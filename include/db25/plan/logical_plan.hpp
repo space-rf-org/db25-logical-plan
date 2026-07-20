@@ -42,6 +42,8 @@ enum class LogicalOp : std::uint8_t {
     Aggregate,  // GROUP BY + aggregate functions
     Window,     // window functions (RANK/ROW_NUMBER/SUM(..) OVER (...)); sits
                 // below Project, appends one output column per window function
+    Distinct,   // SELECT DISTINCT: de-duplicate the child's rows (sits directly
+                // above Project; schema-preserving)
     Sort,       // ORDER BY (with sort keys + directions)
     Limit,      // LIMIT / OFFSET
     SetOp,      // UNION [ALL] / INTERSECT / EXCEPT
