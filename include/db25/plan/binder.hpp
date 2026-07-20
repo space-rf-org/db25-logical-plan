@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "db25/plan/expr_ir.hpp"
 #include "db25/plan/logical_plan.hpp"
 
 #include "db25/ast/ast_node.hpp"
@@ -23,8 +24,12 @@
 #include "db25/semantic/catalog.hpp"
 
 #include <string>
+#include <vector>
 
 namespace db25::plan {
+
+// Test-only accessor (defined in the test TU) for the private lowering surface.
+struct BinderExprTestAccess;
 
 // Outcome of binding. On success `root` is the plan tree and `ok` is true. On
 // failure `root` is null and `error` explains why (no exceptions are thrown -
@@ -91,8 +96,47 @@ private:
     void attach_subqueries(LogicalNode* owner, const db25::ast::ASTNode* expr_root,
                            std::string& error);
 
+    // ------------------------------------------------------------------
+    // AST -> owned, typed Expr lowering (expr_lower.cpp).
+    //
+    // The single place that reads the analyzer + AST and emits an owned Expr:
+    // it dispatches on node_type, bakes type / nullability once, resolves a
+    // ColumnRef to a flat `input_index` into `input` (the owning operator's
+    // input schema; for a Join, child0.output ++ child1.output), lowers an
+    // embedded subquery inline into an owned `sub_plan`, and represents a
+    // correlated outer-column reference as an `OuterRef` resolved against an
+    // enclosing input on `outer_inputs_`. Returns null and sets `error` on an
+    // unlowerable shape (the whole stack is -fno-exceptions).
+    //
+    // ADDITIVE (migration steps 1-2): not yet called by the operator-building
+    // code, so it does not change any existing plan behavior.
+    [[nodiscard]] ExprPtr lower_expr(const db25::ast::ASTNode* n, const Schema& input,
+                                     std::string& error);
+
+    // Fold a scalar / IN / EXISTS subquery into an owned Subquery Expr: bind the
+    // inner block into `sub_plan` (with `input` pushed as an enclosing schema for
+    // correlated resolution) and record its correlation flag. `left` (IN only) is
+    // the already-lowered left operand, kept as children[0].
+    [[nodiscard]] ExprPtr lower_subquery(const db25::ast::ASTNode* subquery,
+                                         SubqueryKind kind, bool negated, ExprPtr left,
+                                         db25::ast::DataType type, std::uint8_t nullability,
+                                         const Schema& input, std::string& error);
+
+    // Lower an AST WindowSpec (the OVER (...) clause) into an owned WindowSpecIR.
+    [[nodiscard]] bool lower_window_spec(const db25::ast::ASTNode* window_spec,
+                                         const Schema& input, WindowSpecIR& out,
+                                         std::string& error);
+
     const db25::semantic::Analyzer& analyzer_;
     const db25::semantic::Catalog& catalog_;
+
+    // Enclosing operators' input schemas, for resolving correlated outer-column
+    // references while lowering a subquery body. Ordered outermost-first, so the
+    // immediately-enclosing block is back(): OuterRef depth 1 is `outer_inputs_`
+    // back(), depth 2 the one before it, and so on.
+    std::vector<const Schema*> outer_inputs_;
+
+    friend struct BinderExprTestAccess;
 };
 
 }  // namespace db25::plan

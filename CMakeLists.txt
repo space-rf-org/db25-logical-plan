@@ -46,6 +46,8 @@ add_subdirectory(${PARSER_DIR} ${CMAKE_CURRENT_BINARY_DIR}/parser)
 add_library(db25logicalplan STATIC
     src/logical_plan.cpp
     src/binder.cpp
+    src/expr_ir.cpp
+    src/expr_lower.cpp
     ${ANALYZER_DIR}/src/analyzer.cpp
 )
 
@@ -69,3 +71,11 @@ add_executable(test_binder tests/test_binder.cpp)
 target_link_libraries(test_binder PRIVATE db25logicalplan)
 target_compile_options(test_binder PRIVATE -fno-exceptions)
 add_test(NAME test_binder COMMAND test_binder)
+
+# Expression-IR lowering unit tests (Binder::lower_expr over real parse+analyze
+# output): positional column resolution, per-kind typing, join concatenated
+# indexing, aggregate-over-arithmetic, and correlated subquery lowering.
+add_executable(test_expr_lower tests/test_expr_lower.cpp)
+target_link_libraries(test_expr_lower PRIVATE db25logicalplan)
+target_compile_options(test_expr_lower PRIVATE -fno-exceptions)
+add_test(NAME test_expr_lower COMMAND test_expr_lower)
