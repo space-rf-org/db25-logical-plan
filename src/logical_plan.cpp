@@ -15,6 +15,7 @@ const char* logical_op_to_string(LogicalOp op) noexcept {
         case LogicalOp::Project:   return "Project";
         case LogicalOp::Join:      return "Join";
         case LogicalOp::Aggregate: return "Aggregate";
+        case LogicalOp::Window:    return "Window";
         case LogicalOp::Sort:      return "Sort";
         case LogicalOp::Limit:     return "Limit";
         case LogicalOp::SetOp:     return "SetOp";
@@ -22,6 +23,7 @@ const char* logical_op_to_string(LogicalOp op) noexcept {
         case LogicalOp::Insert:    return "Insert";
         case LogicalOp::Update:    return "Update";
         case LogicalOp::Delete:    return "Delete";
+        case LogicalOp::Returning: return "Returning";
     }
     return "?";
 }
@@ -104,9 +106,14 @@ void dump_rec(const LogicalNode* n, int depth, std::string& out) {
             out.append(" rows=");
             out.append(std::to_string(n->value_rows.size()));
             break;
+        case LogicalOp::Window:
+            out.append(" fns=");
+            out.append(std::to_string(n->window_functions.size()));
+            break;
         case LogicalOp::Insert:
         case LogicalOp::Update:
         case LogicalOp::Delete:
+        case LogicalOp::Returning:
             out.push_back(' ');
             out.append(n->table_name);
             break;
@@ -120,6 +127,23 @@ void dump_rec(const LogicalNode* n, int depth, std::string& out) {
 
     for (const auto& c : n->children) {
         dump_rec(c.get(), depth + 1, out);
+    }
+
+    // Attached subquery sub-plans are printed indented under a marker line so a
+    // plan dump shows the represented (but not yet decorrelated) subqueries.
+    for (const auto& sp : n->subplans) {
+        for (int i = 0; i < depth + 1; ++i) {
+            out.append("  ");
+        }
+        out.append("SubPlan (");
+        switch (sp.kind) {
+            case SubqueryKind::Scalar: out.append("scalar"); break;
+            case SubqueryKind::In:     out.append("IN"); break;
+            case SubqueryKind::Exists: out.append("EXISTS"); break;
+        }
+        out.append(sp.correlated ? ", correlated" : ", uncorrelated");
+        out.append(")\n");
+        dump_rec(sp.plan.get(), depth + 2, out);
     }
 }
 

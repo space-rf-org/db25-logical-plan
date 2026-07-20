@@ -27,8 +27,8 @@ which are vendored read-only.
 
 ### Logical IR — `include/db25/plan/logical_plan.hpp`
 
-* `LogicalOp` — `{ Scan, Filter, Project, Join, Aggregate, Sort, Limit, SetOp,
-  Values, Insert, Update, Delete }`.
+* `LogicalOp` — `{ Scan, Filter, Project, Join, Aggregate, Window, Sort, Limit,
+  SetOp, Values, Insert, Update, Delete, Returning }`.
 * `LogicalNode` — an owning tree (`std::unique_ptr` children) where every node
   carries an **output schema**: a `std::vector<ColumnSchema>` and each
   `ColumnSchema` is `{ std::string name, db25::ast::DataType type, bool nullable,
@@ -77,22 +77,44 @@ Scan(s) -> [Join] -> [Filter (WHERE)] -> [Aggregate (GROUP BY)]
   or bound query source for `INSERT`, and a `Scan` (wrapped in a `Filter` when a
   `WHERE` clause is present) for `UPDATE` / `DELETE`. `UPDATE` also carries its
   borrowed `SET` assignment nodes.
+* **`RETURNING` -> Returning** on top of the DML node, with an output schema
+  resolved against the target table's catalog columns (`RETURNING *` expands to
+  every column; a bare column reference carries its type / nullability / ids).
+  Represented for `UPDATE` / `DELETE`; **`INSERT ... RETURNING`** is wired the
+  same way but the vendored parser currently drops the clause for `INSERT` (no
+  `ReturningClause` node), so it does not yet appear — a parser-side `TODO`.
+* **Window functions -> Window** (below the `Project`): a `Window` node carries
+  the borrowed window-call nodes (each a `FunctionCall` with a `WindowSpec` child
+  holding the `PARTITION BY` / `ORDER BY` / frame refs) and appends one output
+  column per function (type / nullability from the analyzer). The `Project`
+  above references those outputs. Covers `RANK` / `ROW_NUMBER` / `SUM(..) OVER
+  (...)` and friends.
+* **Subqueries in expressions** (scalar / `IN` / `EXISTS`) -> represented as
+  **`SubPlan`s** attached to the owning node (a `Project` for a scalar subquery
+  in the `SELECT` list, a `Filter` for `IN` / `EXISTS` in `WHERE`). Each `SubPlan`
+  carries the bound inner query plan, the subquery kind, and its correlation flag
+  from `Analyzer::is_correlated`. Correlated subqueries are faithfully
+  represented but **not** decorrelated (left to a later optimizer pass).
 
 **Not yet lowered (clearly-marked `TODO`s in the source)**
 
-* `RETURNING` projections, `ON CONFLICT`, and multi-table `UPDATE` / `DELETE`.
-* `LATERAL` joins, `GROUPING SETS` / `CUBE` / `ROLLUP`, window functions in the
-  plan, and correlated-subquery decorrelation.
+* `INSERT ... RETURNING` (parser drops the clause), `ON CONFLICT`, and
+  multi-table `UPDATE` / `DELETE`.
+* `LATERAL` joins (the vendored parser/analyzer do not support them end-to-end:
+  the analyzer reports the correlated relation alias as unresolved and
+  `CROSS JOIN LATERAL` fails to parse), `GROUPING SETS` / `CUBE` / `ROLLUP`, and
+  correlated-subquery **decorrelation**.
 
 ### Tests — `tests/test_binder.cpp`
 
 A self-contained harness (no gtest, so no network fetch and a clean
 `-fno-exceptions` build). It parses + analyzes + binds a spread of queries —
 scan/filter/project/limit, joins (inner, comma/cross, `USING`), `GROUP BY`,
-`ORDER BY`, `SELECT` without `FROM`, derived tables, set operations, and
-`INSERT` / `UPDATE` / `DELETE` — and asserts both the logical tree shape and the
-output schema (names + types + nullability). Run via `ctest` or the
-`test_binder` binary.
+`ORDER BY`, `SELECT` without `FROM`, derived tables, set operations,
+`INSERT` / `UPDATE` / `DELETE`, `UPDATE` / `DELETE ... RETURNING`, window
+functions, and scalar / `IN` / `EXISTS` subqueries — and asserts both the
+logical tree shape and the output schema (names + types + nullability), plus
+subquery kind and correlation. Run via `ctest` or the `test_binder` binary.
 
 ## Submodule pattern
 

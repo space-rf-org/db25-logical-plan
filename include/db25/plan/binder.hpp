@@ -78,6 +78,19 @@ private:
     [[nodiscard]] Schema scan_schema(const db25::semantic::TableInfo& table,
                                      std::uint32_t table_id) const;
 
+    // If `stmt` (an INSERT / UPDATE / DELETE) carries a RETURNING clause, wrap
+    // `dml` in a Returning node whose output schema is resolved against the
+    // target table's catalog columns. Returns `dml` unchanged when there is no
+    // RETURNING clause. On error returns null and sets `error`.
+    LogicalNodePtr wrap_returning(LogicalNodePtr dml, const db25::ast::ASTNode* stmt,
+                                  std::string& error);
+
+    // Bind any subqueries embedded in `expr_root` (a SELECT-list item or a WHERE
+    // predicate) and attach them to `owner` as SubPlans, recording each one's
+    // correlation status. Does not descend into an inner subquery's own body.
+    void attach_subqueries(LogicalNode* owner, const db25::ast::ASTNode* expr_root,
+                           std::string& error);
+
     const db25::semantic::Analyzer& analyzer_;
     const db25::semantic::Catalog& catalog_;
 };

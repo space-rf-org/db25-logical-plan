@@ -40,6 +40,8 @@ enum class LogicalOp : std::uint8_t {
     Project,    // SELECT list -> named output columns
     Join,       // binary join (INNER / OUTER / CROSS; USING columns merged)
     Aggregate,  // GROUP BY + aggregate functions
+    Window,     // window functions (RANK/ROW_NUMBER/SUM(..) OVER (...)); sits
+                // below Project, appends one output column per window function
     Sort,       // ORDER BY (with sort keys + directions)
     Limit,      // LIMIT / OFFSET
     SetOp,      // UNION [ALL] / INTERSECT / EXCEPT
@@ -48,6 +50,7 @@ enum class LogicalOp : std::uint8_t {
     Insert,     // INSERT INTO target <- child (Values / query source)
     Update,     // UPDATE target SET ... [WHERE] over a Scan / Filter child
     Delete,     // DELETE FROM target [WHERE] over a Scan / Filter child
+    Returning,  // RETURNING projection on top of an Insert / Update / Delete
 };
 
 [[nodiscard]] const char* logical_op_to_string(LogicalOp op) noexcept;
@@ -71,6 +74,28 @@ struct SortKey {
     bool descending = false;             // ASC (false) / DESC (true)
     bool nulls_order_explicit = false;   // whether NULLS FIRST/LAST was written
     bool nulls_first = false;            // meaningful when nulls_order_explicit
+};
+
+struct LogicalNode;  // forward declaration for SubPlan
+
+// How a subquery is used in the expression that owns it.
+enum class SubqueryKind : std::uint8_t {
+    Scalar,  // a scalar subquery: (SELECT ...) yielding a single value
+    In,      // expr IN (SELECT ...)
+    Exists,  // [NOT] EXISTS (SELECT ...)
+};
+
+// A subquery embedded in an expression (a SELECT-list item or a WHERE
+// predicate), faithfully represented rather than dropped. `plan` is the bound
+// inner query block; `expr` borrows the AST Subquery node it came from; and
+// `correlated` records Analyzer::is_correlated for that subquery. Decorrelation
+// of correlated subqueries is deliberately left to a later optimizer pass (TODO)
+// - the binder only represents the subquery and its correlation status here.
+struct SubPlan {
+    const ast::ASTNode* expr = nullptr;         // borrowed Subquery AST node
+    SubqueryKind kind = SubqueryKind::Scalar;   // how it is used
+    bool correlated = false;                    // Analyzer::is_correlated(expr)
+    std::unique_ptr<LogicalNode> plan;          // bound inner query sub-plan
 };
 
 // A node in the logical plan tree. Payload fields are grouped by the operator
@@ -103,6 +128,19 @@ struct LogicalNode {
     // --- Aggregate payload ---
     std::vector<const ast::ASTNode*> group_keys;   // GROUP BY expressions
     std::vector<const ast::ASTNode*> aggregates;   // aggregate call nodes
+
+    // --- Window payload ---
+    // Borrowed window-function call nodes (each a FunctionCall carrying a
+    // WindowSpec child that holds the PARTITION BY / ORDER BY / frame refs).
+    // The node's output is its child's schema with one appended column per
+    // window function, in this order.
+    std::vector<const ast::ASTNode*> window_functions;
+
+    // --- Subquery payload (any node that owns expression subqueries) ---
+    // Sub-plans for subqueries embedded in this node's expressions: scalar
+    // subqueries in a Project's SELECT list, or IN / EXISTS subqueries in a
+    // Filter's predicate.
+    std::vector<SubPlan> subplans;
 
     // --- Sort payload ---
     std::vector<SortKey> sort_keys;   // ORDER BY keys, in order
