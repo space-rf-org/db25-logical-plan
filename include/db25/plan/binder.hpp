@@ -117,6 +117,28 @@ private:
     [[nodiscard]] ExprPtr lower_expr(const db25::ast::ASTNode* n, const Schema& input,
                                      std::string& error);
 
+    // Lower a SELECT-list / RETURNING projection into owned expressions, one per
+    // output column, appended to `out`. `child` is the operator feeding the
+    // projection (its `output` is the input schema against which items are
+    // lowered). A `*` expands to one positional ColumnRef per covered column; a
+    // projected item that names a precomputed group/aggregate/window output of
+    // `child` lowers to a ColumnRef into that child column (the producer map)
+    // rather than a re-evaluated expression. Returns false and sets `error` on
+    // an unlowerable shape (e.g. a qualified `t.*`, not yet supported).
+    [[nodiscard]] bool lower_projection(const db25::ast::ASTNode* select_list,
+                                        const LogicalNode* child,
+                                        std::vector<ExprPtr>& out, std::string& error);
+
+    // Lower a single non-star projected item at ordinal `index` against `input`
+    // (the child's output schema). When the child is an Aggregate its output is
+    // 1:1 with the select list, so the item maps positionally; otherwise a
+    // precomputed aggregate / window item is referenced by output name (the
+    // producer map) and anything else is lowered as a fresh expression. Returns
+    // null on failure.
+    [[nodiscard]] ExprPtr lower_projection_item(const db25::ast::ASTNode* item,
+                                                const Schema& input, std::size_t index,
+                                                bool child_is_aggregate, std::string& error);
+
     // Fold a scalar / IN / EXISTS subquery into an owned Subquery Expr: bind the
     // inner block into `sub_plan` (with `input` pushed as an enclosing schema for
     // correlated resolution) and record its correlation flag. `left` (IN only) is
