@@ -93,6 +93,14 @@ const LogicalNode* only_child(const LogicalNode* n) {
     return (n != nullptr && n->child_count() == 1) ? n->child(0) : nullptr;
 }
 
+// Assert a projected expression is a positional ColumnRef into slot `slot`.
+void expect_col_ref(const db25::plan::ExprPtr& e, std::uint32_t slot,
+                    const std::string& ctx) {
+    check(e && e->kind == ExprKind::ColumnRef, ctx + ": is a ColumnRef");
+    check(e && e->kind == ExprKind::ColumnRef && e->input_index == slot,
+          ctx + ": input_index == " + std::to_string(slot));
+}
+
 // -------------------------------------------------------------------------
 
 void test_scan_filter_project_limit(const InMemoryCatalog& cat) {
@@ -134,6 +142,12 @@ void test_scan_filter_project_limit(const InMemoryCatalog& cat) {
         if (project && project->output.size() == 2) {
             expect_col(project->output[0], "id", DataType::Integer, false, "proj[0]");
             expect_col(project->output[1], "name", DataType::VarChar, true, "proj[1]");
+        }
+        // SELECT id, name lowers to two positional column refs (#0, #1).
+        check(project && project->exprs.size() == 2, "project has 2 exprs");
+        if (project && project->exprs.size() == 2) {
+            expect_col_ref(project->exprs[0], 0, "proj expr[0]");
+            expect_col_ref(project->exprs[1], 1, "proj expr[1]");
         }
     });
 }
@@ -212,6 +226,14 @@ void test_group_by(const InMemoryCatalog& cat) {
             expect_col(root->output[0], "dept", DataType::VarChar, true, "proj[0]");
             // COUNT(*) -> BigInt, not null.
             expect_col(root->output[1], "COUNT", DataType::BigInt, false, "proj[1]");
+        }
+        // Over an Aggregate child the projection is positional into its output:
+        // the group key (#0) and the aggregate (#1) are both column refs, not
+        // re-evaluated calls.
+        check(root->exprs.size() == 2, "project has 2 exprs");
+        if (root->exprs.size() == 2) {
+            expect_col_ref(root->exprs[0], 0, "agg proj expr[0] (dept)");
+            expect_col_ref(root->exprs[1], 1, "agg proj expr[1] (COUNT)");
         }
     });
 }
@@ -317,6 +339,12 @@ void test_select_star(const InMemoryCatalog& cat) {
             // Star expansion carries catalog ids through the analyzer.
             check(root->output[0].table_id != 0, "star col carries table_id");
             check(root->output[0].column_id == 1, "id column_id == 1");
+        }
+        // `*` expands to one positional column ref per covered column (#0, #1).
+        check(root->exprs.size() == 2, "star lowers to 2 column-ref exprs");
+        if (root->exprs.size() == 2) {
+            expect_col_ref(root->exprs[0], 0, "star expr[0]");
+            expect_col_ref(root->exprs[1], 1, "star expr[1]");
         }
     });
 }
@@ -645,6 +673,12 @@ void test_delete_returning_star(const InMemoryCatalog& cat) {
             expect_col(root->output[1], "name", DataType::VarChar, true, "ret*[1]");
             check(root->output[0].column_id == 1, "star col carries column_id");
         }
+        // RETURNING * lowers to owned positional column refs over the target row.
+        check(root->exprs.size() == 2, "returning * -> 2 exprs");
+        if (root->exprs.size() == 2) {
+            expect_col_ref(root->exprs[0], 0, "ret* expr[0]");
+            expect_col_ref(root->exprs[1], 1, "ret* expr[1]");
+        }
         const LogicalNode* del = only_child(root);
         check(del && del->op == LogicalOp::Delete, "child is Delete");
         const LogicalNode* scan = only_child(del);
@@ -677,6 +711,13 @@ void test_window_rank(const InMemoryCatalog& cat) {
         if (root->output.size() == 2) {
             expect_col(root->output[0], "id", DataType::Integer, false, "proj[0]");
             expect_col(root->output[1], "RANK", DataType::BigInt, false, "proj[1]");
+        }
+        // The window function is precomputed by the Window child (output slot
+        // #2); the projection references it by name rather than re-evaluating.
+        check(root->exprs.size() == 2, "project has 2 exprs");
+        if (root->exprs.size() == 2) {
+            expect_col_ref(root->exprs[0], 0, "win proj expr[0] (id)");
+            expect_col_ref(root->exprs[1], 2, "win proj expr[1] (RANK -> #2)");
         }
     });
 }

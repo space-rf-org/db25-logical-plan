@@ -134,11 +134,13 @@ struct LogicalNode {
     // --- Join payload ---
     ast::JoinType join_type = ast::JoinType::Inner;
 
-    // --- Project payload ---
-    // Borrowed SELECT-list expression nodes, parallel to `output`. A `Star`
-    // item expands to several output columns, so exprs and output are only
-    // 1:1 when no star was expanded (see is_star below).
-    std::vector<const ast::ASTNode*> exprs;
+    // --- Project / Returning payload ---
+    // Owned, typed projected expressions, one per output column (a `*` is
+    // expanded to one positional ColumnRef per covered column, so `exprs` and
+    // `output` are 1:1). For a Project over an Aggregate / Window child, an
+    // item that names a precomputed group/aggregate/window output lowers to a
+    // ColumnRef into that child column rather than a re-evaluated expression.
+    std::vector<ExprPtr> exprs;
 
     // --- Aggregate payload ---
     std::vector<const ast::ASTNode*> group_keys;   // GROUP BY expressions

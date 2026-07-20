@@ -232,6 +232,31 @@ std::string item_output_name(const ASTNode* item) {
     return std::string{item->primary_text};
 }
 
+// Build an owned ColumnRef Expr that references slot `slot` of an input schema,
+// carrying the referenced column's type, nullability (parser 2-bit: 1 not-null /
+// 2 nullable) and provenance ids. The single place a positional projection leaf
+// is minted, so passthrough columns and producer-map hits share one encoding.
+ExprPtr make_column_ref(std::uint32_t slot, const ColumnSchema& c) {
+    auto e = std::make_unique<Expr>(ExprKind::ColumnRef);
+    e->input_index = slot;
+    e->type = c.type;
+    e->nullability = c.nullable ? std::uint8_t{2} : std::uint8_t{1};
+    e->ref_table_id = c.table_id;
+    e->ref_column_id = c.column_id;
+    return e;
+}
+
+// Find a schema slot by output column name (the producer-map fallback for a
+// precomputed aggregate / window output). Returns -1 when absent.
+int slot_by_name(const Schema& s, std::string_view name) {
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (s[i].name == name) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
 }  // namespace
 
 Schema Binder::scan_schema(const TableInfo& table, std::uint32_t table_id) const {
@@ -632,11 +657,23 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
         // is the enclosing schema against which a correlated SELECT-list scalar
         // subquery resolves its outer references.
         const Schema& project_input = current->output;
+        // Represent scalar subqueries embedded in each SELECT-list item.
         for (const ASTNode* item = first_child(select_list); item != nullptr;
              item = item->next_sibling) {
-            project->exprs.push_back(item);
-            // Represent scalar subqueries embedded in a SELECT-list item.
             attach_subqueries(project.get(), item, project_input, error);
+        }
+        // Lower the SELECT list into owned, typed projected expressions.
+        if (!lower_projection(select_list, current.get(), project->exprs, error)) {
+            return nullptr;
+        }
+        // Invariant: exactly one projected expression per output column. A
+        // divergence means star expansion disagreed with the analyzer's
+        // projection; fail loudly rather than emit an inconsistent Project.
+        if (project->exprs.size() != project->output.size()) {
+            error = "projection arity (" + std::to_string(project->exprs.size()) +
+                    ") does not match the analyzer's output (" +
+                    std::to_string(project->output.size()) + ")";
+            return nullptr;
         }
     }
     project->add_child(std::move(current));
@@ -854,29 +891,44 @@ LogicalNodePtr Binder::wrap_returning(LogicalNodePtr dml, const ASTNode* stmt,
 
     auto node = make_node(LogicalOp::Returning);
     node->table_name = dml->table_name;
+    // The RETURNING items are evaluated over the target table's rows; resolve
+    // them (and expand `*`) positionally against that table's schema so the
+    // owned exprs stay 1:1 with `output`.
+    const Schema target = scan_schema(*table, table->table_id);
     for (const ASTNode* item = first_child(returning); item != nullptr;
          item = item->next_sibling) {
         if (item->node_type == NodeType::Star) {
             // RETURNING * -> every column of the target table, in order.
-            for (const auto& c : table->columns) {
-                node->output.push_back(
-                    ColumnSchema{c.name, c.type, c.nullable, table->table_id, c.column_id});
+            for (std::size_t s = 0; s < target.size(); ++s) {
+                node->output.push_back(target[s]);
+                node->exprs.push_back(make_column_ref(static_cast<std::uint32_t>(s), target[s]));
             }
             continue;
         }
-        node->exprs.push_back(item);
         ColumnSchema col;
         col.name = item_output_name(item);
+        ExprPtr expr;
         if (item->node_type == NodeType::ColumnRef ||
             item->node_type == NodeType::Identifier) {
             const std::string_view cname = split_column_ref(item->primary_text).column;
-            if (const auto* ci = table->find_column(cname)) {
-                col.type = ci->type;
-                col.nullable = ci->nullable;
-                col.table_id = table->table_id;
-                col.column_id = ci->column_id;
+            const int slot = slot_by_name(target, cname);
+            if (slot >= 0) {
+                col.type = target[slot].type;
+                col.nullable = target[slot].nullable;
+                col.table_id = target[slot].table_id;
+                col.column_id = target[slot].column_id;
+                expr = make_column_ref(static_cast<std::uint32_t>(slot), target[slot]);
             }
         }
+        if (!expr) {
+            // A non-column RETURNING item (an expression over the target row):
+            // lower it as a fresh expression against the target schema.
+            expr = lower_expr(item, target, error);
+            if (!expr) {
+                return nullptr;
+            }
+        }
+        node->exprs.push_back(std::move(expr));
         node->output.push_back(std::move(col));
     }
     node->add_child(std::move(dml));
@@ -949,6 +1001,95 @@ void Binder::attach_subqueries(LogicalNode* owner, const ASTNode* expr_root,
     for (const ASTNode* c = first_child(expr_root); c != nullptr; c = c->next_sibling) {
         attach_subqueries(owner, c, input, error);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Projection lowering (SELECT list -> owned, typed expressions).
+//
+// One owned Expr per output column. A `*` expands to one positional ColumnRef
+// per covered child column; a projected aggregate / window item that a child
+// Aggregate / Window has already computed becomes a ColumnRef into that child
+// column (the producer map) rather than a re-evaluated expression tree.
+// ---------------------------------------------------------------------------
+ExprPtr Binder::lower_projection_item(const ASTNode* item, const Schema& input,
+                                      std::size_t index, bool child_is_aggregate,
+                                      std::string& error) {
+    // Over an Aggregate child the output is 1:1 with the select list (it was
+    // built by walking the same items in order), so every item maps positionally
+    // - including an expression over an aggregate such as `SUM(x) + 1`, whose
+    // inner argument is not in the aggregate's output and so must not be
+    // re-lowered here.
+    if (child_is_aggregate) {
+        if (index < input.size()) {
+            return make_column_ref(static_cast<std::uint32_t>(index), input[index]);
+        }
+        error = "projection item past the aggregate's output";
+        return nullptr;
+    }
+    // A precomputed aggregate / window output (a window function, or an aggregate
+    // surfacing above a HAVING filter): reference the child column by its output
+    // name instead of re-evaluating it. These are matched by name first because
+    // re-lowering them as fresh calls would reach for arguments the child no
+    // longer exposes.
+    if (is_aggregate_call(item) || is_window_call(item)) {
+        const int slot = slot_by_name(input, item_output_name(item));
+        if (slot >= 0) {
+            return make_column_ref(static_cast<std::uint32_t>(slot), input[slot]);
+        }
+        return lower_expr(item, input, error);
+    }
+    // A plain column passthrough: resolve by (table_id, column_id) first so
+    // same-named columns from different inputs stay distinct, then fall back to
+    // the output name for a producer whose ids were not carried through (e.g. a
+    // group key surfacing above a HAVING filter, whose Aggregate output column
+    // has no provenance ids).
+    if (item->node_type == NodeType::ColumnRef || item->node_type == NodeType::Identifier) {
+        std::string local_error;
+        if (auto e = lower_expr(item, input, local_error)) {
+            return e;
+        }
+        const int slot = slot_by_name(input, item_output_name(item));
+        if (slot >= 0) {
+            return make_column_ref(static_cast<std::uint32_t>(slot), input[slot]);
+        }
+        error = std::move(local_error);
+        return nullptr;
+    }
+    // Otherwise a fresh scalar expression over the child's output.
+    return lower_expr(item, input, error);
+}
+
+bool Binder::lower_projection(const ASTNode* select_list, const LogicalNode* child,
+                              std::vector<ExprPtr>& out, std::string& error) {
+    const Schema& input = child->output;
+    const bool child_is_aggregate = child->op == LogicalOp::Aggregate;
+    std::size_t index = 0;
+    for (const ASTNode* item = first_child(select_list); item != nullptr;
+         item = item->next_sibling) {
+        if (item->node_type == NodeType::Star) {
+            // Only an unqualified whole-child `*` is supported: expand to one
+            // positional ColumnRef per child output column. A qualified `t.*`
+            // covers a subset and needs table-scoped expansion (TODO); fail
+            // loudly rather than emit a wrong-arity projection.
+            const std::string_view qual = split_column_ref(item->primary_text).qualifier;
+            if (!qual.empty()) {
+                error = "qualified '" + std::string{qual} + ".*' projection not yet lowered";
+                return false;
+            }
+            for (std::size_t s = 0; s < input.size(); ++s) {
+                out.push_back(make_column_ref(static_cast<std::uint32_t>(s), input[s]));
+            }
+            ++index;
+            continue;
+        }
+        auto e = lower_projection_item(item, input, index, child_is_aggregate, error);
+        if (!e) {
+            return false;
+        }
+        out.push_back(std::move(e));
+        ++index;
+    }
+    return true;
 }
 
 }  // namespace db25::plan

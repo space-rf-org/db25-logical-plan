@@ -76,6 +76,16 @@ void dump_rec(const LogicalNode* n, int depth, std::string& out) {
                 out.append(dump_expr(*n->predicate));
             }
             break;
+        case LogicalOp::Project:
+            out.append(" (");
+            for (std::size_t i = 0; i < n->exprs.size(); ++i) {
+                if (i != 0) {
+                    out.append(", ");
+                }
+                out.append(n->exprs[i] ? dump_expr(*n->exprs[i]) : "?");
+            }
+            out.push_back(')');
+            break;
         case LogicalOp::Join:
             out.append(" (");
             switch (n->join_type) {
