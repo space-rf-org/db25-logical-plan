@@ -22,6 +22,7 @@ using db25::plan::BindResult;
 using db25::plan::ColumnSchema;
 using db25::plan::LogicalNode;
 using db25::plan::LogicalOp;
+using db25::plan::SubqueryKind;
 using db25::semantic::Analyzer;
 using db25::semantic::InMemoryCatalog;
 
@@ -469,6 +470,198 @@ void test_delete(const InMemoryCatalog& cat) {
     });
 }
 
+// -------------------------------------------------------------------------
+// RETURNING: a Returning projection on top of the DML node, its output schema
+// resolved from the target table's catalog columns.
+
+void test_update_returning(const InMemoryCatalog& cat) {
+    std::printf("[test] UPDATE users SET name='x' WHERE id=1 RETURNING id, name\n");
+    with_plan(cat, "UPDATE users SET name = 'x' WHERE id = 1 RETURNING id, name",
+              [](const LogicalNode* root) {
+        // Returning -> Update -> Filter -> Scan
+        check(root->op == LogicalOp::Returning, "root is Returning");
+        check(root->table_name == "users", "returning of users");
+        check(root->output.size() == 2, "returning 2 cols");
+        if (root->output.size() == 2) {
+            expect_col(root->output[0], "id", DataType::Integer, false, "ret[0]");
+            expect_col(root->output[1], "name", DataType::VarChar, true, "ret[1]");
+        }
+        const LogicalNode* upd = only_child(root);
+        check(upd && upd->op == LogicalOp::Update, "child is Update");
+        const LogicalNode* filter = only_child(upd);
+        check(filter && filter->op == LogicalOp::Filter, "update child is Filter");
+        const LogicalNode* scan = only_child(filter);
+        check(scan && scan->op == LogicalOp::Scan && scan->table_name == "users",
+              "leaf scan users");
+    });
+}
+
+void test_delete_returning(const InMemoryCatalog& cat) {
+    std::printf("[test] DELETE FROM orders WHERE id=1 RETURNING id, total\n");
+    with_plan(cat, "DELETE FROM orders WHERE id = 1 RETURNING id, total",
+              [](const LogicalNode* root) {
+        // Returning -> Delete -> Filter -> Scan
+        check(root->op == LogicalOp::Returning, "root is Returning");
+        check(root->table_name == "orders", "returning of orders");
+        check(root->output.size() == 2, "returning 2 cols");
+        if (root->output.size() == 2) {
+            expect_col(root->output[0], "id", DataType::Integer, false, "ret[0]");
+            expect_col(root->output[1], "total", DataType::Double, true, "ret[1]");
+        }
+        const LogicalNode* del = only_child(root);
+        check(del && del->op == LogicalOp::Delete, "child is Delete");
+    });
+}
+
+void test_delete_returning_star(const InMemoryCatalog& cat) {
+    std::printf("[test] DELETE FROM users RETURNING *\n");
+    with_plan(cat, "DELETE FROM users RETURNING *", [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Returning, "root is Returning");
+        // RETURNING * expands to every column of users.
+        check(root->output.size() == 2, "returning * -> 2 cols");
+        if (root->output.size() == 2) {
+            expect_col(root->output[0], "id", DataType::Integer, false, "ret*[0]");
+            expect_col(root->output[1], "name", DataType::VarChar, true, "ret*[1]");
+            check(root->output[0].column_id == 1, "star col carries column_id");
+        }
+        const LogicalNode* del = only_child(root);
+        check(del && del->op == LogicalOp::Delete, "child is Delete");
+        const LogicalNode* scan = only_child(del);
+        check(scan && scan->op == LogicalOp::Scan, "delete child is Scan (no WHERE)");
+    });
+}
+
+// -------------------------------------------------------------------------
+// Window functions: a Window node below the Project, carrying the window-call
+// specs and appending one output column per function.
+
+void test_window_rank(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id, RANK() OVER (PARTITION BY name ORDER BY id) FROM users\n");
+    with_plan(cat, "SELECT id, RANK() OVER (PARTITION BY name ORDER BY id) FROM users",
+              [](const LogicalNode* root) {
+        // Project -> Window -> Scan
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* window = only_child(root);
+        check(window && window->op == LogicalOp::Window, "child is Window");
+        check(window && window->window_functions.size() == 1, "1 window function");
+        // Window output = input columns (id, name) + the RANK result.
+        check(window && window->output.size() == 3, "window output = 3 cols");
+        if (window && window->output.size() == 3) {
+            expect_col(window->output[2], "RANK", DataType::BigInt, false, "win[2]");
+        }
+        const LogicalNode* scan = only_child(window);
+        check(scan && scan->op == LogicalOp::Scan && scan->table_name == "users",
+              "leaf scan users");
+        check(root->output.size() == 2, "project 2 cols");
+        if (root->output.size() == 2) {
+            expect_col(root->output[0], "id", DataType::Integer, false, "proj[0]");
+            expect_col(root->output[1], "RANK", DataType::BigInt, false, "proj[1]");
+        }
+    });
+}
+
+void test_window_row_number(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM users\n");
+    with_plan(cat, "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM users",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* window = only_child(root);
+        check(window && window->op == LogicalOp::Window, "child is Window");
+        check(window && window->window_functions.size() == 1, "1 window function");
+        check(root->output.size() == 2, "project 2 cols");
+        if (root->output.size() == 2) {
+            // The alias renames the window output to rn.
+            expect_col(root->output[1], "rn", DataType::BigInt, false, "proj[1]");
+        }
+    });
+}
+
+void test_window_sum(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT dept, SUM(sal) OVER (PARTITION BY dept) FROM emp\n");
+    with_plan(cat, "SELECT dept, SUM(sal) OVER (PARTITION BY dept) FROM emp",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* window = only_child(root);
+        check(window && window->op == LogicalOp::Window, "child is Window");
+        check(window && window->window_functions.size() == 1, "1 window function");
+        check(root->output.size() == 2, "project 2 cols");
+        if (root->output.size() == 2) {
+            expect_col(root->output[1], "SUM", DataType::Double, true, "proj[1]");
+        }
+    });
+}
+
+// -------------------------------------------------------------------------
+// Subqueries in expressions: represented as SubPlans (not decorrelated),
+// tagged by kind and correlation.
+
+void test_scalar_subquery(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id, (SELECT MAX(total) FROM orders) FROM users\n");
+    with_plan(cat, "SELECT id, (SELECT MAX(total) FROM orders) FROM users",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        check(root->subplans.size() == 1, "project has 1 subplan");
+        if (root->subplans.size() == 1) {
+            const auto& sp = root->subplans[0];
+            check(sp.kind == SubqueryKind::Scalar, "scalar subquery");
+            check(!sp.correlated, "uncorrelated");
+            check(sp.plan && sp.plan->op == LogicalOp::Project, "subplan is a Project");
+        }
+    });
+}
+
+void test_scalar_subquery_correlated(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id, (SELECT MAX(total) FROM orders o WHERE o.user_id = users.id) FROM users\n");
+    with_plan(cat,
+              "SELECT id, (SELECT MAX(total) FROM orders o WHERE o.user_id = users.id) "
+              "FROM users",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        check(root->subplans.size() == 1, "project has 1 subplan");
+        if (root->subplans.size() == 1) {
+            const auto& sp = root->subplans[0];
+            check(sp.kind == SubqueryKind::Scalar, "scalar subquery");
+            check(sp.correlated, "correlated");
+        }
+    });
+}
+
+void test_in_subquery(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id FROM users WHERE id IN (SELECT user_id FROM orders)\n");
+    with_plan(cat, "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders)",
+              [](const LogicalNode* root) {
+        // Project -> Filter(with IN subplan) -> Scan
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* filter = only_child(root);
+        check(filter && filter->op == LogicalOp::Filter, "child is Filter");
+        check(filter && filter->subplans.size() == 1, "filter has 1 subplan");
+        if (filter && filter->subplans.size() == 1) {
+            const auto& sp = filter->subplans[0];
+            check(sp.kind == SubqueryKind::In, "IN subquery");
+            check(!sp.correlated, "uncorrelated");
+            check(sp.plan && sp.plan->op == LogicalOp::Project, "subplan is a Project");
+        }
+    });
+}
+
+void test_exists_subquery(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE ...)\n");
+    with_plan(cat,
+              "SELECT id FROM users WHERE EXISTS "
+              "(SELECT 1 FROM orders WHERE orders.user_id = users.id)",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* filter = only_child(root);
+        check(filter && filter->op == LogicalOp::Filter, "child is Filter");
+        check(filter && filter->subplans.size() == 1, "filter has 1 subplan");
+        if (filter && filter->subplans.size() == 1) {
+            const auto& sp = filter->subplans[0];
+            check(sp.kind == SubqueryKind::Exists, "EXISTS subquery");
+            check(sp.correlated, "correlated");
+        }
+    });
+}
+
 }  // namespace
 
 int main() {
@@ -496,6 +689,19 @@ int main() {
     test_update(cat);
     test_update_no_where(cat);
     test_delete(cat);
+
+    test_update_returning(cat);
+    test_delete_returning(cat);
+    test_delete_returning_star(cat);
+
+    test_window_rank(cat);
+    test_window_row_number(cat);
+    test_window_sum(cat);
+
+    test_scalar_subquery(cat);
+    test_scalar_subquery_correlated(cat);
+    test_in_subquery(cat);
+    test_exists_subquery(cat);
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) {

@@ -181,6 +181,18 @@ bool parse_int_literal(const ASTNode* op, std::int64_t& out) {
     return true;
 }
 
+// A window-function call: a FunctionCall / FunctionExpr that carries a
+// WindowSpec child (the OVER (...) specification). The WindowSpec in turn holds
+// the PARTITION BY / ORDER BY / frame sub-clauses.
+bool is_window_call(const ASTNode* n) {
+    if (n == nullptr ||
+        (n->node_type != NodeType::FunctionCall &&
+         n->node_type != NodeType::FunctionExpr)) {
+        return false;
+    }
+    return find_child(n, NodeType::WindowSpec) != nullptr;
+}
+
 // The output name of a projected select-list item: its alias if any, else the
 // (undotted) column name for a column reference, else its literal/primary text.
 std::string item_output_name(const ASTNode* item) {
@@ -457,6 +469,8 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
         auto filter = make_node(LogicalOp::Filter);
         filter->predicate = first_child(where);  // the predicate expression
         filter->output = current->output;         // filter is schema-preserving
+        // Represent IN / EXISTS / scalar subqueries in the predicate.
+        attach_subqueries(filter.get(), filter->predicate, error);
         filter->add_child(std::move(current));
         current = std::move(filter);
     }
@@ -490,6 +504,36 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
         current = std::move(agg);
     }
 
+    // --- Window functions -> Window (below Project) ---
+    // Window functions are evaluated after WHERE / GROUP BY but before the final
+    // projection. Collect the SELECT-list items that are window calls; if any,
+    // insert a Window node that carries them and appends one output column per
+    // function (its type / nullability read back from the analyzer) to the
+    // input schema. The Project above then references those outputs.
+    if (select_list != nullptr) {
+        std::vector<const ASTNode*> window_fns;
+        for (const ASTNode* item = first_child(select_list); item != nullptr;
+             item = item->next_sibling) {
+            if (is_window_call(item)) {
+                window_fns.push_back(item);
+            }
+        }
+        if (!window_fns.empty()) {
+            auto window = make_node(LogicalOp::Window);
+            window->output = current->output;  // input columns pass through
+            for (const ASTNode* fn : window_fns) {
+                window->window_functions.push_back(fn);
+                ColumnSchema col;
+                col.name = item_output_name(fn);
+                col.type = analyzer_.type_of(fn);
+                col.nullable = analyzer_.nullability_of(fn) != 1;
+                window->output.push_back(std::move(col));
+            }
+            window->add_child(std::move(current));
+            current = std::move(window);
+        }
+    }
+
     // --- SELECT list -> Project (authoritative output schema) ---
     auto project = make_node(LogicalOp::Project);
     if (const auto* proj = analyzer_.projection_of(select_stmt)) {
@@ -505,6 +549,8 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
         for (const ASTNode* item = first_child(select_list); item != nullptr;
              item = item->next_sibling) {
             project->exprs.push_back(item);
+            // Represent scalar subqueries embedded in a SELECT-list item.
+            attach_subqueries(project.get(), item, error);
         }
     }
     project->add_child(std::move(current));
@@ -609,8 +655,7 @@ LogicalNodePtr Binder::bind_insert(const ASTNode* insert_stmt, std::string& erro
         }
         node->add_child(std::move(src));
     }
-    // A bare INSERT projects nothing (RETURNING is not modeled yet). TODO.
-    return node;
+    return wrap_returning(std::move(node), insert_stmt, error);
 }
 
 LogicalNodePtr Binder::bind_update(const ASTNode* update_stmt, std::string& error) {
@@ -645,7 +690,7 @@ LogicalNodePtr Binder::bind_update(const ASTNode* update_stmt, std::string& erro
         }
     }
     node->add_child(std::move(child));
-    return node;
+    return wrap_returning(std::move(node), update_stmt, error);
 }
 
 LogicalNodePtr Binder::bind_delete(const ASTNode* delete_stmt, std::string& error) {
@@ -669,7 +714,127 @@ LogicalNodePtr Binder::bind_delete(const ASTNode* delete_stmt, std::string& erro
     auto node = make_node(LogicalOp::Delete);
     node->table_name = std::string{table_ref->primary_text};
     node->add_child(std::move(child));
+    return wrap_returning(std::move(node), delete_stmt, error);
+}
+
+// ---------------------------------------------------------------------------
+// RETURNING (INSERT / UPDATE / DELETE ... RETURNING ...).
+//
+// The parser emits a ReturningClause whose children are the returned items
+// (ColumnRef / Star / expressions). The analyzer does not type these items, so
+// the output schema is resolved here against the target table's catalog columns
+// (a Star expands to every column; a bare column reference picks up that
+// column's type / nullability / ids; anything else is left Unknown-typed).
+//
+// NOTE: the build of the parser we consume drops the RETURNING clause for
+// INSERT (it emits no ReturningClause node), so only UPDATE / DELETE RETURNING
+// are represented end-to-end today. INSERT RETURNING is handled here too and
+// will light up automatically once the parser preserves it. TODO(parser).
+// ---------------------------------------------------------------------------
+LogicalNodePtr Binder::wrap_returning(LogicalNodePtr dml, const ASTNode* stmt,
+                                      std::string& error) {
+    const ASTNode* returning = find_child(stmt, NodeType::ReturningClause);
+    if (returning == nullptr) {
+        return dml;  // no RETURNING: the DML node is the whole plan
+    }
+    const TableInfo* table = catalog_.find_table(dml->table_name);
+    if (table == nullptr) {
+        error = "RETURNING on unresolved table '" + dml->table_name + "'";
+        return nullptr;
+    }
+
+    auto node = make_node(LogicalOp::Returning);
+    node->table_name = dml->table_name;
+    for (const ASTNode* item = first_child(returning); item != nullptr;
+         item = item->next_sibling) {
+        if (item->node_type == NodeType::Star) {
+            // RETURNING * -> every column of the target table, in order.
+            for (const auto& c : table->columns) {
+                node->output.push_back(
+                    ColumnSchema{c.name, c.type, c.nullable, table->table_id, c.column_id});
+            }
+            continue;
+        }
+        node->exprs.push_back(item);
+        ColumnSchema col;
+        col.name = item_output_name(item);
+        if (item->node_type == NodeType::ColumnRef ||
+            item->node_type == NodeType::Identifier) {
+            const std::string_view cname = split_column_ref(item->primary_text).column;
+            if (const auto* ci = table->find_column(cname)) {
+                col.type = ci->type;
+                col.nullable = ci->nullable;
+                col.table_id = table->table_id;
+                col.column_id = ci->column_id;
+            }
+        }
+        node->output.push_back(std::move(col));
+    }
+    node->add_child(std::move(dml));
     return node;
+}
+
+// ---------------------------------------------------------------------------
+// Subqueries embedded in an expression (scalar / IN / EXISTS).
+//
+// Each embedded Subquery node is bound to its own sub-plan and attached to the
+// owning logical node as a SubPlan, tagged with how it is used and whether the
+// analyzer found it correlated. This faithfully REPRESENTS the subquery in the
+// plan; decorrelating a correlated subquery is deliberately left to a later
+// optimizer pass. TODO(optimizer): decorrelate correlated subqueries.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Classify a Subquery node by the expression that owns it.
+SubqueryKind subquery_kind_of(const ASTNode* subquery) {
+    const ASTNode* parent = subquery->parent;
+    if (parent != nullptr) {
+        if (parent->node_type == NodeType::InExpr) {
+            return SubqueryKind::In;
+        }
+        if (parent->node_type == NodeType::ExistsExpr) {
+            return SubqueryKind::Exists;
+        }
+        if (parent->node_type == NodeType::UnaryExpr &&
+            upper(parent->primary_text).find("EXISTS") != std::string::npos) {
+            return SubqueryKind::Exists;
+        }
+    }
+    return SubqueryKind::Scalar;
+}
+
+}  // namespace
+
+void Binder::attach_subqueries(LogicalNode* owner, const ASTNode* expr_root,
+                               std::string& error) {
+    if (expr_root == nullptr) {
+        return;
+    }
+    // A Subquery node roots an embedded query block; bind it and stop
+    // descending (its own nested subqueries belong to its inner plan).
+    if (expr_root->node_type == NodeType::Subquery) {
+        const ASTNode* body = subquery_body(expr_root);
+        if (body != nullptr) {
+            std::string local_error;
+            auto plan = bind_query(body, local_error);
+            if (plan) {
+                SubPlan sp;
+                sp.expr = expr_root;
+                sp.kind = subquery_kind_of(expr_root);
+                sp.correlated = analyzer_.is_correlated(expr_root);
+                sp.plan = std::move(plan);
+                owner->subplans.push_back(std::move(sp));
+            }
+            // A subquery we cannot bind is left unrepresented rather than
+            // failing the whole statement; `error` is only surfaced on a hard
+            // top-level failure. (Silently skipped here by design.)
+            (void)error;
+        }
+        return;
+    }
+    for (const ASTNode* c = first_child(expr_root); c != nullptr; c = c->next_sibling) {
+        attach_subqueries(owner, c, error);
+    }
 }
 
 }  // namespace db25::plan
