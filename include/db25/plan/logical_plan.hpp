@@ -143,8 +143,12 @@ struct LogicalNode {
     std::vector<ExprPtr> exprs;
 
     // --- Aggregate payload ---
-    std::vector<const ast::ASTNode*> group_keys;   // GROUP BY expressions
-    std::vector<const ast::ASTNode*> aggregates;   // aggregate call nodes
+    // Owned, typed grouping keys and aggregate calls, each lowered against the
+    // Aggregate's input (its child's output) schema. An aggregate call lowers to
+    // an ExprKind::Aggregate node whose children are the (already positional)
+    // argument expressions.
+    std::vector<ExprPtr> group_keys;   // GROUP BY expressions
+    std::vector<ExprPtr> aggregates;   // aggregate call expressions
 
     // --- Window payload ---
     // Borrowed window-function call nodes (each a FunctionCall carrying a

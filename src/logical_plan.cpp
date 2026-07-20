@@ -133,6 +133,24 @@ void dump_rec(const LogicalNode* n, int depth, std::string& out) {
             out.append(" rows=");
             out.append(std::to_string(n->value_rows.size()));
             break;
+        case LogicalOp::Aggregate: {
+            out.append(" group=(");
+            for (std::size_t i = 0; i < n->group_keys.size(); ++i) {
+                if (i != 0) {
+                    out.append(", ");
+                }
+                out.append(n->group_keys[i] ? dump_expr(*n->group_keys[i]) : "?");
+            }
+            out.append(") aggs=(");
+            for (std::size_t i = 0; i < n->aggregates.size(); ++i) {
+                if (i != 0) {
+                    out.append(", ");
+                }
+                out.append(n->aggregates[i] ? dump_expr(*n->aggregates[i]) : "?");
+            }
+            out.push_back(')');
+            break;
+        }
         case LogicalOp::Window:
             out.append(" fns=");
             out.append(std::to_string(n->window_functions.size()));

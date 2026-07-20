@@ -574,14 +574,34 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
 
     if (group_by != nullptr || !aggregates.empty()) {
         auto agg = make_node(LogicalOp::Aggregate);
-        // Group keys: the GROUP BY expressions, or empty for implicit aggregation.
+        // Group keys and aggregate calls are lowered against the Aggregate's
+        // input (its child's output), where their base-column references live.
+        const Schema& agg_input = current->output;
+        // Group keys: the GROUP BY expressions, or empty for implicit
+        // aggregation. Keys are base-column references or expressions over the
+        // input, which lower directly. (GROUP BY by output ordinal `GROUP BY 1`
+        // or by select alias is rejected upstream by the analyzer, so it never
+        // reaches a clean bind and is not resolved here.)
         for (const ASTNode* key = group_by != nullptr ? first_child(group_by) : nullptr;
              key != nullptr; key = key->next_sibling) {
-            agg->group_keys.push_back(key);
+            auto e = lower_expr(key, agg_input, error);
+            if (!e) {
+                return nullptr;
+            }
+            agg->group_keys.push_back(std::move(e));
         }
-        agg->aggregates = std::move(aggregates);
+        for (const ASTNode* call : aggregates) {
+            auto e = lower_expr(call, agg_input, error);
+            if (!e) {
+                return nullptr;
+            }
+            agg->aggregates.push_back(std::move(e));
+        }
         // Derive the aggregate output by walking the SELECT list in order,
-        // reading each item's type / nullability back from the analyzer.
+        // reading each item's type / nullability back from the analyzer. A
+        // group-key passthrough (a bare column reference) additionally carries
+        // its source (table_id, column_id) so an operator above resolves it by
+        // id rather than only by name.
         if (select_list != nullptr) {
             for (const ASTNode* item = first_child(select_list); item != nullptr;
                  item = item->next_sibling) {
@@ -589,6 +609,11 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
                 col.name = item_output_name(item);
                 col.type = analyzer_.type_of(item);
                 col.nullable = analyzer_.nullability_of(item) != 1;
+                if (item->node_type == NodeType::ColumnRef ||
+                    item->node_type == NodeType::Identifier) {
+                    col.table_id = item->context.analysis.table_id;
+                    col.column_id = item->context.analysis.column_id;
+                }
                 agg->output.push_back(std::move(col));
             }
         }
