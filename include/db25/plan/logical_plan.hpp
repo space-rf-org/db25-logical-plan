@@ -11,10 +11,14 @@
 //   * Every node carries an explicit output schema (the columns it produces),
 //     mirroring db25::semantic::ResolvedColumn so the shapes line up 1:1 with
 //     what Analyzer::projection_of() reports.
-//   * Expression payloads (predicates, projected expressions, group keys,
-//     aggregates) are *borrowed* pointers into the parser-owned AST. The Parser
-//     that produced the AST must therefore outlive the LogicalNode tree, exactly
-//     as the Analyzer already requires.
+//   * Expression payloads are being migrated, one operator at a time, from
+//     *borrowed* AST pointers to the owned, typed Expr IR (see expr_ir.hpp).
+//     Migrated payloads (currently: Filter / Join predicates) own their
+//     expression trees outright and carry baked type / nullability / positional
+//     column slots, so they no longer depend on the parser arena. Not-yet-
+//     migrated payloads (projected expressions, group keys, aggregates, ...)
+//     remain borrowed pointers into the parser-owned AST, which must therefore
+//     still outlive the LogicalNode tree, exactly as the Analyzer requires.
 //
 // The build matches the rest of the stack: C++23, -fno-exceptions.
 
@@ -31,6 +35,13 @@
 namespace db25::plan {
 
 using ast::DataType;
+
+// The owned, typed expression IR node (defined in expr_ir.hpp). Forward-declared
+// here so migrated operator payloads can own Expr trees by `unique_ptr` without
+// this header depending on the full expression vocabulary. LogicalNode's
+// destructor is defined out-of-line (logical_plan.cpp, where Expr is complete).
+struct Expr;
+using ExprPtr = std::unique_ptr<Expr>;
 
 // The relational-algebra operators this IR can represent. A LogicalNode's `op`
 // selects which of the op-specific payload fields below are meaningful.
@@ -114,9 +125,11 @@ struct LogicalNode {
     std::string alias;       // correlation name, empty if none
 
     // --- Filter / Join payload ---
-    // Borrowed predicate expression subtree (WHERE condition, or a join's ON
-    // condition). nullptr for a CROSS join or an unconditioned filter.
-    const ast::ASTNode* predicate = nullptr;
+    // Owned, typed predicate expression (WHERE / HAVING condition, or a join's
+    // ON condition), lowered against this node's input schema so its column
+    // leaves are positional. Null for a CROSS join, a USING join, or an
+    // unconditioned filter.
+    ExprPtr predicate;
 
     // --- Join payload ---
     ast::JoinType join_type = ast::JoinType::Inner;
@@ -171,6 +184,12 @@ struct LogicalNode {
     std::vector<const ast::ASTNode*> assignments;
 
     explicit LogicalNode(LogicalOp o) : op(o) {}
+
+    // Out-of-line (defined in logical_plan.cpp) because `predicate` is an owning
+    // unique_ptr to the forward-declared Expr; the destructor must be emitted
+    // where Expr is a complete type. Moves are consequently not implicitly
+    // declared, which is fine: LogicalNode is only ever held by unique_ptr.
+    ~LogicalNode();
 
     [[nodiscard]] LogicalNode* child(std::size_t i) const {
         return i < children.size() ? children[i].get() : nullptr;

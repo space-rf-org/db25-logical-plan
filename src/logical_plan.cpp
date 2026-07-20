@@ -2,11 +2,17 @@
 
 #include "db25/plan/logical_plan.hpp"
 
+#include "db25/plan/expr_ir.hpp"  // complete Expr for ~LogicalNode + dump_expr
 #include "db25/ast/node_types.hpp"
 
 #include <string>
 
 namespace db25::plan {
+
+// Defined here (not inline in the header) because LogicalNode owns an ExprPtr to
+// the forward-declared Expr; the destructor is emitted in this TU, where
+// expr_ir.hpp has made Expr complete.
+LogicalNode::~LogicalNode() = default;
 
 const char* logical_op_to_string(LogicalOp op) noexcept {
     switch (op) {
@@ -64,6 +70,12 @@ void dump_rec(const LogicalNode* n, int depth, std::string& out) {
                 out.append(n->alias);
             }
             break;
+        case LogicalOp::Filter:
+            if (n->predicate) {
+                out.push_back(' ');
+                out.append(dump_expr(*n->predicate));
+            }
+            break;
         case LogicalOp::Join:
             out.append(" (");
             switch (n->join_type) {
@@ -75,6 +87,10 @@ void dump_rec(const LogicalNode* n, int depth, std::string& out) {
                 case ast::JoinType::Lateral: out.append("LATERAL"); break;
             }
             out.push_back(')');
+            if (n->predicate) {
+                out.append(" ON ");
+                out.append(dump_expr(*n->predicate));
+            }
             break;
         case LogicalOp::Limit:
             if (n->has_limit) {

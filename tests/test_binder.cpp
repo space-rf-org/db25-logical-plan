@@ -20,6 +20,7 @@ using db25::ast::SetOp;
 using db25::plan::Binder;
 using db25::plan::BindResult;
 using db25::plan::ColumnSchema;
+using db25::plan::ExprKind;
 using db25::plan::LogicalNode;
 using db25::plan::LogicalOp;
 using db25::plan::SubqueryKind;
@@ -109,6 +110,21 @@ void test_scan_filter_project_limit(const InMemoryCatalog& cat) {
         const LogicalNode* filter = only_child(project);
         check(filter && filter->op == LogicalOp::Filter, "child is Filter");
         check(filter && filter->predicate != nullptr, "filter has predicate");
+        if (filter && filter->predicate) {
+            // WHERE id = 1 lowers to an owned, typed BinaryOp with a positional
+            // column leaf (id is slot #0 of the users scan) and an int literal.
+            const auto& p = *filter->predicate;
+            check(p.kind == ExprKind::BinaryOp, "predicate is a BinaryOp");
+            check(p.bin_op == db25::ast::BinaryOp::Equal, "predicate operator is '='");
+            check(p.type == DataType::Boolean, "predicate typed Boolean");
+            check(p.children.size() == 2, "predicate has 2 operands");
+            if (p.children.size() == 2) {
+                check(p.children[0]->kind == ExprKind::ColumnRef &&
+                          p.children[0]->input_index == 0,
+                      "lhs is column ref #0 (id)");
+                check(p.children[1]->kind == ExprKind::Literal, "rhs is a literal");
+            }
+        }
 
         const LogicalNode* scan = only_child(filter);
         check(scan && scan->op == LogicalOp::Scan, "leaf is Scan");
@@ -143,6 +159,24 @@ void test_inner_join(const InMemoryCatalog& cat) {
         check(join && join->op == LogicalOp::Join, "child is Join");
         check(join && join->join_type == db25::ast::JoinType::Inner, "inner join");
         check(join && join->predicate != nullptr, "join has ON predicate");
+        if (join && join->predicate) {
+            // ON u.id = o.user_id lowers over the concatenated input schema
+            // [users.id #0, users.name #1, orders.id #2, orders.user_id #3,
+            //  orders.total #4], so both sides are positional column refs.
+            const auto& p = *join->predicate;
+            check(p.kind == ExprKind::BinaryOp &&
+                      p.bin_op == db25::ast::BinaryOp::Equal,
+                  "ON predicate is '='");
+            check(p.children.size() == 2, "ON predicate has 2 operands");
+            if (p.children.size() == 2) {
+                check(p.children[0]->kind == ExprKind::ColumnRef &&
+                          p.children[0]->input_index == 0,
+                      "lhs is column ref #0 (u.id)");
+                check(p.children[1]->kind == ExprKind::ColumnRef &&
+                          p.children[1]->input_index == 3,
+                      "rhs is column ref #3 (o.user_id)");
+            }
+        }
         check(join && join->child_count() == 2, "join has 2 inputs");
         if (join && join->child_count() == 2) {
             check(join->child(0)->op == LogicalOp::Scan &&

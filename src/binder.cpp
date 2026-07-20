@@ -92,12 +92,12 @@ ast::SetOp setop_kind(const ASTNode* n) {
 // Build a binary Join node over two already-bound inputs, producing the
 // concatenated (left ++ right) output schema with outer-join nullability applied
 // to the null-supplying side. Used for explicit joins without USING and for
-// comma / CROSS joins.
+// comma / CROSS joins. The node is created predicate-less; a caller with an ON
+// condition lowers it (against the join's concatenated input schema) afterwards.
 LogicalNodePtr make_join_node(LogicalNodePtr left, LogicalNodePtr right,
-                              ast::JoinType jt, const ASTNode* predicate) {
+                              ast::JoinType jt) {
     auto join = std::make_unique<LogicalNode>(LogicalOp::Join);
     join->join_type = jt;
-    join->predicate = predicate;
     const bool null_left = jt == ast::JoinType::Right || jt == ast::JoinType::Full;
     const bool null_right = jt == ast::JoinType::Left || jt == ast::JoinType::Full;
     Schema out;
@@ -315,7 +315,16 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
 
     const ast::JoinType jt = join_type_of(join_node);
     if (using_clause == nullptr) {
-        return make_join_node(std::move(left), std::move(right), jt, predicate);
+        auto join = make_join_node(std::move(left), std::move(right), jt);
+        if (predicate != nullptr) {
+            // Lower the ON condition against the join's concatenated input
+            // schema (left.output ++ right.output = join->output).
+            join->predicate = lower_expr(predicate, join->output, error);
+            if (!join->predicate) {
+                return nullptr;
+            }
+        }
+        return join;
     }
 
     // JOIN ... USING (cols): the named columns are shared and collapse to a
@@ -337,7 +346,8 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
 
     auto join = make_node(LogicalOp::Join);
     join->join_type = jt;
-    join->predicate = nullptr;
+    // A USING join stays predicate-less (the equality is implied); `predicate`
+    // is left default-null.
     const bool null_left = jt == ast::JoinType::Right || jt == ast::JoinType::Full;
     const bool null_right = jt == ast::JoinType::Left || jt == ast::JoinType::Full;
     Schema out;
@@ -384,7 +394,7 @@ LogicalNodePtr Binder::bind_from(const ASTNode* from_clause, std::string& error)
                 return nullptr;
             }
             current = make_join_node(std::move(current), std::move(right),
-                                     ast::JoinType::Cross, nullptr);
+                                     ast::JoinType::Cross);
         }
         // Other node kinds at FROM level are ignored (defensive).
     }
@@ -492,11 +502,17 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
 
     // --- WHERE -> Filter ---
     if (const ASTNode* where = find_child(select_stmt, NodeType::WhereClause)) {
+        const ASTNode* pred_ast = first_child(where);  // the predicate expression
         auto filter = make_node(LogicalOp::Filter);
-        filter->predicate = first_child(where);  // the predicate expression
-        filter->output = current->output;         // filter is schema-preserving
-        // Represent IN / EXISTS / scalar subqueries in the predicate.
-        attach_subqueries(filter.get(), filter->predicate, error);
+        filter->output = current->output;   // filter is schema-preserving
+        // Lower the predicate against the child's output (the filter's input).
+        filter->predicate = lower_expr(pred_ast, current->output, error);
+        if (!filter->predicate) {
+            return nullptr;
+        }
+        // Represent IN / EXISTS / scalar subqueries in the predicate. Its input
+        // (= the filter's output) is the enclosing schema for correlation.
+        attach_subqueries(filter.get(), pred_ast, filter->output, error);
         filter->add_child(std::move(current));
         current = std::move(filter);
     }
@@ -556,10 +572,15 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
 
         // --- HAVING -> Filter (post-aggregation predicate, above the Aggregate) ---
         if (having != nullptr) {
+            const ASTNode* pred_ast = first_child(having);  // the HAVING condition
             auto filter = make_node(LogicalOp::Filter);
-            filter->predicate = first_child(having);  // the HAVING condition
-            filter->output = current->output;          // schema-preserving
-            attach_subqueries(filter.get(), filter->predicate, error);
+            filter->output = current->output;   // schema-preserving
+            // Lower against the aggregate's output (the HAVING filter's input).
+            filter->predicate = lower_expr(pred_ast, current->output, error);
+            if (!filter->predicate) {
+                return nullptr;
+            }
+            attach_subqueries(filter.get(), pred_ast, filter->output, error);
             filter->add_child(std::move(current));
             current = std::move(filter);
         }
@@ -607,11 +628,15 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
         return nullptr;
     }
     if (select_list != nullptr) {
+        // The Project's input is its child's output (the FROM-clause rows); that
+        // is the enclosing schema against which a correlated SELECT-list scalar
+        // subquery resolves its outer references.
+        const Schema& project_input = current->output;
         for (const ASTNode* item = first_child(select_list); item != nullptr;
              item = item->next_sibling) {
             project->exprs.push_back(item);
             // Represent scalar subqueries embedded in a SELECT-list item.
-            attach_subqueries(project.get(), item, error);
+            attach_subqueries(project.get(), item, project_input, error);
         }
     }
     project->add_child(std::move(current));
@@ -747,9 +772,13 @@ LogicalNodePtr Binder::bind_update(const ASTNode* update_stmt, std::string& erro
         return nullptr;
     }
     if (const ASTNode* where = find_child(update_stmt, NodeType::WhereClause)) {
+        const ASTNode* pred_ast = first_child(where);
         auto filter = make_node(LogicalOp::Filter);
-        filter->predicate = first_child(where);
         filter->output = child->output;
+        filter->predicate = lower_expr(pred_ast, child->output, error);
+        if (!filter->predicate) {
+            return nullptr;
+        }
         filter->add_child(std::move(child));
         child = std::move(filter);
     }
@@ -780,9 +809,13 @@ LogicalNodePtr Binder::bind_delete(const ASTNode* delete_stmt, std::string& erro
         return nullptr;
     }
     if (const ASTNode* where = find_child(delete_stmt, NodeType::WhereClause)) {
+        const ASTNode* pred_ast = first_child(where);
         auto filter = make_node(LogicalOp::Filter);
-        filter->predicate = first_child(where);
         filter->output = child->output;
+        filter->predicate = lower_expr(pred_ast, child->output, error);
+        if (!filter->predicate) {
+            return nullptr;
+        }
         filter->add_child(std::move(child));
         child = std::move(filter);
     }
@@ -882,7 +915,7 @@ SubqueryKind subquery_kind_of(const ASTNode* subquery) {
 }  // namespace
 
 void Binder::attach_subqueries(LogicalNode* owner, const ASTNode* expr_root,
-                               std::string& error) {
+                               const Schema& input, std::string& error) {
     if (expr_root == nullptr) {
         return;
     }
@@ -891,8 +924,13 @@ void Binder::attach_subqueries(LogicalNode* owner, const ASTNode* expr_root,
     if (expr_root->node_type == NodeType::Subquery) {
         const ASTNode* body = subquery_body(expr_root);
         if (body != nullptr) {
+            // Push the owner's input as an enclosing schema so a correlated
+            // reference inside the subquery body resolves outward (matching
+            // lower_subquery); pop it once the body is bound.
+            outer_inputs_.push_back(&input);
             std::string local_error;
             auto plan = bind_query(body, local_error);
+            outer_inputs_.pop_back();
             if (plan) {
                 SubPlan sp;
                 sp.expr = expr_root;
@@ -909,7 +947,7 @@ void Binder::attach_subqueries(LogicalNode* owner, const ASTNode* expr_root,
         return;
     }
     for (const ASTNode* c = first_child(expr_root); c != nullptr; c = c->next_sibling) {
-        attach_subqueries(owner, c, error);
+        attach_subqueries(owner, c, input, error);
     }
 }
 
