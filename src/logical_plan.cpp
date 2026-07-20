@@ -19,6 +19,9 @@ const char* logical_op_to_string(LogicalOp op) noexcept {
         case LogicalOp::Limit:     return "Limit";
         case LogicalOp::SetOp:     return "SetOp";
         case LogicalOp::Values:    return "Values";
+        case LogicalOp::Insert:    return "Insert";
+        case LogicalOp::Update:    return "Update";
+        case LogicalOp::Delete:    return "Delete";
     }
     return "?";
 }
@@ -79,6 +82,33 @@ void dump_rec(const LogicalNode* n, int depth, std::string& out) {
                 out.append(" offset=");
                 out.append(std::to_string(n->offset));
             }
+            break;
+        case LogicalOp::Sort:
+            out.append(" keys=");
+            out.append(std::to_string(n->sort_keys.size()));
+            for (const auto& k : n->sort_keys) {
+                out.append(k.descending ? " DESC" : " ASC");
+            }
+            break;
+        case LogicalOp::SetOp:
+            out.append(" (");
+            switch (n->set_op) {
+                case ast::SetOp::Union:     out.append("UNION"); break;
+                case ast::SetOp::UnionAll:  out.append("UNION ALL"); break;
+                case ast::SetOp::Intersect: out.append("INTERSECT"); break;
+                case ast::SetOp::Except:    out.append("EXCEPT"); break;
+            }
+            out.push_back(')');
+            break;
+        case LogicalOp::Values:
+            out.append(" rows=");
+            out.append(std::to_string(n->value_rows.size()));
+            break;
+        case LogicalOp::Insert:
+        case LogicalOp::Update:
+        case LogicalOp::Delete:
+            out.push_back(' ');
+            out.append(n->table_name);
             break;
         default:
             break;

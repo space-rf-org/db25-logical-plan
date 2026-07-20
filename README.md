@@ -27,7 +27,8 @@ which are vendored read-only.
 
 ### Logical IR — `include/db25/plan/logical_plan.hpp`
 
-* `LogicalOp` — `{ Scan, Filter, Project, Join, Aggregate, Sort, Limit, SetOp, Values }`.
+* `LogicalOp` — `{ Scan, Filter, Project, Join, Aggregate, Sort, Limit, SetOp,
+  Values, Insert, Update, Delete }`.
 * `LogicalNode` — an owning tree (`std::unique_ptr` children) where every node
   carries an **output schema**: a `std::vector<ColumnSchema>` and each
   `ColumnSchema` is `{ std::string name, db25::ast::DataType type, bool nullable,
@@ -53,27 +54,45 @@ Scan(s) -> [Join] -> [Filter (WHERE)] -> [Aggregate (GROUP BY)]
 * **`SELECT` list -> Project**, whose output schema is the analyzer's resolved
   projection (`projection_of`) — names, types and nullability, including
   `SELECT *` expansion.
+* **`SELECT` without `FROM`** (e.g. `SELECT 1 + 2`, `SELECT now()`) -> a Project
+  over a synthetic single-row / zero-column **Values** input.
 * **`LIMIT` / `OFFSET` -> Limit** (non-negative integer literals parsed to values).
-* **`INNER JOIN` -> Join** with a concatenated output schema; outer-join
-  nullability (`LEFT` / `RIGHT` / `FULL`) is applied to the null-supplying side.
+* **`INNER` / `LEFT` / `RIGHT` / `FULL JOIN` -> Join** with a concatenated output
+  schema; outer-join nullability is applied to the null-supplying side.
+* **Comma / `CROSS JOIN` -> Join** (`Cross`, no predicate).
+* **`JOIN ... USING (cols)` -> Join** with the named columns **merged** to a
+  single output column (the right-side duplicates are dropped).
+* **Derived tables / subqueries in `FROM`** -> the inner query block is bound and
+  used as the Scan-equivalent input; its output schema is the derived
+  projection, labeled with the correlation alias.
 * **`GROUP BY` -> Aggregate** carrying group keys + detected aggregate calls, with
   a per-item output schema read back from the analyzer.
-* **`ORDER BY` -> Sort** (node inserted, schema-preserving).
+* **`ORDER BY` -> Sort** carrying real sort keys with `ASC` / `DESC` direction and
+  `NULLS FIRST` / `LAST` placement (schema-preserving).
+* **Set operations** `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT` -> a **SetOp**
+  node with the two child plans and the analyzer's reconciled output schema
+  (`projection_of`), preserving the parser's left-associative folding.
+* **DML** — `INSERT` / `UPDATE` / `DELETE` -> **Insert** / **Update** / **Delete**
+  nodes carrying the target table and the relevant child plan: a `Values` node
+  or bound query source for `INSERT`, and a `Scan` (wrapped in a `Filter` when a
+  `WHERE` clause is present) for `UPDATE` / `DELETE`. `UPDATE` also carries its
+  borrowed `SET` assignment nodes.
 
 **Not yet lowered (clearly-marked `TODO`s in the source)**
 
-* Derived tables / subqueries and `VALUES` in `FROM`.
-* Comma / cross joins of base tables and `JOIN ... USING`.
-* Set operations (`UNION` / `INTERSECT` / `EXCEPT`) and DML.
-* `SELECT` without `FROM` (constant projection).
-* Sort keys and directions on the `Sort` node.
+* `RETURNING` projections, `ON CONFLICT`, and multi-table `UPDATE` / `DELETE`.
+* `LATERAL` joins, `GROUPING SETS` / `CUBE` / `ROLLUP`, window functions in the
+  plan, and correlated-subquery decorrelation.
 
 ### Tests — `tests/test_binder.cpp`
 
 A self-contained harness (no gtest, so no network fetch and a clean
-`-fno-exceptions` build). It parses + analyzes + binds five queries and asserts
-both the logical tree shape and the `Project` output schema (names + types +
-nullability). Run via `ctest` or the `test_binder` binary.
+`-fno-exceptions` build). It parses + analyzes + binds a spread of queries —
+scan/filter/project/limit, joins (inner, comma/cross, `USING`), `GROUP BY`,
+`ORDER BY`, `SELECT` without `FROM`, derived tables, set operations, and
+`INSERT` / `UPDATE` / `DELETE` — and asserts both the logical tree shape and the
+output schema (names + types + nullability). Run via `ctest` or the
+`test_binder` binary.
 
 ## Submodule pattern
 
