@@ -52,6 +52,72 @@ bool is_join_node(NodeType t) {
     }
 }
 
+// A derived table / subquery used as a FROM relation.
+bool is_derived_node(NodeType t) {
+    return t == NodeType::Subquery || t == NodeType::SubqueryExpr;
+}
+
+// A set-operation node (UNION / INTERSECT / EXCEPT).
+bool is_setop_node(NodeType t) {
+    return t == NodeType::UnionStmt || t == NodeType::IntersectStmt ||
+           t == NodeType::ExceptStmt;
+}
+
+// The inner query block of a subquery / derived table: a SELECT block or a
+// nested set operation.
+const ASTNode* subquery_body(const ASTNode* node) {
+    if (ASTNode* sel = find_child(node, NodeType::SelectStmt)) {
+        return sel;
+    }
+    for (const ASTNode* c = first_child(node); c != nullptr; c = c->next_sibling) {
+        if (is_setop_node(c->node_type)) {
+            return c;
+        }
+    }
+    return nullptr;
+}
+
+// Map a set-operation AST node to the IR SetOp, honoring UNION ALL (the ALL
+// flag) vs. distinct UNION.
+ast::SetOp setop_kind(const ASTNode* n) {
+    const bool all = n->has_flag(ast::NodeFlags::All);
+    switch (n->node_type) {
+        case NodeType::UnionStmt:     return all ? ast::SetOp::UnionAll : ast::SetOp::Union;
+        case NodeType::IntersectStmt: return ast::SetOp::Intersect;
+        case NodeType::ExceptStmt:    return ast::SetOp::Except;
+        default:                      return ast::SetOp::Union;
+    }
+}
+
+// Build a binary Join node over two already-bound inputs, producing the
+// concatenated (left ++ right) output schema with outer-join nullability applied
+// to the null-supplying side. Used for explicit joins without USING and for
+// comma / CROSS joins.
+LogicalNodePtr make_join_node(LogicalNodePtr left, LogicalNodePtr right,
+                              ast::JoinType jt, const ASTNode* predicate) {
+    auto join = std::make_unique<LogicalNode>(LogicalOp::Join);
+    join->join_type = jt;
+    join->predicate = predicate;
+    const bool null_left = jt == ast::JoinType::Right || jt == ast::JoinType::Full;
+    const bool null_right = jt == ast::JoinType::Left || jt == ast::JoinType::Full;
+    Schema out;
+    out.reserve(left->output.size() + right->output.size());
+    for (const auto& col : left->output) {
+        ColumnSchema c = col;
+        c.nullable = c.nullable || null_left;
+        out.push_back(std::move(c));
+    }
+    for (const auto& col : right->output) {
+        ColumnSchema c = col;
+        c.nullable = c.nullable || null_right;
+        out.push_back(std::move(c));
+    }
+    join->output = std::move(out);
+    join->add_child(std::move(left));
+    join->add_child(std::move(right));
+    return join;
+}
+
 std::string upper(std::string_view s) {
     std::string out;
     out.reserve(s.size());
@@ -153,15 +219,40 @@ LogicalNodePtr Binder::bind_table_ref(const ASTNode* table_ref, std::string& err
     return scan;
 }
 
+LogicalNodePtr Binder::bind_relation(const ASTNode* relation, std::string& error) {
+    if (relation->node_type == NodeType::TableRef) {
+        return bind_table_ref(relation, error);
+    }
+    if (is_derived_node(relation->node_type)) {
+        // Derived table / subquery in FROM: bind the inner query block and use
+        // its plan as the Scan-equivalent input. Its output schema is the
+        // derived projection (analyzer-resolved); the alias labels the relation.
+        const ASTNode* body = subquery_body(relation);
+        if (body == nullptr) {
+            error = "derived table without a query body";
+            return nullptr;
+        }
+        auto inner = bind_query(body, error);
+        if (!inner) {
+            return nullptr;
+        }
+        inner->alias = std::string{alias_of(relation)};
+        return inner;
+    }
+    error = "unsupported FROM relation kind (TODO)";
+    return nullptr;
+}
+
 LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
                                  std::string& error) {
-    // A join node's children are the right-hand relation(s) plus the ON
-    // predicate. Bind the first relation child as the right input; the first
-    // non-relation, non-USING child is the ON condition.
+    // A join node's children are the right-hand relation plus either an ON
+    // predicate or a USING clause. Bind the first relation child as the right
+    // input; the first non-relation, non-USING child is the ON condition.
     const ASTNode* right_ref = nullptr;
     const ASTNode* predicate = nullptr;
+    const ASTNode* using_clause = nullptr;
     for (const ASTNode* c = first_child(join_node); c != nullptr; c = c->next_sibling) {
-        if (c->node_type == NodeType::TableRef) {
+        if (c->node_type == NodeType::TableRef || is_derived_node(c->node_type)) {
             if (right_ref == nullptr) {
                 right_ref = c;
             }
@@ -169,33 +260,48 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
             error = "nested join in a single join node not yet lowered (TODO)";
             return nullptr;
         } else if (c->node_type == NodeType::UsingClause) {
-            error = "JOIN USING not yet lowered (TODO)";
-            return nullptr;
+            using_clause = c;
         } else if (predicate == nullptr) {
             predicate = c;  // the ON expression
         }
     }
     if (right_ref == nullptr) {
-        error = "join without a right-hand base table not yet lowered (TODO)";
+        error = "join without a right-hand relation not yet lowered (TODO)";
         return nullptr;
     }
 
-    auto right = bind_table_ref(right_ref, error);
+    auto right = bind_relation(right_ref, error);
     if (!right) {
         return nullptr;
     }
 
+    const ast::JoinType jt = join_type_of(join_node);
+    if (using_clause == nullptr) {
+        return make_join_node(std::move(left), std::move(right), jt, predicate);
+    }
+
+    // JOIN ... USING (cols): the named columns are shared and collapse to a
+    // single merged output column. Keep the left copy and drop the right's
+    // duplicate. The join stays predicate-less (the equality is implied).
+    std::vector<std::string_view> merged;
+    for (const ASTNode* col = first_child(using_clause); col != nullptr;
+         col = col->next_sibling) {
+        merged.push_back(split_column_ref(col->primary_text).column);
+    }
+    const auto is_merged = [&merged](std::string_view name) {
+        for (const std::string_view m : merged) {
+            if (m == name) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     auto join = make_node(LogicalOp::Join);
-    join->join_type = join_type_of(join_node);
-    join->predicate = predicate;
-
-    // Build the concatenated output schema (left ++ right) with outer-join
-    // nullability applied to the null-supplying side.
-    const bool null_left =
-        join->join_type == ast::JoinType::Right || join->join_type == ast::JoinType::Full;
-    const bool null_right =
-        join->join_type == ast::JoinType::Left || join->join_type == ast::JoinType::Full;
-
+    join->join_type = jt;
+    join->predicate = nullptr;
+    const bool null_left = jt == ast::JoinType::Right || jt == ast::JoinType::Full;
+    const bool null_right = jt == ast::JoinType::Left || jt == ast::JoinType::Full;
     Schema out;
     for (const auto& col : left->output) {
         ColumnSchema c = col;
@@ -203,12 +309,14 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
         out.push_back(std::move(c));
     }
     for (const auto& col : right->output) {
+        if (is_merged(col.name)) {
+            continue;  // merged into the left copy
+        }
         ColumnSchema c = col;
         c.nullable = c.nullable || null_right;
         out.push_back(std::move(c));
     }
     join->output = std::move(out);
-
     join->add_child(std::move(left));
     join->add_child(std::move(right));
     return join;
@@ -220,11 +328,7 @@ LogicalNodePtr Binder::bind_from(const ASTNode* from_clause, std::string& error)
         error = "empty FROM clause";
         return nullptr;
     }
-    if (item->node_type != NodeType::TableRef) {
-        error = "FROM item kind not yet lowered (TODO: derived tables / VALUES)";
-        return nullptr;
-    }
-    LogicalNodePtr current = bind_table_ref(item, error);
+    LogicalNodePtr current = bind_relation(item, error);
     if (!current) {
         return nullptr;
     }
@@ -234,37 +338,118 @@ LogicalNodePtr Binder::bind_from(const ASTNode* from_clause, std::string& error)
             if (!current) {
                 return nullptr;
             }
-        } else if (item->node_type == NodeType::TableRef) {
-            error = "comma / cross join of base tables not yet lowered (TODO)";
-            return nullptr;
+        } else if (item->node_type == NodeType::TableRef ||
+                   is_derived_node(item->node_type)) {
+            // A comma-separated FROM item is a CROSS join of the two relations.
+            auto right = bind_relation(item, error);
+            if (!right) {
+                return nullptr;
+            }
+            current = make_join_node(std::move(current), std::move(right),
+                                     ast::JoinType::Cross, nullptr);
         }
         // Other node kinds at FROM level are ignored (defensive).
     }
     return current;
 }
 
-BindResult Binder::bind(const ASTNode* select_stmt) {
+BindResult Binder::bind(const ASTNode* stmt) {
     BindResult result;
-    if (select_stmt == nullptr) {
+    if (stmt == nullptr) {
         result.error = "null statement";
         return result;
     }
-    if (select_stmt->node_type != NodeType::SelectStmt) {
-        // Set operations (UNION/...) and DML are out of scope for this slice.
-        result.error =
-            "only single SELECT statements are lowered today (TODO: set ops, DML)";
-        return result;
+    switch (stmt->node_type) {
+        case NodeType::SelectStmt:
+        case NodeType::UnionStmt:
+        case NodeType::IntersectStmt:
+        case NodeType::ExceptStmt:
+            result.root = bind_query(stmt, result.error);
+            break;
+        case NodeType::InsertStmt:
+            result.root = bind_insert(stmt, result.error);
+            break;
+        case NodeType::UpdateStmt:
+            result.root = bind_update(stmt, result.error);
+            break;
+        case NodeType::DeleteStmt:
+            result.root = bind_delete(stmt, result.error);
+            break;
+        default:
+            result.error = "statement kind not yet lowered (TODO)";
+            return result;
+    }
+    result.ok = (result.root != nullptr);
+    return result;
+}
+
+LogicalNodePtr Binder::bind_query(const ASTNode* query, std::string& error) {
+    if (query == nullptr) {
+        error = "null query";
+        return nullptr;
+    }
+    if (query->node_type == NodeType::SelectStmt) {
+        return bind_select(query, error);
+    }
+    if (is_setop_node(query->node_type)) {
+        return bind_setop(query, error);
+    }
+    error = "unsupported query block kind (TODO)";
+    return nullptr;
+}
+
+LogicalNodePtr Binder::bind_setop(const ASTNode* setop, std::string& error) {
+    // A set-operation node has exactly two branch children (left, right); the
+    // parser folds successive operators left-deep, so the left child may itself
+    // be a nested set operation. This left-associativity is preserved here.
+    const ASTNode* left_q = first_child(setop);
+    const ASTNode* right_q = left_q != nullptr ? left_q->next_sibling : nullptr;
+    if (left_q == nullptr || right_q == nullptr) {
+        error = "set operation without two branches";
+        return nullptr;
+    }
+    auto left = bind_query(left_q, error);
+    if (!left) {
+        return nullptr;
+    }
+    auto right = bind_query(right_q, error);
+    if (!right) {
+        return nullptr;
     }
 
-    // --- FROM -> Scan / Join subtree ---
+    auto node = make_node(LogicalOp::SetOp);
+    node->set_op = setop_kind(setop);
+    // The reconciled output schema is the analyzer's projection for the set-op
+    // node (arity checked, branch types unified, nullability OR-ed).
+    if (const auto* proj = analyzer_.projection_of(setop)) {
+        node->output.reserve(proj->size());
+        for (const auto& c : *proj) {
+            node->output.push_back(to_schema(c));
+        }
+    } else {
+        error = "analyzer produced no projection for this set operation";
+        return nullptr;
+    }
+    node->add_child(std::move(left));
+    node->add_child(std::move(right));
+    return node;
+}
+
+LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& error) {
+    // --- FROM -> Scan / Join subtree (or a synthetic single row) ---
+    LogicalNodePtr current;
     const ASTNode* from = find_child(select_stmt, NodeType::FromClause);
     if (from == nullptr) {
-        result.error = "SELECT without FROM not yet lowered (TODO: constant / VALUES)";
-        return result;
-    }
-    LogicalNodePtr current = bind_from(from, result.error);
-    if (!current) {
-        return result;
+        // FROM-less SELECT (e.g. `SELECT 1 + 2`, `SELECT now()`): project over a
+        // synthetic single-row, zero-column input (the standard "dual").
+        auto values = make_node(LogicalOp::Values);
+        values->value_rows.emplace_back();  // one empty row
+        current = std::move(values);
+    } else {
+        current = bind_from(from, error);
+        if (!current) {
+            return nullptr;
+        }
     }
 
     // --- WHERE -> Filter ---
@@ -313,8 +498,8 @@ BindResult Binder::bind(const ASTNode* select_stmt) {
             project->output.push_back(to_schema(c));
         }
     } else {
-        result.error = "analyzer produced no projection for this SELECT";
-        return result;
+        error = "analyzer produced no projection for this SELECT";
+        return nullptr;
     }
     if (select_list != nullptr) {
         for (const ASTNode* item = first_child(select_list); item != nullptr;
@@ -325,14 +510,24 @@ BindResult Binder::bind(const ASTNode* select_stmt) {
     project->add_child(std::move(current));
     current = std::move(project);
 
-    // --- ORDER BY -> Sort ---
+    // --- ORDER BY -> Sort (real sort keys + directions) ---
     if (const ASTNode* order_by = find_child(select_stmt, NodeType::OrderByClause)) {
-        (void)order_by;
         auto sort = make_node(LogicalOp::Sort);
+        // Each ORDER BY child is a sort expression; the parser records ASC/DESC
+        // and NULLS placement in its semantic_flags (bit 7 = DESC, bit 5 = NULLS
+        // ordering explicit, bit 4 = NULLS FIRST).
+        for (const ASTNode* key = first_child(order_by); key != nullptr;
+             key = key->next_sibling) {
+            SortKey sk;
+            sk.expr = key;
+            sk.descending = (key->semantic_flags & (1u << 7)) != 0;
+            sk.nulls_order_explicit = (key->semantic_flags & (1u << 5)) != 0;
+            sk.nulls_first = (key->semantic_flags & (1u << 4)) != 0;
+            sort->sort_keys.push_back(sk);
+        }
         sort->output = current->output;  // sort is schema-preserving
         sort->add_child(std::move(current));
         current = std::move(sort);
-        // TODO: capture sort keys / directions from the ORDER BY children.
     }
 
     // --- LIMIT / OFFSET -> Limit ---
@@ -354,9 +549,127 @@ BindResult Binder::bind(const ASTNode* select_stmt) {
         current = std::move(lim);
     }
 
-    result.root = std::move(current);
-    result.ok = true;
-    return result;
+    return current;
+}
+
+// ---------------------------------------------------------------------------
+// DML lowering. Each produces a dedicated logical node carrying the target
+// table plus the relevant child plan. Deeper semantics (RETURNING projections,
+// ON CONFLICT, multi-table UPDATE/DELETE, constraint checking) are left as
+// clearly-marked TODOs; the analyzer already validates the surface shapes.
+// ---------------------------------------------------------------------------
+
+LogicalNodePtr Binder::bind_insert(const ASTNode* insert_stmt, std::string& error) {
+    const ASTNode* table_ref = find_child(insert_stmt, NodeType::TableRef);
+    if (table_ref == nullptr) {
+        error = "INSERT without a target table";
+        return nullptr;
+    }
+    auto node = make_node(LogicalOp::Insert);
+    node->table_name = std::string{table_ref->primary_text};
+
+    // Explicit target column list (empty => all columns in declaration order).
+    if (const ASTNode* col_list = find_child(insert_stmt, NodeType::ColumnList)) {
+        for (const ASTNode* c = first_child(col_list); c != nullptr; c = c->next_sibling) {
+            node->target_columns.push_back(
+                std::string{split_column_ref(c->primary_text).column});
+        }
+    }
+
+    // Source of rows: a VALUES clause or a query (INSERT ... SELECT / set op).
+    if (const ASTNode* values = find_child(insert_stmt, NodeType::ValuesClause)) {
+        auto vnode = make_node(LogicalOp::Values);
+        for (const ASTNode* row = first_child(values); row != nullptr;
+             row = row->next_sibling) {
+            std::vector<const ASTNode*> vals;
+            for (const ASTNode* v = first_child(row); v != nullptr; v = v->next_sibling) {
+                vals.push_back(v);
+            }
+            vnode->value_rows.push_back(std::move(vals));
+        }
+        node->add_child(std::move(vnode));
+    } else {
+        const ASTNode* source = find_child(insert_stmt, NodeType::SelectStmt);
+        if (source == nullptr) {
+            for (const ASTNode* c = first_child(insert_stmt); c != nullptr;
+                 c = c->next_sibling) {
+                if (is_setop_node(c->node_type)) {
+                    source = c;
+                    break;
+                }
+            }
+        }
+        if (source == nullptr) {
+            error = "INSERT has neither VALUES nor a query source";
+            return nullptr;
+        }
+        auto src = bind_query(source, error);
+        if (!src) {
+            return nullptr;
+        }
+        node->add_child(std::move(src));
+    }
+    // A bare INSERT projects nothing (RETURNING is not modeled yet). TODO.
+    return node;
+}
+
+LogicalNodePtr Binder::bind_update(const ASTNode* update_stmt, std::string& error) {
+    const ASTNode* table_ref = find_child(update_stmt, NodeType::TableRef);
+    if (table_ref == nullptr) {
+        error = "UPDATE without a target table";
+        return nullptr;
+    }
+    // Child plan: a Scan of the target, wrapped in a Filter when there is a
+    // WHERE clause (the set of rows the UPDATE rewrites).
+    auto child = bind_table_ref(table_ref, error);
+    if (!child) {
+        return nullptr;
+    }
+    if (const ASTNode* where = find_child(update_stmt, NodeType::WhereClause)) {
+        auto filter = make_node(LogicalOp::Filter);
+        filter->predicate = first_child(where);
+        filter->output = child->output;
+        filter->add_child(std::move(child));
+        child = std::move(filter);
+    }
+
+    auto node = make_node(LogicalOp::Update);
+    node->table_name = std::string{table_ref->primary_text};
+    // SET assignments: each a BinaryExpr (primary_text = target column, first
+    // child = value expression). Kept borrowed; deeper checking is the
+    // analyzer's job. TODO: model the post-update output columns.
+    if (const ASTNode* set_clause = find_child(update_stmt, NodeType::SetClause)) {
+        for (const ASTNode* asgn = first_child(set_clause); asgn != nullptr;
+             asgn = asgn->next_sibling) {
+            node->assignments.push_back(asgn);
+        }
+    }
+    node->add_child(std::move(child));
+    return node;
+}
+
+LogicalNodePtr Binder::bind_delete(const ASTNode* delete_stmt, std::string& error) {
+    const ASTNode* table_ref = find_child(delete_stmt, NodeType::TableRef);
+    if (table_ref == nullptr) {
+        error = "DELETE without a target table";
+        return nullptr;
+    }
+    auto child = bind_table_ref(table_ref, error);
+    if (!child) {
+        return nullptr;
+    }
+    if (const ASTNode* where = find_child(delete_stmt, NodeType::WhereClause)) {
+        auto filter = make_node(LogicalOp::Filter);
+        filter->predicate = first_child(where);
+        filter->output = child->output;
+        filter->add_child(std::move(child));
+        child = std::move(filter);
+    }
+
+    auto node = make_node(LogicalOp::Delete);
+    node->table_name = std::string{table_ref->primary_text};
+    node->add_child(std::move(child));
+    return node;
 }
 
 }  // namespace db25::plan

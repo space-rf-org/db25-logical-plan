@@ -38,12 +38,16 @@ enum class LogicalOp : std::uint8_t {
     Scan,       // base-table access
     Filter,     // WHERE / HAVING predicate
     Project,    // SELECT list -> named output columns
-    Join,       // binary join (INNER today; others scaffolded)
+    Join,       // binary join (INNER / OUTER / CROSS; USING columns merged)
     Aggregate,  // GROUP BY + aggregate functions
-    Sort,       // ORDER BY
+    Sort,       // ORDER BY (with sort keys + directions)
     Limit,      // LIMIT / OFFSET
-    SetOp,      // UNION / INTERSECT / EXCEPT (scaffold)
-    Values,     // VALUES (row), (row), ... (scaffold)
+    SetOp,      // UNION [ALL] / INTERSECT / EXCEPT
+    Values,     // VALUES (row), (row), ... (also the synthetic single row of a
+                // FROM-less SELECT)
+    Insert,     // INSERT INTO target <- child (Values / query source)
+    Update,     // UPDATE target SET ... [WHERE] over a Scan / Filter child
+    Delete,     // DELETE FROM target [WHERE] over a Scan / Filter child
 };
 
 [[nodiscard]] const char* logical_op_to_string(LogicalOp op) noexcept;
@@ -59,6 +63,15 @@ struct ColumnSchema {
 };
 
 using Schema = std::vector<ColumnSchema>;
+
+// One ORDER BY key on a Sort node: a borrowed sort expression plus its
+// direction and (optional) NULLS placement, decoded from the parser's flags.
+struct SortKey {
+    const ast::ASTNode* expr = nullptr;  // borrowed ORDER BY expression
+    bool descending = false;             // ASC (false) / DESC (true)
+    bool nulls_order_explicit = false;   // whether NULLS FIRST/LAST was written
+    bool nulls_first = false;            // meaningful when nulls_order_explicit
+};
 
 // A node in the logical plan tree. Payload fields are grouped by the operator
 // that uses them; a node only populates the fields relevant to its `op`.
@@ -91,6 +104,14 @@ struct LogicalNode {
     std::vector<const ast::ASTNode*> group_keys;   // GROUP BY expressions
     std::vector<const ast::ASTNode*> aggregates;   // aggregate call nodes
 
+    // --- Sort payload ---
+    std::vector<SortKey> sort_keys;   // ORDER BY keys, in order
+
+    // --- Values payload ---
+    // Each row is a list of borrowed value expressions. A FROM-less SELECT is
+    // lowered over a single empty row (one row, zero columns).
+    std::vector<std::vector<const ast::ASTNode*>> value_rows;
+
     // --- Limit payload ---
     bool has_limit = false;
     bool has_offset = false;
@@ -99,6 +120,15 @@ struct LogicalNode {
 
     // --- SetOp payload ---
     ast::SetOp set_op = ast::SetOp::Union;
+
+    // --- DML payload (Insert / Update / Delete) ---
+    // The target relation name is carried in `table_name`. For INSERT,
+    // `target_columns` is the explicit target column list (empty = all columns
+    // in declaration order). For UPDATE, `assignments` holds the borrowed SET
+    // assignment nodes (each a BinaryExpr whose primary_text is the target
+    // column and whose first child is the value expression).
+    std::vector<std::string> target_columns;
+    std::vector<const ast::ASTNode*> assignments;
 
     explicit LogicalNode(LogicalOp o) : op(o) {}
 
