@@ -27,8 +27,8 @@ which are vendored read-only.
 
 ### Logical IR — `include/db25/plan/logical_plan.hpp`
 
-* `LogicalOp` — `{ Scan, Filter, Project, Join, Aggregate, Window, Sort, Limit,
-  SetOp, Values, Insert, Update, Delete, Returning }`.
+* `LogicalOp` — `{ Scan, Filter, Project, Join, Aggregate, Window, Distinct,
+  Sort, Limit, SetOp, Values, Insert, Update, Delete, Returning }`.
 * `LogicalNode` — an owning tree (`std::unique_ptr` children) where every node
   carries an **output schema**: a `std::vector<ColumnSchema>` and each
   `ColumnSchema` is `{ std::string name, db25::ast::DataType type, bool nullable,
@@ -43,8 +43,9 @@ which are vendored read-only.
 Lowers a single `SELECT` block bottom-up:
 
 ```
-Scan(s) -> [Join] -> [Filter (WHERE)] -> [Aggregate (GROUP BY)]
-        -> Project (SELECT list) -> [Sort (ORDER BY)] -> [Limit]
+Scan(s) -> [Join] -> [Filter (WHERE)] -> [Aggregate (GROUP BY / implicit)]
+        -> [Filter (HAVING)] -> Project (SELECT list) -> [Distinct]
+        -> [Sort (ORDER BY)] -> [Limit]
 ```
 
 **Lowered today**
@@ -67,6 +68,18 @@ Scan(s) -> [Join] -> [Filter (WHERE)] -> [Aggregate (GROUP BY)]
   projection, labeled with the correlation alias.
 * **`GROUP BY` -> Aggregate** carrying group keys + detected aggregate calls, with
   a per-item output schema read back from the analyzer.
+* **Implicit aggregation -> Aggregate** (empty group keys): a query that uses an
+  aggregate function without a `GROUP BY` (`SELECT COUNT(*) FROM users`) collapses
+  the input to a single group. Aggregate detection walks the whole expression
+  subtree of the `SELECT` list, `HAVING` and `ORDER BY`, so aggregates nested in a
+  larger expression (`SUM(x)+1`) or appearing only in `HAVING` / `ORDER BY` are
+  found (window calls and embedded subqueries are excluded — they aggregate
+  separately).
+* **`HAVING` -> Filter** placed **above** the `Aggregate` (a post-aggregation
+  predicate), borrowing the `HAVING` condition subtree; schema-preserving.
+* **`SELECT DISTINCT` -> Distinct** a dedicated schema-preserving node sitting
+  directly above the `Project` (so `ORDER BY` / `LIMIT` apply to the
+  de-duplicated result).
 * **`ORDER BY` -> Sort** carrying real sort keys with `ASC` / `DESC` direction and
   `NULLS FIRST` / `LAST` placement (schema-preserving).
 * **Set operations** `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT` -> a **SetOp**
@@ -110,6 +123,7 @@ Scan(s) -> [Join] -> [Filter (WHERE)] -> [Aggregate (GROUP BY)]
 A self-contained harness (no gtest, so no network fetch and a clean
 `-fno-exceptions` build). It parses + analyzes + binds a spread of queries —
 scan/filter/project/limit, joins (inner, comma/cross, `USING`), `GROUP BY`,
+implicit aggregation, `HAVING`, `SELECT DISTINCT`,
 `ORDER BY`, `SELECT` without `FROM`, derived tables, set operations,
 `INSERT` / `UPDATE` / `DELETE`, `UPDATE` / `DELETE ... RETURNING`, window
 functions, and scalar / `IN` / `EXISTS` subqueries — and asserts both the

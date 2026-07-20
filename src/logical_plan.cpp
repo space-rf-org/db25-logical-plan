@@ -16,6 +16,7 @@ const char* logical_op_to_string(LogicalOp op) noexcept {
         case LogicalOp::Join:      return "Join";
         case LogicalOp::Aggregate: return "Aggregate";
         case LogicalOp::Window:    return "Window";
+        case LogicalOp::Distinct:  return "Distinct";
         case LogicalOp::Sort:      return "Sort";
         case LogicalOp::Limit:     return "Limit";
         case LogicalOp::SetOp:     return "SetOp";

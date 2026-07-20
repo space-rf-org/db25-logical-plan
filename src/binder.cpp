@@ -164,6 +164,32 @@ bool is_aggregate_call(const ASTNode* n) {
            name == "GROUP_CONCAT" || name == "STRING_AGG";
 }
 
+// A window-function call: a FunctionCall / FunctionExpr that carries a WindowSpec
+// child (the OVER (...) specification). Declared here so aggregate detection can
+// exclude it (SUM(..) OVER (...) is a window function, not a grouping aggregate).
+bool is_window_call(const ASTNode* n);
+
+// Walk an expression subtree collecting aggregate call nodes into `out`. Unlike
+// the top-level `is_aggregate_call` check this finds aggregates nested inside a
+// larger expression (e.g. `SUM(x) + 1`) and aggregates that appear only in
+// HAVING / ORDER BY. It deliberately does NOT descend into a window call (an
+// aggregate written as a window function is handled by the Window node, not by
+// grouping) nor into an embedded Subquery (which owns its own aggregates), and it
+// does not descend into an aggregate's own arguments (SQL forbids nesting one
+// aggregate inside another).
+void collect_aggregates(const ASTNode* n, std::vector<const ASTNode*>& out) {
+    if (n == nullptr || n->node_type == NodeType::Subquery || is_window_call(n)) {
+        return;
+    }
+    if (is_aggregate_call(n)) {
+        out.push_back(n);
+        return;
+    }
+    for (const ASTNode* c = first_child(n); c != nullptr; c = c->next_sibling) {
+        collect_aggregates(c, out);
+    }
+}
+
 // Parse a LIMIT / OFFSET operand. Only a non-negative integer literal yields a
 // value; anything else (parameter, expression) leaves `out` untouched and
 // returns false so the caller records "no static bound".
@@ -475,18 +501,46 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
         current = std::move(filter);
     }
 
-    // --- GROUP BY -> Aggregate ---
+    // --- GROUP BY / aggregation -> Aggregate ---
+    // An Aggregate node is emitted when the query groups (GROUP BY present) OR
+    // when it uses any aggregate function without a GROUP BY - the "implicit
+    // aggregation" case (`SELECT COUNT(*) FROM users`), which collapses the input
+    // to a single group with EMPTY group keys. Aggregates are detected by walking
+    // the SELECT list, the HAVING condition and the ORDER BY keys (not just the
+    // top-level SELECT items), so aggregates nested in a larger expression
+    // (`SUM(x)+1`) or appearing only in HAVING / ORDER BY are found too.
     const ASTNode* group_by = find_child(select_stmt, NodeType::GroupByClause);
     const ASTNode* select_list = find_child(select_stmt, NodeType::SelectList);
-    if (group_by != nullptr) {
-        auto agg = make_node(LogicalOp::Aggregate);
-        for (const ASTNode* key = first_child(group_by); key != nullptr;
+    const ASTNode* having = find_child(select_stmt, NodeType::HavingClause);
+    const ASTNode* order_by = find_child(select_stmt, NodeType::OrderByClause);
+
+    std::vector<const ASTNode*> aggregates;
+    if (select_list != nullptr) {
+        for (const ASTNode* item = first_child(select_list); item != nullptr;
+             item = item->next_sibling) {
+            collect_aggregates(item, aggregates);
+        }
+    }
+    if (having != nullptr) {
+        collect_aggregates(first_child(having), aggregates);
+    }
+    if (order_by != nullptr) {
+        for (const ASTNode* key = first_child(order_by); key != nullptr;
              key = key->next_sibling) {
+            collect_aggregates(key, aggregates);
+        }
+    }
+
+    if (group_by != nullptr || !aggregates.empty()) {
+        auto agg = make_node(LogicalOp::Aggregate);
+        // Group keys: the GROUP BY expressions, or empty for implicit aggregation.
+        for (const ASTNode* key = group_by != nullptr ? first_child(group_by) : nullptr;
+             key != nullptr; key = key->next_sibling) {
             agg->group_keys.push_back(key);
         }
+        agg->aggregates = std::move(aggregates);
         // Derive the aggregate output by walking the SELECT list in order,
-        // classifying each item as a grouping key or an aggregate result and
-        // reading its type / nullability back from the analyzer.
+        // reading each item's type / nullability back from the analyzer.
         if (select_list != nullptr) {
             for (const ASTNode* item = first_child(select_list); item != nullptr;
                  item = item->next_sibling) {
@@ -494,14 +548,21 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
                 col.name = item_output_name(item);
                 col.type = analyzer_.type_of(item);
                 col.nullable = analyzer_.nullability_of(item) != 1;
-                if (is_aggregate_call(item)) {
-                    agg->aggregates.push_back(item);
-                }
                 agg->output.push_back(std::move(col));
             }
         }
         agg->add_child(std::move(current));
         current = std::move(agg);
+
+        // --- HAVING -> Filter (post-aggregation predicate, above the Aggregate) ---
+        if (having != nullptr) {
+            auto filter = make_node(LogicalOp::Filter);
+            filter->predicate = first_child(having);  // the HAVING condition
+            filter->output = current->output;          // schema-preserving
+            attach_subqueries(filter.get(), filter->predicate, error);
+            filter->add_child(std::move(current));
+            current = std::move(filter);
+        }
     }
 
     // --- Window functions -> Window (below Project) ---
@@ -556,8 +617,23 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
     project->add_child(std::move(current));
     current = std::move(project);
 
+    // --- SELECT DISTINCT -> Distinct (de-duplicate the projected rows) ---
+    // The parser records DISTINCT as bit 0 (NodeFlags::Distinct) of the
+    // SelectStmt's semantic_flags. Model it as a dedicated schema-preserving
+    // Distinct node sitting directly above the Project, so ORDER BY / LIMIT apply
+    // to the de-duplicated result.
+    const bool distinct =
+        (select_stmt->semantic_flags &
+         static_cast<std::uint16_t>(ast::NodeFlags::Distinct)) != 0;
+    if (distinct) {
+        auto dnode = make_node(LogicalOp::Distinct);
+        dnode->output = current->output;  // distinct is schema-preserving
+        dnode->add_child(std::move(current));
+        current = std::move(dnode);
+    }
+
     // --- ORDER BY -> Sort (real sort keys + directions) ---
-    if (const ASTNode* order_by = find_child(select_stmt, NodeType::OrderByClause)) {
+    if (order_by != nullptr) {
         auto sort = make_node(LogicalOp::Sort);
         // Each ORDER BY child is a sort expression; the parser records ASC/DESC
         // and NULLS placement in its semantic_flags (bit 7 = DESC, bit 5 = NULLS

@@ -182,6 +182,93 @@ void test_group_by(const InMemoryCatalog& cat) {
     });
 }
 
+// -------------------------------------------------------------------------
+// Implicit aggregation: an aggregate with no GROUP BY collapses the input to a
+// single group (Aggregate with EMPTY group keys) below the Project.
+
+void test_implicit_aggregate_count(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT COUNT(*) FROM users  (implicit aggregation)\n");
+    with_plan(cat, "SELECT COUNT(*) FROM users", [](const LogicalNode* root) {
+        // Project -> Aggregate(0 keys) -> Scan
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->op == LogicalOp::Aggregate, "child is Aggregate");
+        check(agg && agg->group_keys.empty(), "no group keys (implicit)");
+        check(agg && agg->aggregates.size() == 1, "1 aggregate (COUNT)");
+        const LogicalNode* scan = only_child(agg);
+        check(scan && scan->op == LogicalOp::Scan && scan->table_name == "users",
+              "leaf scan users");
+        check(root->output.size() == 1, "project has 1 col");
+        if (root->output.size() == 1) {
+            // COUNT(*) -> BigInt, not null.
+            expect_col(root->output[0], "COUNT", DataType::BigInt, false, "proj[0]");
+        }
+    });
+}
+
+void test_implicit_aggregate_nested(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT SUM(sal)+1 FROM emp  (aggregate nested in expr)\n");
+    with_plan(cat, "SELECT SUM(sal)+1 FROM emp", [](const LogicalNode* root) {
+        // Project -> Aggregate(0 keys, detects the nested SUM) -> Scan
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->op == LogicalOp::Aggregate, "child is Aggregate");
+        check(agg && agg->group_keys.empty(), "no group keys (implicit)");
+        // The SUM is nested inside `SUM(sal) + 1`; detection must still find it.
+        check(agg && agg->aggregates.size() == 1, "1 aggregate (nested SUM)");
+        const LogicalNode* scan = only_child(agg);
+        check(scan && scan->op == LogicalOp::Scan && scan->table_name == "emp",
+              "leaf scan emp");
+        check(root->output.size() == 1, "project has 1 col");
+    });
+}
+
+// -------------------------------------------------------------------------
+// HAVING: a post-aggregation Filter sitting above the Aggregate.
+
+void test_having(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT dept, COUNT(*) FROM emp GROUP BY dept HAVING COUNT(*) > 5\n");
+    with_plan(cat,
+              "SELECT dept, COUNT(*) FROM emp GROUP BY dept HAVING COUNT(*) > 5",
+              [](const LogicalNode* root) {
+        // Project -> Filter (HAVING) -> Aggregate -> Scan
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* filter = only_child(root);
+        check(filter && filter->op == LogicalOp::Filter, "child is Filter (HAVING)");
+        check(filter && filter->predicate != nullptr, "HAVING has predicate");
+        const LogicalNode* agg = only_child(filter);
+        check(agg && agg->op == LogicalOp::Aggregate, "filter child is Aggregate");
+        check(agg && agg->group_keys.size() == 1, "1 group key");
+        const LogicalNode* scan = only_child(agg);
+        check(scan && scan->op == LogicalOp::Scan && scan->table_name == "emp",
+              "leaf scan emp");
+        // The HAVING Filter is schema-preserving over the Aggregate.
+        check(filter && filter->output.size() == 2, "filter preserves 2 cols");
+        check(root->output.size() == 2, "project has 2 cols");
+    });
+}
+
+// -------------------------------------------------------------------------
+// SELECT DISTINCT: a Distinct node directly above the Project.
+
+void test_distinct(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT DISTINCT dept FROM emp\n");
+    with_plan(cat, "SELECT DISTINCT dept FROM emp", [](const LogicalNode* root) {
+        // Distinct -> Project -> Scan
+        check(root->op == LogicalOp::Distinct, "root is Distinct");
+        const LogicalNode* project = only_child(root);
+        check(project && project->op == LogicalOp::Project, "child is Project");
+        const LogicalNode* scan = only_child(project);
+        check(scan && scan->op == LogicalOp::Scan && scan->table_name == "emp",
+              "leaf scan emp");
+        // Distinct is schema-preserving: same output as its Project child.
+        check(root->output.size() == 1, "distinct preserves 1 col");
+        if (root->output.size() == 1) {
+            expect_col(root->output[0], "dept", DataType::VarChar, true, "distinct[0]");
+        }
+    });
+}
+
 void test_select_star(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT * FROM users\n");
     with_plan(cat, "SELECT * FROM users", [](const LogicalNode* root) {
@@ -671,6 +758,10 @@ int main() {
     test_limit_offset(cat);
     test_inner_join(cat);
     test_group_by(cat);
+    test_implicit_aggregate_count(cat);
+    test_implicit_aggregate_nested(cat);
+    test_having(cat);
+    test_distinct(cat);
     test_select_star(cat);
     test_order_by(cat);
     test_order_by_nulls(cat);
