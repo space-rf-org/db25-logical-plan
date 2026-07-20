@@ -218,6 +218,15 @@ void test_group_by(const InMemoryCatalog& cat) {
         check(agg && agg->op == LogicalOp::Aggregate, "child is Aggregate");
         check(agg && agg->group_keys.size() == 1, "1 group key");
         check(agg && agg->aggregates.size() == 1, "1 aggregate");
+        // GROUP BY dept lowers to a positional key (dept is slot #1 of emp);
+        // COUNT(*) lowers to an owned Aggregate expression.
+        if (agg && agg->group_keys.size() == 1) {
+            expect_col_ref(agg->group_keys[0], 1, "group key (dept)");
+        }
+        if (agg && agg->aggregates.size() == 1) {
+            check(agg->aggregates[0]->kind == ExprKind::Aggregate, "aggregate is Aggregate expr");
+            check(agg->aggregates[0]->func_name == "COUNT", "aggregate func is COUNT");
+        }
         const LogicalNode* scan = only_child(agg);
         check(scan && scan->op == LogicalOp::Scan && scan->table_name == "emp",
               "leaf scan emp");
@@ -251,6 +260,10 @@ void test_implicit_aggregate_count(const InMemoryCatalog& cat) {
         check(agg && agg->op == LogicalOp::Aggregate, "child is Aggregate");
         check(agg && agg->group_keys.empty(), "no group keys (implicit)");
         check(agg && agg->aggregates.size() == 1, "1 aggregate (COUNT)");
+        if (agg && agg->aggregates.size() == 1) {
+            check(agg->aggregates[0]->kind == ExprKind::Aggregate, "aggregate is Aggregate expr");
+            check(agg->aggregates[0]->func_name == "COUNT", "aggregate func is COUNT");
+        }
         const LogicalNode* scan = only_child(agg);
         check(scan && scan->op == LogicalOp::Scan && scan->table_name == "users",
               "leaf scan users");
@@ -272,6 +285,16 @@ void test_implicit_aggregate_nested(const InMemoryCatalog& cat) {
         check(agg && agg->group_keys.empty(), "no group keys (implicit)");
         // The SUM is nested inside `SUM(sal) + 1`; detection must still find it.
         check(agg && agg->aggregates.size() == 1, "1 aggregate (nested SUM)");
+        // The SUM aggregate's argument lowers to a positional ref (sal is #2 of
+        // emp), proving aggregate arguments resolve against the Aggregate input.
+        if (agg && agg->aggregates.size() == 1) {
+            const auto& a = *agg->aggregates[0];
+            check(a.kind == ExprKind::Aggregate && a.func_name == "SUM", "aggregate is SUM");
+            check(a.children.size() == 1, "SUM has 1 argument");
+            if (a.children.size() == 1) {
+                expect_col_ref(a.children[0], 2, "SUM arg (sal -> #2)");
+            }
+        }
         const LogicalNode* scan = only_child(agg);
         check(scan && scan->op == LogicalOp::Scan && scan->table_name == "emp",
               "leaf scan emp");
