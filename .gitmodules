@@ -1,0 +1,6 @@
+[submodule "external/parser"]
+	path = external/parser
+	url = https://github.com/space-rf-org/db25-sql-parser
+[submodule "external/analyzer"]
+	path = external/analyzer
+	url = https://github.com/space-rf-org/DB25-Semantic-Analyzer
