@@ -1,0 +1,78 @@
+name: CI
+
+# Build and test the DB25 logical-plan / binder on every push and pull request.
+# The parser and semantic analyzer are consumed as git submodules under
+# external/ (with the parser's SIMD tokenizer as a recursive sub-submodule), so
+# the checkout must be recursive. No separate dependency install is needed: the
+# top-level CMake builds the parser in-tree and compiles the analyzer sources
+# directly (see CMakeLists.txt).
+on:
+  push:
+  pull_request:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Standard build + test against the pinned submodules.
+  # ---------------------------------------------------------------------------
+  build-and-test:
+    name: build-and-test (g++-14)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout (recursive submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install g++-14
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  # Same recipe under AddressSanitizer + UndefinedBehaviorSanitizer. The
+  # sanitizer flags apply to every translation unit built in-tree (binder +
+  # parser + analyzer sources), so this exercises the whole pipeline for memory
+  # and UB errors.
+  # ---------------------------------------------------------------------------
+  sanitizers:
+    name: sanitizers (asan+ubsan)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout (recursive submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install g++-14
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14
+
+      - name: Configure (asan+ubsan)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build (asan+ubsan)
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test (asan+ubsan)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure
