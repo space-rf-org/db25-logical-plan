@@ -967,6 +967,26 @@ void test_in_subquery(const InMemoryCatalog& cat) {
     });
 }
 
+// NOT EXISTS must carry the negation: the parser marks NOT with semantic_flags
+// bit 6 (not in the operator text), so the lowered Subquery is negated.
+void test_not_exists_negated(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id FROM users WHERE NOT EXISTS (SELECT 1 FROM orders ...)\n");
+    with_plan(cat,
+              "SELECT id FROM users WHERE NOT EXISTS "
+              "(SELECT 1 FROM orders WHERE orders.user_id = users.id)",
+              [](const LogicalNode* root) {
+        const LogicalNode* filter = only_child(root);
+        check(filter && filter->op == LogicalOp::Filter, "child is Filter");
+        if (filter && filter->predicate &&
+            filter->predicate->kind == ExprKind::Subquery) {
+            check(filter->predicate->subquery_kind == SubqueryKind::Exists, "EXISTS kind");
+            check(filter->predicate->negated(), "NOT EXISTS sets the negated flag");
+        } else {
+            check(false, "predicate is a Subquery");
+        }
+    });
+}
+
 // A scalar subquery that is a whole SELECT item over an Aggregate child must
 // still be lowered into an owned Subquery (not swallowed by the positional
 // aggregate-passthrough rule, which would drop its plan).
@@ -1049,6 +1069,7 @@ int main() {
     test_scalar_subquery_correlated(cat);
     test_in_subquery(cat);
     test_exists_subquery(cat);
+    test_not_exists_negated(cat);
     test_scalar_subquery_over_aggregate(cat);
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);

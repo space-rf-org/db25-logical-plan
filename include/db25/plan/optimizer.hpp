@@ -25,6 +25,10 @@
 //     Scans and Projects and remapping the positional slots throughout. Conserv-
 //     ative around operators whose column flow is intricate (set operations,
 //     VALUES, DML) and around any operator carrying an embedded subquery.
+//   * EXISTS decorrelation - rewrite a Filter whose whole predicate is a
+//     [NOT] EXISTS subquery into a Semi / Anti join, hoisting a correlated
+//     subquery's correlation predicate into the join condition. Handled shapes
+//     only; anything else is left as a represented subquery (still correct).
 //
 // The build matches the rest of the stack: C++23, -fno-exceptions.
 
@@ -64,6 +68,19 @@ void simplify_booleans(LogicalNode* node);
 // Embedded subquery sub-plans are pruned independently. In place; takes `node`
 // by owning reference because pruning can shrink the root's own layout.
 void prune_columns(LogicalNodePtr& node);
+
+// EXISTS decorrelation: rewrite a Filter whose entire predicate is a
+// `[NOT] EXISTS (subquery)` into a SemiJoin (EXISTS) or AntiJoin (NOT EXISTS)
+// whose left input is the filter's child and whose right input is the subquery's
+// relation. For a correlated subquery whose correlation lives in a single top
+// Filter (all OuterRefs at depth 1, no nested subquery in the correlation, and
+// nothing correlated below that Filter), the correlation predicate is hoisted
+// into the join condition (OuterRef -> a left column, inner column -> a right
+// column). Any shape not matching this is left untouched as a represented
+// subquery, so the rewrite is always either a valid decorrelation or a no-op.
+// Takes `node` by owning reference (the Filter is replaced by the join) and
+// recurses children and embedded subquery sub-plans.
+void decorrelate_exists(LogicalNodePtr& node);
 
 // Predicate pushdown: for a Filter over an INNER / CROSS Join, split the
 // predicate into conjuncts and push each conjunct that references only one

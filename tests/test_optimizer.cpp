@@ -478,6 +478,98 @@ void test_distinct_keeps_all_columns(const InMemoryCatalog& cat) {
     });
 }
 
+// A correlated EXISTS filter becomes a SemiJoin whose condition is the hoisted
+// correlation (orders.user_id = users.id -> #3 = #0 in the left ++ right frame).
+void test_decorrelate_exists(const InMemoryCatalog& cat) {
+    std::printf("[test] WHERE EXISTS (correlated)  ->  SemiJoin\n");
+    with_optimized_plan(
+        cat,
+        "SELECT id FROM users WHERE EXISTS "
+        "(SELECT 1 FROM orders WHERE orders.user_id = users.id)",
+        [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* sj = only_child(root);
+        check(sj && sj->op == LogicalOp::SemiJoin, "child is a SemiJoin");
+        if (sj && sj->child_count() == 2) {
+            check(sj->child(0)->op == LogicalOp::Scan &&
+                      sj->child(0)->table_name == "users", "left is Scan users");
+            check(find_scan(sj->child(1), "orders") != nullptr, "right is orders relation");
+            check(sj->predicate && sj->predicate->kind == ExprKind::BinaryOp &&
+                      sj->predicate->bin_op == db25::ast::BinaryOp::Equal,
+                  "condition is the hoisted equality");
+            if (sj->predicate && sj->predicate->children.size() == 2) {
+                check(sj->predicate->children[0]->input_index == 3 &&
+                          sj->predicate->children[1]->input_index == 0,
+                      "condition is #3 (orders.user_id) = #0 (users.id)");
+            }
+        }
+        // The subquery is gone: no owned Subquery remains in the plan.
+        check(sj && sj->op == LogicalOp::SemiJoin, "no residual Filter/Subquery");
+    });
+}
+
+// NOT EXISTS becomes an AntiJoin.
+void test_decorrelate_not_exists(const InMemoryCatalog& cat) {
+    std::printf("[test] WHERE NOT EXISTS (correlated)  ->  AntiJoin\n");
+    with_optimized_plan(
+        cat,
+        "SELECT id FROM users WHERE NOT EXISTS "
+        "(SELECT 1 FROM orders WHERE orders.user_id = users.id)",
+        [](const LogicalNode* root) {
+        const LogicalNode* aj = only_child(root);
+        check(aj && aj->op == LogicalOp::AntiJoin, "child is an AntiJoin");
+    });
+}
+
+// An uncorrelated EXISTS becomes a conditionless SemiJoin.
+void test_decorrelate_exists_uncorrelated(const InMemoryCatalog& cat) {
+    std::printf("[test] WHERE EXISTS (uncorrelated)  ->  SemiJoin (no condition)\n");
+    with_optimized_plan(cat, "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders)",
+                        [](const LogicalNode* root) {
+        const LogicalNode* sj = only_child(root);
+        check(sj && sj->op == LogicalOp::SemiJoin, "child is a SemiJoin");
+        check(sj && sj->predicate == nullptr, "no join condition (uncorrelated)");
+    });
+}
+
+// Skip-level correlation: the outer EXISTS body has NO depth-1 correlation of
+// its own (the analyzer flags that subquery "uncorrelated"), but a live OuterRef
+// survives in a deeper-nested subquery. Decorrelating it into a conditionless
+// SemiJoin would silently drop that correlation and change results, so the whole
+// Filter must be left as a represented subquery instead.
+void test_no_decorrelate_skip_level_correlation(const InMemoryCatalog& cat) {
+    std::printf("[test] skip-level correlated EXISTS  (left as-is, not a SemiJoin)\n");
+    with_optimized_plan(
+        cat,
+        "SELECT id FROM users WHERE EXISTS "
+        "(SELECT 1 FROM orders WHERE EXISTS "
+        "(SELECT 1 FROM emp WHERE emp.id = users.id))",
+        [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* child = only_child(root);
+        check(child && child->op == LogicalOp::Filter,
+              "child is still a Filter (not decorrelated to a SemiJoin)");
+        check(child && child->predicate &&
+                  child->predicate->kind == ExprKind::Subquery,
+              "the EXISTS predicate is left as a represented Subquery");
+        check(find_scan(child, "users") != nullptr, "left relation preserved");
+    });
+}
+
+// A shape that is not handled (a scalar subquery in the SELECT list) is left as
+// a represented subquery, not rewritten.
+void test_no_decorrelate_scalar_subquery(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id, (SELECT MAX(total) FROM orders) FROM users  (left as-is)\n");
+    with_optimized_plan(cat, "SELECT id, (SELECT MAX(total) FROM orders) FROM users",
+                        [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project && root->exprs.size() == 2, "root Project of 2");
+        if (root->exprs.size() == 2) {
+            check(root->exprs[1] && root->exprs[1]->kind == ExprKind::Subquery,
+                  "scalar subquery left as a Subquery expr (not decorrelated)");
+        }
+    });
+}
+
 }  // namespace
 
 int main() {
@@ -506,6 +598,11 @@ int main() {
     test_window_passthrough_not_corrupted(cat);
     test_using_join_not_corrupted(cat);
     test_distinct_keeps_all_columns(cat);
+    test_decorrelate_exists(cat);
+    test_decorrelate_not_exists(cat);
+    test_decorrelate_exists_uncorrelated(cat);
+    test_no_decorrelate_skip_level_correlation(cat);
+    test_no_decorrelate_scalar_subquery(cat);
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) {

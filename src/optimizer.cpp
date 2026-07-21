@@ -761,6 +761,216 @@ void prune_all_subplans(LogicalNode* node) {
     }
 }
 
+// ---- EXISTS decorrelation helpers -------------------------------------------
+
+// True if an expression tree contains any correlated OuterRef (descends into a
+// nested subquery's sub-plan too, so "no OuterRef anywhere below" is a strict
+// safety check).
+bool subtree_has_outer_ref(const LogicalNode* node);
+
+bool expr_has_outer_ref(const Expr& e) {
+    if (e.kind == ExprKind::OuterRef) {
+        return true;
+    }
+    if (e.kind == ExprKind::Subquery && e.sub_plan && subtree_has_outer_ref(e.sub_plan.get())) {
+        return true;
+    }
+    for (const auto& c : e.children) {
+        if (expr_has_outer_ref(*c)) return true;
+    }
+    if (e.kind == ExprKind::WindowFunction) {
+        for (const auto& p : e.window.partition_by) if (expr_has_outer_ref(*p)) return true;
+        for (const auto& k : e.window.order_by) if (expr_has_outer_ref(*k.expr)) return true;
+    }
+    return false;
+}
+
+bool subtree_has_outer_ref(const LogicalNode* node) {
+    if (node == nullptr) {
+        return false;
+    }
+    auto check = [](const ExprPtr& e) { return e && expr_has_outer_ref(*e); };
+    if (check(node->predicate)) return true;
+    for (const auto& e : node->exprs) if (check(e)) return true;
+    for (const auto& e : node->group_keys) if (check(e)) return true;
+    for (const auto& e : node->aggregates) if (check(e)) return true;
+    for (const auto& e : node->window_functions) if (check(e)) return true;
+    for (const auto& k : node->sort_keys) if (check(k.expr)) return true;
+    for (const auto& row : node->value_rows) for (const auto& e : row) if (check(e)) return true;
+    for (const auto& a : node->assignments) if (check(a.value)) return true;
+    for (const auto& c : node->children) if (subtree_has_outer_ref(c.get())) return true;
+    return false;
+}
+
+// A correlation conjunct is safe to hoist into a join condition only if every
+// OuterRef it carries is at depth 1 (references the immediately enclosing input)
+// and it embeds no subquery.
+bool can_rewrite_correlation(const Expr& e) {
+    if (e.kind == ExprKind::OuterRef) {
+        return e.outer_depth == 1;
+    }
+    if (e.kind == ExprKind::Subquery) {
+        return false;
+    }
+    for (const auto& c : e.children) {
+        if (!can_rewrite_correlation(*c)) return false;
+    }
+    return true;
+}
+
+// Rewrite a hoisted correlation conjunct into the semi-join's left ++ right
+// frame: an OuterRef at depth 1 (a left column at input_index i) becomes a plain
+// left ColumnRef #i; an inner ColumnRef #j (into the right relation) shifts to
+// #(j + left_width). OuterRef and ColumnRef are leaves, so converting them in
+// place without recursing is unambiguous.
+void rewrite_correlation(Expr& e, std::uint32_t left_width) {
+    switch (e.kind) {
+        case ExprKind::OuterRef:
+            e.kind = ExprKind::ColumnRef;  // now a left column at the same index
+            e.outer_depth = 0;
+            return;
+        case ExprKind::ColumnRef:
+            e.input_index += left_width;   // shift into the right frame
+            return;
+        default:
+            for (auto& c : e.children) {
+                rewrite_correlation(*c, left_width);
+            }
+            return;
+    }
+}
+
+// Every top-level AND conjunct that carries a correlation (an OuterRef) must be
+// hoistable into a join condition (all its OuterRefs depth 1, no embedded
+// subquery). A conjunct without an OuterRef is a local filter and imposes no
+// constraint. Read-only: used as a pre-transform gate.
+bool correlation_hoistable(const Expr& e) {
+    if (e.kind == ExprKind::BinaryOp && e.bin_op == BinaryOp::And &&
+        e.children.size() == 2) {
+        return correlation_hoistable(*e.children[0]) &&
+               correlation_hoistable(*e.children[1]);
+    }
+    if (expr_has_outer_ref(e)) {
+        return can_rewrite_correlation(e);
+    }
+    return true;
+}
+
+// If `filter_node` is a Filter whose entire predicate is a [NOT] EXISTS subquery
+// of a handled shape, replace it with a Semi / Anti join. Otherwise leaves it
+// unchanged (the subquery stays represented). Correlation is decided by the
+// ACTUAL presence of OuterRefs in the subquery body, not the analyzer's
+// immediate-level `correlated` flag (which misses skip-level correlation, where
+// the only OuterRef lives in a deeper-nested subquery).
+void try_decorrelate_exists_filter(LogicalNodePtr& filter_node) {
+    Expr* subq = filter_node->predicate.get();
+    if (!subq->sub_plan) {
+        return;
+    }
+    const bool is_anti = subq->negated();
+
+    // Peek past a leading Project (a semi/anti join ignores the projected value,
+    // so a correlated projection inside EXISTS is irrelevant and discarded).
+    LogicalNode* body = subq->sub_plan.get();
+    if (body->op == LogicalOp::Project && body->child_count() == 1) {
+        body = body->child(0);
+    }
+
+    // ---- Gate (no mutation) ----
+    const bool correlated = subtree_has_outer_ref(body);
+    if (correlated) {
+        // Only `Project -> Filter(correlation [AND local]) -> relation`, with all
+        // correlation confined to that one top Filter, every correlation conjunct
+        // depth-1 and subquery-free, is handled. Anything else stays a subquery.
+        if (body->op != LogicalOp::Filter || !body->predicate || body->child_count() != 1) {
+            return;
+        }
+        if (subtree_has_outer_ref(body->child(0))) {
+            return;  // correlation reaches below the top Filter.
+        }
+        if (!correlation_hoistable(*body->predicate)) {
+            return;  // a correlation conjunct is not hoistable (deep ref / subquery).
+        }
+    }
+    // else: body is provably OuterRef-free -> a genuine uncorrelated EXISTS.
+
+    // ---- Commit (gate passed, no further bail) ----
+    const auto left_width =
+        static_cast<std::uint32_t>(filter_node->child(0)->output.size());
+    LogicalNodePtr sub = std::move(subq->sub_plan);
+    if (sub->op == LogicalOp::Project && sub->child_count() == 1) {
+        sub = std::move(sub->children[0]);
+    }
+
+    LogicalNodePtr right;
+    ExprPtr join_cond;
+    if (correlated) {
+        std::vector<ExprPtr> conjuncts;
+        collect_conjuncts(std::move(sub->predicate), conjuncts);
+        std::vector<ExprPtr> correlation;
+        std::vector<ExprPtr> local;
+        for (auto& c : conjuncts) {
+            (expr_has_outer_ref(*c) ? correlation : local).push_back(std::move(c));
+        }
+        for (auto& c : correlation) {
+            rewrite_correlation(*c, left_width);
+        }
+        join_cond = combine_conjuncts(correlation);
+        if (local.empty()) {
+            right = std::move(sub->children[0]);  // drop the now-empty Filter
+        } else {
+            sub->predicate = combine_conjuncts(local);  // reuse as the local Filter
+            right = std::move(sub);
+        }
+    } else {
+        right = std::move(sub);  // conditionless: the OuterRef-free relation as-is
+    }
+
+    LogicalNodePtr left = std::move(filter_node->children[0]);
+    auto join = std::make_unique<LogicalNode>(is_anti ? LogicalOp::AntiJoin
+                                                      : LogicalOp::SemiJoin);
+    join->output = left->output;  // semi / anti join produces only the left schema
+    join->predicate = std::move(join_cond);
+    join->add_child(std::move(left));
+    join->add_child(std::move(right));
+    filter_node = std::move(join);
+}
+
+void decorrelate_node(LogicalNodePtr& node);
+
+// Recurse decorrelation into every embedded subquery sub-plan of an expression.
+void decorrelate_in_expr(ExprPtr& e) {
+    if (!e) {
+        return;
+    }
+    if (e->kind == ExprKind::Subquery && e->sub_plan) {
+        decorrelate_node(e->sub_plan);
+    }
+    for (auto& c : e->children) {
+        decorrelate_in_expr(c);
+    }
+    if (e->kind == ExprKind::WindowFunction) {
+        for (auto& p : e->window.partition_by) decorrelate_in_expr(p);
+        for (auto& k : e->window.order_by) decorrelate_in_expr(k.expr);
+    }
+}
+
+void decorrelate_node(LogicalNodePtr& node) {
+    if (!node) {
+        return;
+    }
+    for (auto& child : node->children) {
+        decorrelate_node(child);
+    }
+    for_each_payload_expr(node.get(), [](ExprPtr& e) { decorrelate_in_expr(e); });
+
+    if (node->op == LogicalOp::Filter && node->child_count() == 1 && node->predicate &&
+        node->predicate->kind == ExprKind::Subquery &&
+        node->predicate->subquery_kind == SubqueryKind::Exists) {
+        try_decorrelate_exists_filter(node);
+    }
+}
+
 }  // namespace
 
 void fold_constants(LogicalNode* node) {
@@ -835,11 +1045,17 @@ void prune_columns(LogicalNodePtr& node) {
     prune_all_subplans(node.get());
 }
 
+void decorrelate_exists(LogicalNodePtr& node) {
+    decorrelate_node(node);
+}
+
 LogicalNodePtr optimize(LogicalNodePtr plan) {
     if (plan) {
-        // Fold first so a folded `1 = 1` -> `true` feeds the boolean identities;
+        // Decorrelate first, so the later passes optimize the resulting joins;
+        // fold so a folded `1 = 1` -> `true` feeds the boolean identities;
         // simplify next so a reduced predicate feeds pushdown; push filters so
         // they narrow inputs before pruning; then drop unreferenced columns.
+        decorrelate_exists(plan);
         fold_constants(plan.get());
         simplify_booleans(plan.get());
         push_down_filters(plan);

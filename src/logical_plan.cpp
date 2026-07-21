@@ -20,6 +20,8 @@ const char* logical_op_to_string(LogicalOp op) noexcept {
         case LogicalOp::Filter:    return "Filter";
         case LogicalOp::Project:   return "Project";
         case LogicalOp::Join:      return "Join";
+        case LogicalOp::SemiJoin:  return "SemiJoin";
+        case LogicalOp::AntiJoin:  return "AntiJoin";
         case LogicalOp::Aggregate: return "Aggregate";
         case LogicalOp::Window:    return "Window";
         case LogicalOp::Distinct:  return "Distinct";
@@ -122,6 +124,13 @@ void dump_rec(const LogicalNode* n, int depth, std::string& out) {
                 out.append(n->exprs[i] ? dump_expr(*n->exprs[i]) : "?");
             }
             out.push_back(')');
+            break;
+        case LogicalOp::SemiJoin:
+        case LogicalOp::AntiJoin:
+            if (n->predicate) {
+                out.append(" ON ");
+                out.append(dump_expr(*n->predicate));
+            }
             break;
         case LogicalOp::Join:
             out.append(" (");
