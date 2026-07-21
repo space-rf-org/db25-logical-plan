@@ -358,7 +358,13 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
     }
 
     const ast::JoinType jt = join_type_of(join_node);
-    if (using_clause == nullptr) {
+    // NATURAL joins carry no ON / USING clause; their join columns are every
+    // column common to both inputs. The parser records NATURAL in the join
+    // clause's primary_text ("NATURAL JOIN", "NATURAL LEFT JOIN", ...).
+    const bool natural =
+        upper(join_node->primary_text).find("NATURAL") != std::string::npos;
+
+    if (using_clause == nullptr && !natural) {
         auto join = make_join_node(std::move(left), std::move(right), jt);
         if (predicate != nullptr) {
             // Lower the ON condition against the join's concatenated input
@@ -371,13 +377,50 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
         return join;
     }
 
-    // JOIN ... USING (cols): the named columns are shared and collapse to a
+    // JOIN ... USING (cols) / NATURAL JOIN: the shared columns collapse to a
     // single merged output column. Keep the left copy and drop the right's
-    // duplicate. The join stays predicate-less (the equality is implied).
+    // duplicate; the equality is materialized as the join predicate below.
+    // USING names the columns explicitly; NATURAL uses every column common to
+    // both inputs (by name, in left order, de-duplicated). A NATURAL join with
+    // no common columns has an empty set - it degrades to a plain cross join,
+    // exactly as SQL specifies.
     std::vector<std::string_view> merged;
-    for (const ASTNode* col = first_child(using_clause); col != nullptr;
-         col = col->next_sibling) {
-        merged.push_back(split_column_ref(col->primary_text).column);
+    if (using_clause != nullptr) {
+        for (const ASTNode* col = first_child(using_clause); col != nullptr;
+             col = col->next_sibling) {
+            merged.push_back(split_column_ref(col->primary_text).column);
+        }
+    } else {
+        const auto count_by_name = [](const Schema& s, std::string_view name) {
+            int n = 0;
+            for (const auto& c : s) {
+                if (c.name == name) ++n;
+            }
+            return n;
+        };
+        for (const auto& lc : left->output) {
+            const int right_count = count_by_name(right->output, lc.name);
+            if (right_count == 0) {
+                continue;  // not a common column
+            }
+            bool already = false;
+            for (const std::string_view m : merged) {
+                if (m == lc.name) { already = true; break; }
+            }
+            if (already) {
+                continue;
+            }
+            // A common column that occurs more than once on either side is
+            // ambiguous - the equi-predicate would tie only the first slot and
+            // leave the duplicate unconstrained, silently producing wrong rows.
+            // SQL requires this to be an error.
+            if (count_by_name(left->output, lc.name) > 1 || right_count > 1) {
+                error = "common column '" + std::string{lc.name} +
+                        "' in NATURAL JOIN is ambiguous";
+                return nullptr;
+            }
+            merged.push_back(lc.name);
+        }
     }
     const auto is_merged = [&merged](std::string_view name) {
         for (const std::string_view m : merged) {

@@ -828,6 +828,93 @@ void test_join_using(const InMemoryCatalog& cat) {
     });
 }
 
+// NATURAL JOIN is USING over the columns common to both inputs. users and
+// orders share exactly `id`, so `users u NATURAL JOIN orders o` must produce the
+// identical merged frame and equi-predicate as `... USING (id)`.
+void test_natural_join(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT u.name, o.total FROM users u NATURAL JOIN orders o\n");
+    with_plan(cat, "SELECT u.name, o.total FROM users u NATURAL JOIN orders o",
+              [](const LogicalNode* root) {
+        const LogicalNode* join = only_child(root);
+        check(join && join->op == LogicalOp::Join, "child is Join");
+        // Common column id merges: 2 (users) + 3 (orders) - 1 = 4.
+        check(join && join->output.size() == 4, "NATURAL merges id -> 4 cols");
+        if (join && join->output.size() == 4) {
+            int id_count = 0;
+            for (const auto& c : join->output) {
+                if (c.name == "id") ++id_count;
+            }
+            check(id_count == 1, "single merged id column");
+        }
+        // Equi-predicate over the pre-merge frame: users.id (#0) = orders.id (#2).
+        check(join && join->predicate != nullptr, "NATURAL carries an equi-predicate");
+        if (join && join->predicate) {
+            const auto& p = *join->predicate;
+            check(p.kind == ExprKind::BinaryOp &&
+                      p.bin_op == db25::ast::BinaryOp::Equal,
+                  "NATURAL predicate is an '=' BinaryOp");
+            if (p.kind == ExprKind::BinaryOp && p.children.size() == 2) {
+                check(p.children[0]->kind == ExprKind::ColumnRef &&
+                          p.children[0]->input_index == 0,
+                      "lhs is users.id (slot 0)");
+                check(p.children[1]->kind == ExprKind::ColumnRef &&
+                          p.children[1]->input_index == 2,
+                      "rhs is orders.id (slot 2 = left_width + 0)");
+            }
+        }
+    });
+}
+
+// NATURAL over inputs with NO common column degrades to a plain cross join
+// (empty common-column set), exactly as SQL specifies. users and emp share no
+// column names in this catalog... but they both have `id`; use a subquery alias
+// that renames columns so there is genuinely no overlap.
+void test_natural_join_no_common_is_cross(const InMemoryCatalog& cat) {
+    std::printf("[test] users u NATURAL JOIN (SELECT total AS amt FROM orders) t\n");
+    with_plan(cat,
+              "SELECT u.name FROM users u NATURAL JOIN (SELECT total AS amt FROM orders) t",
+              [](const LogicalNode* root) {
+        const LogicalNode* join = only_child(root);
+        check(join && join->op == LogicalOp::Join, "child is Join");
+        // No shared column -> nothing merged, no predicate: a cross product.
+        check(join && join->output.size() == 3, "no merge -> users(2) ++ t(1) = 3 cols");
+        check(join && join->predicate == nullptr, "no common column -> cross join");
+    });
+}
+
+// NATURAL LEFT JOIN routes the outer-join kind through the same merge path:
+// Left join type, merged frame, equi-predicate, right side null-extended.
+void test_natural_left_join(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT u.name, o.total FROM users u NATURAL LEFT JOIN orders o\n");
+    with_plan(cat, "SELECT u.name, o.total FROM users u NATURAL LEFT JOIN orders o",
+              [](const LogicalNode* root) {
+        const LogicalNode* join = only_child(root);
+        check(join && join->op == LogicalOp::Join, "child is Join");
+        check(join && join->join_type == db25::ast::JoinType::Left, "NATURAL LEFT -> Left");
+        check(join && join->output.size() == 4, "merged frame -> 4 cols");
+        check(join && join->predicate != nullptr, "carries the equi-predicate");
+    });
+}
+
+// A NATURAL join whose common column is ambiguous on one side (here `id` occurs
+// in both users and emp on the left) must be REJECTED, not silently tie only the
+// first slot and leave the duplicate unconstrained (which returns wrong rows).
+void test_natural_join_ambiguous_rejected(const InMemoryCatalog& cat) {
+    std::printf("[test] users u CROSS JOIN emp e NATURAL JOIN orders o (ambiguous id, rejected)\n");
+    db25::parser::Parser parser;
+    auto parsed = parser.parse(
+        "SELECT u.name FROM users u CROSS JOIN emp e NATURAL JOIN orders o");
+    check(parsed.has_value(), "parse ambiguous NATURAL");
+    if (!parsed) {
+        return;
+    }
+    Analyzer analyzer(cat);
+    analyzer.analyze(parsed.value());
+    Binder binder(analyzer, cat);
+    BindResult res = binder.bind(parsed.value());
+    check(!res.ok, "bind rejects a NATURAL join with an ambiguous common column");
+}
+
 void test_join_using_multi(const InMemoryCatalog& cat) {
     std::printf("[test] users u1 JOIN users u2 USING (id, name)\n");
     with_plan(cat, "SELECT u1.id FROM users u1 JOIN users u2 USING (id, name)",
@@ -1389,6 +1476,10 @@ int main() {
     test_comma_join(cat);
     test_cross_join(cat);
     test_join_using(cat);
+    test_natural_join(cat);
+    test_natural_left_join(cat);
+    test_natural_join_no_common_is_cross(cat);
+    test_natural_join_ambiguous_rejected(cat);
     test_join_using_multi(cat);
     test_select_star_over_using(cat);
     test_qualified_star_over_join_rejected(cat);
