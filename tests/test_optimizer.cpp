@@ -833,6 +833,36 @@ void test_pushdown_through_semijoin() {
     }
 }
 
+// optimize() must be idempotent: a filter over stacked joins is pushed all the
+// way to its base scan in ONE pass, so a second optimize() changes nothing.
+void test_optimize_idempotent(const InMemoryCatalog& cat) {
+    std::printf("[test] optimize() is idempotent over stacked joins\n");
+    const char* sqls[] = {
+        "SELECT e.dept FROM emp e JOIN orders o ON e.id = o.user_id "
+        "JOIN users u ON e.id = u.id WHERE e.sal > 100",
+        "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id "
+        "WHERE o.total > 5 AND u.id > 1",
+    };
+    for (const char* sql : sqls) {
+        db25::parser::Parser parser;
+        auto parsed = parser.parse(sql);
+        check(parsed.has_value(), std::string{"parse: "} + sql);
+        if (!parsed) continue;
+        Analyzer analyzer(cat);
+        analyzer.analyze(parsed.value());
+        check(!analyzer.has_errors(), std::string{"analyze: "} + sql);
+        Binder binder(analyzer, cat);
+        BindResult res = binder.bind(parsed.value());
+        check(res.ok, std::string{"bind: "} + sql);
+        if (!res.ok) continue;
+        auto once = db25::plan::optimize(std::move(res.root));
+        const std::string d1 = db25::plan::dump_plan(once.get());
+        auto twice = db25::plan::optimize(std::move(once));
+        const std::string d2 = db25::plan::dump_plan(twice.get());
+        check(d1 == d2, std::string{"optimize() idempotent: "} + sql);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -877,6 +907,7 @@ int main() {
     test_no_decorrelate_scalar_subquery(cat);
     test_prune_semijoin_inputs(cat);
     test_pushdown_through_semijoin();
+    test_optimize_idempotent(cat);
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) {
