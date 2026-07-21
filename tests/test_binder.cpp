@@ -896,6 +896,90 @@ void test_natural_left_join(const InMemoryCatalog& cat) {
     });
 }
 
+// RIGHT / FULL JOIN ... USING / NATURAL: the merged column is COALESCE(left,
+// right), NOT the bare left copy. Under a RIGHT join the left copy is NULL for
+// every right row with no left match, so keeping it would make a bare reference
+// to the join key read NULL (verified end-to-end: SQLite and DuckDB return the
+// key values, DB25 previously returned all-NULL). The binder must wrap the join
+// in a Project that emits COALESCE(left.id, right.id) over the full frame, with
+// the merged column keeping the LEFT column's identity.
+void expect_coalesce_merge(const LogicalNode* root, db25::ast::JoinType jt,
+                           const std::string& ctx) {
+    // Project(outer SELECT) -> Project(COALESCE merge) -> Join(jt) -> [scans].
+    const LogicalNode* merge = only_child(root);
+    check(merge && merge->op == LogicalOp::Project, ctx + ": merge is a Project");
+    if (!merge || merge->op != LogicalOp::Project) return;
+    // users(id,name) + orders(id,user_id,total), merged on id -> 4 output cols
+    // (id, name, user_id, total); exactly one id, and it is expr[0].
+    check(merge->output.size() == 4, ctx + ": merged frame -> 4 cols");
+    int id_count = 0;
+    for (const auto& c : merge->output) if (c.name == "id") ++id_count;
+    check(id_count == 1, ctx + ": single merged id column");
+    // Both users.id and orders.id are NOT NULL, so COALESCE(id,id) is NOT NULL,
+    // even under RIGHT / FULL where each side is otherwise null-supplied.
+    check(!merge->output.empty() && merge->output[0].name == "id" &&
+              !merge->output[0].nullable,
+          ctx + ": merged id is NOT NULL (both sides not-null)");
+    // expr[0] materializes COALESCE(left.id #0, right.id #2) over the full frame.
+    check(!merge->exprs.empty() &&
+              merge->exprs[0]->kind == ExprKind::ScalarFunction &&
+              merge->exprs[0]->func_name == "COALESCE",
+          ctx + ": merged id is a COALESCE call");
+    if (!merge->exprs.empty() && merge->exprs[0]->kind == ExprKind::ScalarFunction &&
+        merge->exprs[0]->children.size() == 2) {
+        const auto& coa = *merge->exprs[0];
+        check(coa.children[0]->kind == ExprKind::ColumnRef &&
+                  coa.children[0]->input_index == 0,
+              ctx + ": COALESCE arg0 is left.id (slot 0)");
+        check(coa.children[1]->kind == ExprKind::ColumnRef &&
+                  coa.children[1]->input_index == 2,
+              ctx + ": COALESCE arg1 is right.id (slot 2 = left_width + 0)");
+    }
+    // The join underneath keeps BOTH id copies (full left ++ right frame = 5).
+    const LogicalNode* join = only_child(merge);
+    check(join && join->op == LogicalOp::Join, ctx + ": child is Join");
+    check(join && join->join_type == jt, ctx + ": join type preserved");
+    check(join && join->output.size() == 5, ctx + ": join keeps full frame (5)");
+    check(join && join->predicate != nullptr, ctx + ": carries the equi-predicate");
+}
+
+void test_right_join_using_coalesces(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id FROM users u RIGHT JOIN orders o USING (id)\n");
+    with_plan(cat, "SELECT id FROM users u RIGHT JOIN orders o USING (id)",
+              [](const LogicalNode* root) {
+        expect_coalesce_merge(root, db25::ast::JoinType::Right, "RIGHT USING");
+    });
+}
+
+void test_full_join_using_coalesces(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id FROM users u FULL JOIN orders o USING (id)\n");
+    with_plan(cat, "SELECT id FROM users u FULL JOIN orders o USING (id)",
+              [](const LogicalNode* root) {
+        expect_coalesce_merge(root, db25::ast::JoinType::Full, "FULL USING");
+    });
+}
+
+void test_natural_right_join_coalesces(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id FROM users u NATURAL RIGHT JOIN orders o\n");
+    with_plan(cat, "SELECT id FROM users u NATURAL RIGHT JOIN orders o",
+              [](const LogicalNode* root) {
+        expect_coalesce_merge(root, db25::ast::JoinType::Right, "NATURAL RIGHT");
+    });
+}
+
+// INNER / LEFT keep the compact left-copy output (no COALESCE Project): the left
+// side is never null-supplied there, so the left copy already IS the merged value.
+void test_left_join_using_keeps_left_copy(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id FROM users u LEFT JOIN orders o USING (id)\n");
+    with_plan(cat, "SELECT id FROM users u LEFT JOIN orders o USING (id)",
+              [](const LogicalNode* root) {
+        const LogicalNode* join = only_child(root);
+        check(join && join->op == LogicalOp::Join, "LEFT USING: child is Join (no merge Project)");
+        check(join && join->join_type == db25::ast::JoinType::Left, "LEFT preserved");
+        check(join && join->output.size() == 4, "LEFT USING: compact merged frame -> 4 cols");
+    });
+}
+
 // A NATURAL join whose common column is ambiguous on one side (here `id` occurs
 // in both users and emp on the left) must be REJECTED, not silently tie only the
 // first slot and leave the duplicate unconstrained (which returns wrong rows).
@@ -1480,6 +1564,10 @@ int main() {
     test_natural_left_join(cat);
     test_natural_join_no_common_is_cross(cat);
     test_natural_join_ambiguous_rejected(cat);
+    test_right_join_using_coalesces(cat);
+    test_full_join_using_coalesces(cat);
+    test_natural_right_join_coalesces(cat);
+    test_left_join_using_keeps_left_copy(cat);
     test_join_using_multi(cat);
     test_select_star_over_using(cat);
     test_qualified_star_over_join_rejected(cat);
