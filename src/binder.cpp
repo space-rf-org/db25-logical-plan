@@ -390,8 +390,6 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
 
     auto join = make_node(LogicalOp::Join);
     join->join_type = jt;
-    // A USING join stays predicate-less (the equality is implied); `predicate`
-    // is left default-null.
     const bool null_left = jt == ast::JoinType::Right || jt == ast::JoinType::Full;
     const bool null_right = jt == ast::JoinType::Left || jt == ast::JoinType::Full;
     Schema out;
@@ -409,6 +407,43 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
         out.push_back(std::move(c));
     }
     join->output = std::move(out);
+
+    // Materialize the USING equality as the join predicate: for each shared
+    // column, `left.col = right.col` over the pre-merge (left ++ right) frame.
+    // Without this the join carries no condition and degrades to a cross product
+    // (the output is merged, so it looked right while producing wrong rows). The
+    // predicate indexes the full input frame; the merged output is narrower,
+    // which the optimizer's non-full-concat guard already treats conservatively.
+    const auto left_width = static_cast<std::uint32_t>(left->output.size());
+    ExprPtr pred;
+    for (const std::string_view name : merged) {
+        const int li = slot_by_name(left->output, name);
+        const int ri = slot_by_name(right->output, name);
+        if (li < 0 || ri < 0) {
+            error = "USING column '" + std::string{name} +
+                    "' is not present in both join inputs";
+            return nullptr;
+        }
+        auto eq = std::make_unique<Expr>(ExprKind::BinaryOp);
+        eq->bin_op = ast::BinaryOp::Equal;
+        eq->type = ast::DataType::Boolean;
+        eq->children.push_back(
+            make_column_ref(static_cast<std::uint32_t>(li), left->output[li]));
+        eq->children.push_back(make_column_ref(
+            left_width + static_cast<std::uint32_t>(ri), right->output[ri]));
+        if (!pred) {
+            pred = std::move(eq);
+        } else {
+            auto conj = std::make_unique<Expr>(ExprKind::BinaryOp);
+            conj->bin_op = ast::BinaryOp::And;
+            conj->type = ast::DataType::Boolean;
+            conj->children.push_back(std::move(pred));
+            conj->children.push_back(std::move(eq));
+            pred = std::move(conj);
+        }
+    }
+    join->predicate = std::move(pred);
+
     join->add_child(std::move(left));
     join->add_child(std::move(right));
     return join;
