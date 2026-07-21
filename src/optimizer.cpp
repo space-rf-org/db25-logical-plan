@@ -1467,6 +1467,18 @@ void push_down_filters(LogicalNodePtr& node) {
         (node->child(0)->join_type == ast::JoinType::Inner ||
          node->child(0)->join_type == ast::JoinType::Cross)) {
         push_filter_into_join(node);
+        // A conjunct pushed onto a join input that is ITSELF a join settles there
+        // in this single bottom-up pass (that input was already visited). Re-run
+        // pushdown on the join's inputs so the pushed filter cascades all the way
+        // to a fixpoint - without this, optimize() is not idempotent (a second run
+        // pushes the filter further). Each push moves filters strictly downward, so
+        // the recursion terminates.
+        LogicalNode* joined = (node->op == LogicalOp::Join) ? node.get() : node->child(0);
+        if (joined != nullptr && joined->op == LogicalOp::Join) {
+            for (auto& input : joined->children) {
+                push_down_filters(input);
+            }
+        }
     }
 
     // Push a whole Filter below a Semi / Anti join into its LEFT input. The join's
