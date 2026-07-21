@@ -37,6 +37,43 @@ const char* logical_op_to_string(LogicalOp op) noexcept {
 
 namespace {
 
+// Collect the ExprKind::Subquery nodes reachable from an expression tree (its
+// operands, and a window function's PARTITION BY / ORDER BY keys), without
+// descending into a subquery's own inner plan - that plan is printed separately.
+void collect_subqueries(const Expr* e, std::vector<const Expr*>& out) {
+    if (e == nullptr) {
+        return;
+    }
+    if (e->kind == ExprKind::Subquery) {
+        out.push_back(e);
+    }
+    for (const auto& c : e->children) {
+        collect_subqueries(c.get(), out);
+    }
+    if (e->kind == ExprKind::WindowFunction) {
+        for (const auto& p : e->window.partition_by) {
+            collect_subqueries(p.get(), out);
+        }
+        for (const auto& k : e->window.order_by) {
+            collect_subqueries(k.expr.get(), out);
+        }
+    }
+}
+
+// Gather every subquery embedded in a node's owned expression payloads.
+void node_subqueries(const LogicalNode* n, std::vector<const Expr*>& out) {
+    collect_subqueries(n->predicate.get(), out);
+    for (const auto& e : n->exprs) collect_subqueries(e.get(), out);
+    for (const auto& e : n->group_keys) collect_subqueries(e.get(), out);
+    for (const auto& e : n->aggregates) collect_subqueries(e.get(), out);
+    for (const auto& e : n->window_functions) collect_subqueries(e.get(), out);
+    for (const auto& k : n->sort_keys) collect_subqueries(k.expr.get(), out);
+    for (const auto& row : n->value_rows) {
+        for (const auto& e : row) collect_subqueries(e.get(), out);
+    }
+    for (const auto& a : n->assignments) collect_subqueries(a.value.get(), out);
+}
+
 void append_schema(std::string& out, const Schema& schema) {
     out.push_back('[');
     for (std::size_t i = 0; i < schema.size(); ++i) {
@@ -209,21 +246,24 @@ void dump_rec(const LogicalNode* n, int depth, std::string& out) {
         dump_rec(c.get(), depth + 1, out);
     }
 
-    // Attached subquery sub-plans are printed indented under a marker line so a
-    // plan dump shows the represented (but not yet decorrelated) subqueries.
-    for (const auto& sp : n->subplans) {
+    // Subqueries embedded in this node's owned expressions are printed indented
+    // under a marker line so a plan dump shows the represented (but not yet
+    // decorrelated) subqueries and their inner plans.
+    std::vector<const Expr*> subqueries;
+    node_subqueries(n, subqueries);
+    for (const Expr* sq : subqueries) {
         for (int i = 0; i < depth + 1; ++i) {
             out.append("  ");
         }
         out.append("SubPlan (");
-        switch (sp.kind) {
+        switch (sq->subquery_kind) {
             case SubqueryKind::Scalar: out.append("scalar"); break;
             case SubqueryKind::In:     out.append("IN"); break;
             case SubqueryKind::Exists: out.append("EXISTS"); break;
         }
-        out.append(sp.correlated ? ", correlated" : ", uncorrelated");
+        out.append(sq->correlated ? ", correlated" : ", uncorrelated");
         out.append(")\n");
-        dump_rec(sp.plan.get(), depth + 2, out);
+        dump_rec(sq->sub_plan.get(), depth + 2, out);
     }
 }
 

@@ -35,8 +35,13 @@ which are vendored read-only.
   uint32_t table_id, uint32_t column_id }` — field-for-field the same shape as
   the analyzer's `ResolvedColumn`.
 * Expression payloads (filter/join predicates, projected expressions, group
-  keys, aggregates) are **borrowed** pointers into the parser-owned AST, so the
-  `Parser` must outlive the plan (the analyzer already imposes the same rule).
+  keys, aggregates, window functions, sort keys, `VALUES` rows, `UPDATE`
+  assignments, and embedded subqueries) are **owned, typed** expressions — an
+  `Expr` tree (`include/db25/plan/expr_ir.hpp`) whose column leaves are
+  **positional** (a flat `input_index` into the operator's input schema) with
+  type / nullability baked in. The plan no longer borrows the parser AST for its
+  semantics; each `Expr` keeps only a diagnostics-only `source` back-pointer that
+  is never dereferenced for meaning (and may be null on a cached plan).
 
 ### Binder — `src/binder.cpp` (`include/db25/plan/binder.hpp`)
 
@@ -51,7 +56,7 @@ Scan(s) -> [Join] -> [Filter (WHERE)] -> [Aggregate (GROUP BY / implicit)]
 **Lowered today**
 
 * Single-table **Scan** (schema from the catalog, with `table_id` / `column_id`).
-* **`WHERE` -> Filter** (borrows the predicate subtree; schema-preserving).
+* **`WHERE` -> Filter** (owns the lowered predicate expression; schema-preserving).
 * **`SELECT` list -> Project**, whose output schema is the analyzer's resolved
   projection (`projection_of`) — names, types and nullability, including
   `SELECT *` expansion.
@@ -76,20 +81,25 @@ Scan(s) -> [Join] -> [Filter (WHERE)] -> [Aggregate (GROUP BY / implicit)]
   found (window calls and embedded subqueries are excluded — they aggregate
   separately).
 * **`HAVING` -> Filter** placed **above** the `Aggregate` (a post-aggregation
-  predicate), borrowing the `HAVING` condition subtree; schema-preserving.
+  predicate), owning the lowered `HAVING` condition; schema-preserving.
 * **`SELECT DISTINCT` -> Distinct** a dedicated schema-preserving node sitting
   directly above the `Project` (so `ORDER BY` / `LIMIT` apply to the
   de-duplicated result).
-* **`ORDER BY` -> Sort** carrying real sort keys with `ASC` / `DESC` direction and
-  `NULLS FIRST` / `LAST` placement (schema-preserving).
+* **`ORDER BY` -> Sort** carrying owned sort-key expressions with `ASC` / `DESC`
+  direction and `NULLS FIRST` / `LAST` placement. A key may be an output ordinal
+  (`ORDER BY 1`) or a selected column / alias; a key that references a
+  **non-selected** column is computed as a **hidden sort column** appended to the
+  `Project` that the `Sort` orders by and then drops (its visible output is
+  unchanged). Under `SELECT DISTINCT` a non-selected sort key is rejected.
 * **Set operations** `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT` -> a **SetOp**
   node with the two child plans and the analyzer's reconciled output schema
   (`projection_of`), preserving the parser's left-associative folding.
 * **DML** — `INSERT` / `UPDATE` / `DELETE` -> **Insert** / **Update** / **Delete**
   nodes carrying the target table and the relevant child plan: a `Values` node
   or bound query source for `INSERT`, and a `Scan` (wrapped in a `Filter` when a
-  `WHERE` clause is present) for `UPDATE` / `DELETE`. `UPDATE` also carries its
-  borrowed `SET` assignment nodes.
+  `WHERE` clause is present) for `UPDATE` / `DELETE`. `UPDATE` also carries owned
+  `SET` assignments (a target column id plus a lowered value expression); the
+  `VALUES` rows of an `INSERT` are owned constant expressions.
 * **`RETURNING` -> Returning** on top of the DML node, with an output schema
   resolved against the target table's catalog columns (`RETURNING *` expands to
   every column; a bare column reference carries its type / nullability / ids).
@@ -97,17 +107,19 @@ Scan(s) -> [Join] -> [Filter (WHERE)] -> [Aggregate (GROUP BY / implicit)]
   same way but the vendored parser currently drops the clause for `INSERT` (no
   `ReturningClause` node), so it does not yet appear — a parser-side `TODO`.
 * **Window functions -> Window** (below the `Project`): a `Window` node carries
-  the borrowed window-call nodes (each a `FunctionCall` with a `WindowSpec` child
-  holding the `PARTITION BY` / `ORDER BY` / frame refs) and appends one output
-  column per function (type / nullability from the analyzer). The `Project`
+  owned `WindowFunction` expressions (each with its lowered arguments and an owned
+  `WindowSpecIR` for the `PARTITION BY` / `ORDER BY` / frame) and appends one
+  output column per function (type / nullability from the analyzer). The `Project`
   above references those outputs. Covers `RANK` / `ROW_NUMBER` / `SUM(..) OVER
   (...)` and friends.
-* **Subqueries in expressions** (scalar / `IN` / `EXISTS`) -> represented as
-  **`SubPlan`s** attached to the owning node (a `Project` for a scalar subquery
-  in the `SELECT` list, a `Filter` for `IN` / `EXISTS` in `WHERE`). Each `SubPlan`
-  carries the bound inner query plan, the subquery kind, and its correlation flag
-  from `Analyzer::is_correlated`. Correlated subqueries are faithfully
-  represented but **not** decorrelated (left to a later optimizer pass).
+* **Subqueries in expressions** (scalar / `IN` / `EXISTS`) -> owned **inline** by
+  an `ExprKind::Subquery` node within the owning expression (a `Project` item for
+  a scalar subquery in the `SELECT` list, a `Filter` predicate for `IN` / `EXISTS`
+  in `WHERE`). The node owns its bound inner query plan (`sub_plan`), the subquery
+  kind, and its correlation flag from `Analyzer::is_correlated`; a correlated
+  outer-column reference resolves to a first-class `OuterRef`. Correlated
+  subqueries are faithfully represented but **not** decorrelated (left to a later
+  optimizer pass).
 
 **Not yet lowered (clearly-marked `TODO`s in the source)**
 

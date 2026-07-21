@@ -90,16 +90,6 @@ private:
     LogicalNodePtr wrap_returning(LogicalNodePtr dml, const db25::ast::ASTNode* stmt,
                                   std::string& error);
 
-    // Bind any subqueries embedded in `expr_root` (a SELECT-list item or a WHERE
-    // predicate) and attach them to `owner` as SubPlans, recording each one's
-    // correlation status. Does not descend into an inner subquery's own body.
-    // `input` is the owner's input schema (the enclosing query block's rows); it
-    // is pushed onto outer_inputs_ while binding each subquery body so a
-    // correlated inner reference resolves outward to an OuterRef (the same
-    // enclosing-schema discipline lower_subquery uses).
-    void attach_subqueries(LogicalNode* owner, const db25::ast::ASTNode* expr_root,
-                           const Schema& input, std::string& error);
-
     // ------------------------------------------------------------------
     // AST -> owned, typed Expr lowering (expr_lower.cpp).
     //

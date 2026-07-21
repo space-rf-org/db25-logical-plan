@@ -101,6 +101,19 @@ void expect_col_ref(const db25::plan::ExprPtr& e, std::uint32_t slot,
           ctx + ": input_index == " + std::to_string(slot));
 }
 
+// Assert an expression is an owned ExprKind::Subquery of the given kind and
+// correlation, owning a bound inner Project sub-plan.
+void expect_subquery(const db25::plan::Expr* e, SubqueryKind kind, bool correlated,
+                     const std::string& ctx) {
+    check(e && e->kind == ExprKind::Subquery, ctx + ": is a Subquery expr");
+    if (e != nullptr && e->kind == ExprKind::Subquery) {
+        check(e->subquery_kind == kind, ctx + ": subquery kind");
+        check(e->correlated == correlated, ctx + ": correlation");
+        check(e->sub_plan && e->sub_plan->op == LogicalOp::Project,
+              ctx + ": sub_plan is a bound Project");
+    }
+}
+
 // -------------------------------------------------------------------------
 
 void test_scan_filter_project_limit(const InMemoryCatalog& cat) {
@@ -900,20 +913,20 @@ void test_window_sum(const InMemoryCatalog& cat) {
 }
 
 // -------------------------------------------------------------------------
-// Subqueries in expressions: represented as SubPlans (not decorrelated),
-// tagged by kind and correlation.
+// Subqueries in expressions: owned inline by an ExprKind::Subquery node (which
+// holds the bound inner plan), tagged by kind and correlation. No separate
+// borrowed subquery payload exists on a LogicalNode.
 
 void test_scalar_subquery(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT id, (SELECT MAX(total) FROM orders) FROM users\n");
     with_plan(cat, "SELECT id, (SELECT MAX(total) FROM orders) FROM users",
               [](const LogicalNode* root) {
         check(root->op == LogicalOp::Project, "root is Project");
-        check(root->subplans.size() == 1, "project has 1 subplan");
-        if (root->subplans.size() == 1) {
-            const auto& sp = root->subplans[0];
-            check(sp.kind == SubqueryKind::Scalar, "scalar subquery");
-            check(!sp.correlated, "uncorrelated");
-            check(sp.plan && sp.plan->op == LogicalOp::Project, "subplan is a Project");
+        // The scalar subquery is the second projected expression.
+        check(root->exprs.size() == 2, "project has 2 exprs");
+        if (root->exprs.size() == 2) {
+            expect_subquery(root->exprs[1].get(), SubqueryKind::Scalar, false,
+                            "scalar select-list subquery");
         }
     });
 }
@@ -925,11 +938,10 @@ void test_scalar_subquery_correlated(const InMemoryCatalog& cat) {
               "FROM users",
               [](const LogicalNode* root) {
         check(root->op == LogicalOp::Project, "root is Project");
-        check(root->subplans.size() == 1, "project has 1 subplan");
-        if (root->subplans.size() == 1) {
-            const auto& sp = root->subplans[0];
-            check(sp.kind == SubqueryKind::Scalar, "scalar subquery");
-            check(sp.correlated, "correlated");
+        check(root->exprs.size() == 2, "project has 2 exprs");
+        if (root->exprs.size() == 2) {
+            expect_subquery(root->exprs[1].get(), SubqueryKind::Scalar, true,
+                            "correlated scalar subquery");
         }
     });
 }
@@ -938,16 +950,40 @@ void test_in_subquery(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT id FROM users WHERE id IN (SELECT user_id FROM orders)\n");
     with_plan(cat, "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders)",
               [](const LogicalNode* root) {
-        // Project -> Filter(with IN subplan) -> Scan
+        // Project -> Filter (predicate is the owned IN Subquery) -> Scan
         check(root->op == LogicalOp::Project, "root is Project");
         const LogicalNode* filter = only_child(root);
         check(filter && filter->op == LogicalOp::Filter, "child is Filter");
-        check(filter && filter->subplans.size() == 1, "filter has 1 subplan");
-        if (filter && filter->subplans.size() == 1) {
-            const auto& sp = filter->subplans[0];
-            check(sp.kind == SubqueryKind::In, "IN subquery");
-            check(!sp.correlated, "uncorrelated");
-            check(sp.plan && sp.plan->op == LogicalOp::Project, "subplan is a Project");
+        expect_subquery(filter ? filter->predicate.get() : nullptr, SubqueryKind::In,
+                        false, "IN predicate subquery");
+        // The IN subquery keeps the left operand (id) as its first child.
+        if (filter && filter->predicate &&
+            filter->predicate->kind == ExprKind::Subquery) {
+            check(filter->predicate->children.size() == 1, "IN keeps left operand");
+            if (filter->predicate->children.size() == 1) {
+                expect_col_ref(filter->predicate->children[0], 0, "IN left operand (id #0)");
+            }
+        }
+    });
+}
+
+// A scalar subquery that is a whole SELECT item over an Aggregate child must
+// still be lowered into an owned Subquery (not swallowed by the positional
+// aggregate-passthrough rule, which would drop its plan).
+void test_scalar_subquery_over_aggregate(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT COUNT(*), (SELECT MAX(total) FROM orders) FROM users\n");
+    with_plan(cat, "SELECT COUNT(*), (SELECT MAX(total) FROM orders) FROM users",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->op == LogicalOp::Aggregate, "child is Aggregate");
+        check(root->exprs.size() == 2, "project has 2 exprs");
+        if (root->exprs.size() == 2) {
+            // COUNT(*) is the precomputed aggregate output (#0); the scalar
+            // subquery is lowered fresh with its inner plan owned inline.
+            expect_col_ref(root->exprs[0], 0, "COUNT -> #0");
+            expect_subquery(root->exprs[1].get(), SubqueryKind::Scalar, false,
+                            "scalar subquery over aggregate");
         }
     });
 }
@@ -961,12 +997,8 @@ void test_exists_subquery(const InMemoryCatalog& cat) {
         check(root->op == LogicalOp::Project, "root is Project");
         const LogicalNode* filter = only_child(root);
         check(filter && filter->op == LogicalOp::Filter, "child is Filter");
-        check(filter && filter->subplans.size() == 1, "filter has 1 subplan");
-        if (filter && filter->subplans.size() == 1) {
-            const auto& sp = filter->subplans[0];
-            check(sp.kind == SubqueryKind::Exists, "EXISTS subquery");
-            check(sp.correlated, "correlated");
-        }
+        expect_subquery(filter ? filter->predicate.get() : nullptr, SubqueryKind::Exists,
+                        true, "correlated EXISTS predicate subquery");
     });
 }
 
@@ -1017,6 +1049,7 @@ int main() {
     test_scalar_subquery_correlated(cat);
     test_in_subquery(cat);
     test_exists_subquery(cat);
+    test_scalar_subquery_over_aggregate(cat);
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) {

@@ -531,13 +531,13 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
         auto filter = make_node(LogicalOp::Filter);
         filter->output = current->output;   // filter is schema-preserving
         // Lower the predicate against the child's output (the filter's input).
+        // Any IN / EXISTS / scalar subquery is folded inline into the owned
+        // predicate expression (an ExprKind::Subquery owning its sub_plan), with
+        // correlated references resolved against this input.
         filter->predicate = lower_expr(pred_ast, current->output, error);
         if (!filter->predicate) {
             return nullptr;
         }
-        // Represent IN / EXISTS / scalar subqueries in the predicate. Its input
-        // (= the filter's output) is the enclosing schema for correlation.
-        attach_subqueries(filter.get(), pred_ast, filter->output, error);
         filter->add_child(std::move(current));
         current = std::move(filter);
     }
@@ -625,12 +625,12 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
             const ASTNode* pred_ast = first_child(having);  // the HAVING condition
             auto filter = make_node(LogicalOp::Filter);
             filter->output = current->output;   // schema-preserving
-            // Lower against the aggregate's output (the HAVING filter's input).
+            // Lower against the aggregate's output (the HAVING filter's input);
+            // any embedded subquery folds inline into the owned predicate.
             filter->predicate = lower_expr(pred_ast, current->output, error);
             if (!filter->predicate) {
                 return nullptr;
             }
-            attach_subqueries(filter.get(), pred_ast, filter->output, error);
             filter->add_child(std::move(current));
             current = std::move(filter);
         }
@@ -686,16 +686,10 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
         return nullptr;
     }
     if (select_list != nullptr) {
-        // The Project's input is its child's output (the FROM-clause rows); that
-        // is the enclosing schema against which a correlated SELECT-list scalar
-        // subquery resolves its outer references.
-        const Schema& project_input = current->output;
-        // Represent scalar subqueries embedded in each SELECT-list item.
-        for (const ASTNode* item = first_child(select_list); item != nullptr;
-             item = item->next_sibling) {
-            attach_subqueries(project.get(), item, project_input, error);
-        }
-        // Lower the SELECT list into owned, typed projected expressions.
+        // Lower the SELECT list into owned, typed projected expressions. A scalar
+        // subquery embedded in an item folds inline into that item's owned Expr
+        // (an ExprKind::Subquery owning its sub_plan), with correlated references
+        // resolved against the Project's input (the child's output).
         if (!lower_projection(select_list, current.get(), project->exprs, error)) {
             return nullptr;
         }
@@ -1056,74 +1050,6 @@ LogicalNodePtr Binder::wrap_returning(LogicalNodePtr dml, const ASTNode* stmt,
 }
 
 // ---------------------------------------------------------------------------
-// Subqueries embedded in an expression (scalar / IN / EXISTS).
-//
-// Each embedded Subquery node is bound to its own sub-plan and attached to the
-// owning logical node as a SubPlan, tagged with how it is used and whether the
-// analyzer found it correlated. This faithfully REPRESENTS the subquery in the
-// plan; decorrelating a correlated subquery is deliberately left to a later
-// optimizer pass. TODO(optimizer): decorrelate correlated subqueries.
-// ---------------------------------------------------------------------------
-namespace {
-
-// Classify a Subquery node by the expression that owns it.
-SubqueryKind subquery_kind_of(const ASTNode* subquery) {
-    const ASTNode* parent = subquery->parent;
-    if (parent != nullptr) {
-        if (parent->node_type == NodeType::InExpr) {
-            return SubqueryKind::In;
-        }
-        if (parent->node_type == NodeType::ExistsExpr) {
-            return SubqueryKind::Exists;
-        }
-        if (parent->node_type == NodeType::UnaryExpr &&
-            upper(parent->primary_text).find("EXISTS") != std::string::npos) {
-            return SubqueryKind::Exists;
-        }
-    }
-    return SubqueryKind::Scalar;
-}
-
-}  // namespace
-
-void Binder::attach_subqueries(LogicalNode* owner, const ASTNode* expr_root,
-                               const Schema& input, std::string& error) {
-    if (expr_root == nullptr) {
-        return;
-    }
-    // A Subquery node roots an embedded query block; bind it and stop
-    // descending (its own nested subqueries belong to its inner plan).
-    if (expr_root->node_type == NodeType::Subquery) {
-        const ASTNode* body = subquery_body(expr_root);
-        if (body != nullptr) {
-            // Push the owner's input as an enclosing schema so a correlated
-            // reference inside the subquery body resolves outward (matching
-            // lower_subquery); pop it once the body is bound.
-            outer_inputs_.push_back(&input);
-            std::string local_error;
-            auto plan = bind_query(body, local_error);
-            outer_inputs_.pop_back();
-            if (plan) {
-                SubPlan sp;
-                sp.expr = expr_root;
-                sp.kind = subquery_kind_of(expr_root);
-                sp.correlated = analyzer_.is_correlated(expr_root);
-                sp.plan = std::move(plan);
-                owner->subplans.push_back(std::move(sp));
-            }
-            // A subquery we cannot bind is left unrepresented rather than
-            // failing the whole statement; `error` is only surfaced on a hard
-            // top-level failure. (Silently skipped here by design.)
-            (void)error;
-        }
-        return;
-    }
-    for (const ASTNode* c = first_child(expr_root); c != nullptr; c = c->next_sibling) {
-        attach_subqueries(owner, c, input, error);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Projection lowering (SELECT list -> owned, typed expressions).
 //
 // One owned Expr per output column. A `*` expands to one positional ColumnRef
@@ -1140,11 +1066,23 @@ ExprPtr Binder::lower_projection_item(const ASTNode* item, const Schema& input,
     // inner argument is not in the aggregate's output and so must not be
     // re-lowered here.
     if (child_is_aggregate) {
-        if (index < input.size()) {
-            return make_column_ref(static_cast<std::uint32_t>(index), input[index]);
+        // Exception: a scalar subquery that is *itself* a whole select item is
+        // NOT produced by the Aggregate, so mapping it positionally would
+        // reference a phantom output column and drop the subquery's plan. Lower
+        // it fresh (against the aggregate's output) so its inner plan is bound
+        // and owned inline. (A subquery buried inside an aggregate expression,
+        // e.g. `SUM(x) + (SELECT ...)`, still maps positionally and is not
+        // separately represented - a known limitation of the simplified
+        // per-select-item aggregate output model, where such an item collapses
+        // to a single output column with no sub-structure.)
+        if (item->node_type != NodeType::Subquery &&
+            item->node_type != NodeType::SubqueryExpr) {
+            if (index < input.size()) {
+                return make_column_ref(static_cast<std::uint32_t>(index), input[index]);
+            }
+            error = "projection item past the aggregate's output";
+            return nullptr;
         }
-        error = "projection item past the aggregate's output";
-        return nullptr;
     }
     // A precomputed aggregate / window output (a window function, or an aggregate
     // surfacing above a HAVING filter): reference the child column by its output
