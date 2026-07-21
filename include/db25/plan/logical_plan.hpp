@@ -81,6 +81,10 @@ struct ColumnSchema {
     bool nullable = true;
     std::uint32_t table_id = 0;
     std::uint32_t column_id = 0;
+    // The relation alias (or table name) this column came from. Two aliases of
+    // the SAME base table share (table_id, column_id), so the alias is what
+    // disambiguates a self-join's column references. Empty for computed columns.
+    std::string alias;
 };
 
 using Schema = std::vector<ColumnSchema>;

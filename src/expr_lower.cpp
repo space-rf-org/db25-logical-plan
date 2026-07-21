@@ -66,14 +66,26 @@ bool is_negated(const ASTNode* n) {
            to_upper(n->primary_text).find("NOT") != std::string::npos;
 }
 
-// Find the flat slot of a base column (table_id, column_id) in a schema.
-int find_slot_by_id(const Schema& s, std::uint32_t tid, std::uint32_t cid) {
+// Find the flat slot of a base column (table_id, column_id) in a schema. When a
+// `qualifier` is given (a column reference's alias), prefer the matching slot
+// whose column carries that alias - this is what disambiguates a self-join,
+// where every occurrence of the table shares the same (table_id, column_id).
+// Falls back to the first (table_id, column_id) match otherwise, preserving the
+// single-occurrence behaviour.
+int find_slot_by_id(const Schema& s, std::uint32_t tid, std::uint32_t cid,
+                    std::string_view qualifier = {}) {
+    int first = -1;
     for (std::size_t i = 0; i < s.size(); ++i) {
         if (s[i].table_id == tid && s[i].column_id == cid) {
-            return static_cast<int>(i);
+            if (first < 0) {
+                first = static_cast<int>(i);
+            }
+            if (!qualifier.empty() && s[i].alias == qualifier) {
+                return static_cast<int>(i);
+            }
         }
     }
-    return -1;
+    return first;
 }
 
 // Minimal producer-map fallback: match a computed column (synthetic/zero ids)
@@ -191,9 +203,12 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
         case NodeType::Identifier: {
             const std::uint32_t tid = n->context.analysis.table_id;
             const std::uint32_t cid = n->context.analysis.column_id;
+            // The reference's qualifier (`m` in `m.id`) disambiguates a self-join,
+            // where each occurrence shares (table_id, column_id).
+            const std::string_view qual = split_column_ref(n->primary_text).qualifier;
             if (tid != 0 && cid != 0) {
                 // Base / catalog column: resolve by id against the input schema.
-                const int slot = find_slot_by_id(input, tid, cid);
+                const int slot = find_slot_by_id(input, tid, cid, qual);
                 if (slot >= 0) {
                     auto e = make_expr(ExprKind::ColumnRef, n);
                     e->type = type;
@@ -207,7 +222,7 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
                 // Resolve against enclosing inputs (innermost = back()).
                 for (std::size_t d = 1; d <= outer_inputs_.size(); ++d) {
                     const Schema& outer = *outer_inputs_[outer_inputs_.size() - d];
-                    const int os = find_slot_by_id(outer, tid, cid);
+                    const int os = find_slot_by_id(outer, tid, cid, qual);
                     if (os >= 0) {
                         auto e = make_expr(ExprKind::OuterRef, n);
                         e->type = type;
