@@ -50,6 +50,11 @@ enum class LogicalOp : std::uint8_t {
     Filter,     // WHERE / HAVING predicate
     Project,    // SELECT list -> named output columns
     Join,       // binary join (INNER / OUTER / CROSS; USING columns merged)
+    SemiJoin,   // left rows that HAVE a matching right row (from EXISTS / IN);
+                // output is the LEFT schema only. `predicate` is the match
+                // condition over the left ++ right frame (null = unconditioned).
+    AntiJoin,   // left rows that have NO matching right row (from NOT EXISTS);
+                // output is the LEFT schema only. Same predicate convention.
     Aggregate,  // GROUP BY + aggregate functions
     Window,     // window functions (RANK/ROW_NUMBER/SUM(..) OVER (...)); sits
                 // below Project, appends one output column per window function

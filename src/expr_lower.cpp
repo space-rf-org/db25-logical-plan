@@ -57,6 +57,15 @@ std::string to_upper(std::string_view s) {
     return out;
 }
 
+// A predicate is negated (NOT EXISTS / NOT IN / NOT LIKE / NOT BETWEEN / IS NOT
+// NULL). The parser marks NOT on the predicate node with semantic_flags bit 6
+// (0x40); some shapes also spell "NOT" into the operator text. Accept either so
+// the negation is never lost.
+bool is_negated(const ASTNode* n) {
+    return (n->semantic_flags & 0x40u) != 0 ||
+           to_upper(n->primary_text).find("NOT") != std::string::npos;
+}
+
 // Find the flat slot of a base column (table_id, column_id) in a schema.
 int find_slot_by_id(const Schema& s, std::uint32_t tid, std::uint32_t cid) {
     for (std::size_t i = 0; i < s.size(); ++i) {
@@ -307,7 +316,7 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
                     error = "EXISTS without a subquery operand";
                     return nullptr;
                 }
-                return lower_subquery(sq, SubqueryKind::Exists, u == "NOT EXISTS", nullptr,
+                return lower_subquery(sq, SubqueryKind::Exists, is_negated(n), nullptr,
                                       type, nullability, input, error);
             }
             UnaryOp op{};
@@ -418,7 +427,7 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
             auto e = make_expr(ExprKind::Between, n);
             e->type = type;
             e->nullability = nullability;
-            if (to_upper(n->primary_text).find("NOT") != std::string::npos) {
+            if (is_negated(n)) {
                 e->expr_flags |= ExprFlagNegated;
             }
             for (const ASTNode* c : {value, low, high}) {
@@ -434,7 +443,7 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
             auto e = make_expr(ExprKind::Like, n);
             e->type = type;
             e->nullability = nullability;
-            if (to_upper(n->primary_text).find("NOT") != std::string::npos) {
+            if (is_negated(n)) {
                 e->expr_flags |= ExprFlagNegated;
             }
             for (const ASTNode* c = first_child(n); c != nullptr; c = c->next_sibling) {
@@ -450,7 +459,7 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
             auto e = make_expr(ExprKind::IsNull, n);
             e->type = type;
             e->nullability = nullability;
-            if (to_upper(n->primary_text).find("NOT") != std::string::npos) {
+            if (is_negated(n)) {
                 e->expr_flags |= ExprFlagNegated;
             }
             auto o = lower_expr(first_child(n), input, error);
@@ -463,7 +472,7 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
         case NodeType::InExpr: {
             const ASTNode* value = first_child(n);
             const ASTNode* right = value != nullptr ? value->next_sibling : nullptr;
-            const bool negated = to_upper(n->primary_text).find("NOT") != std::string::npos;
+            const bool negated = is_negated(n);
             if (right != nullptr && (right->node_type == NodeType::Subquery ||
                                      right->node_type == NodeType::SubqueryExpr)) {
                 auto v = lower_expr(value, input, error);
@@ -495,7 +504,7 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
                 error = "EXISTS without a subquery operand";
                 return nullptr;
             }
-            const bool negated = to_upper(n->primary_text).find("NOT") != std::string::npos;
+            const bool negated = is_negated(n);
             return lower_subquery(sq, SubqueryKind::Exists, negated, nullptr, type,
                                   nullability, input, error);
         }
