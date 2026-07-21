@@ -11,6 +11,7 @@
 #include <optional>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace db25::plan {
 
@@ -310,6 +311,164 @@ void simplify_expr(ExprPtr& e) {
     }
 }
 
+// ---- Predicate pushdown helpers ---------------------------------------------
+
+// Flatten a predicate's top-level AND chain into individual conjuncts, taking
+// ownership of `e`. `a AND b AND c` -> [a, b, c]; a non-AND -> [itself].
+void collect_conjuncts(ExprPtr e, std::vector<ExprPtr>& out) {
+    if (e && e->kind == ExprKind::BinaryOp && e->bin_op == BinaryOp::And &&
+        e->children.size() == 2) {
+        collect_conjuncts(std::move(e->children[0]), out);
+        collect_conjuncts(std::move(e->children[1]), out);
+    } else {
+        out.push_back(std::move(e));
+    }
+}
+
+// Re-AND a list of conjuncts into one predicate (left-deep), consuming `parts`.
+// Returns null for an empty list.
+ExprPtr combine_conjuncts(std::vector<ExprPtr>& parts) {
+    if (parts.empty()) {
+        return nullptr;
+    }
+    ExprPtr acc = std::move(parts[0]);
+    for (std::size_t i = 1; i < parts.size(); ++i) {
+        auto conj = std::make_unique<Expr>(ExprKind::BinaryOp);
+        conj->bin_op = BinaryOp::And;
+        conj->type = ast::DataType::Boolean;
+        // AND is nullable if either operand is; not-null only if both are.
+        const std::uint8_t ln = acc->nullability;
+        const std::uint8_t rn = parts[i]->nullability;
+        conj->nullability = (ln == 2 || rn == 2) ? 2 : ((ln == 1 && rn == 1) ? 1 : 0);
+        conj->children.push_back(std::move(acc));
+        conj->children.push_back(std::move(parts[i]));
+        acc = std::move(conj);
+    }
+    return acc;
+}
+
+// Which join inputs a conjunct references, and whether it is safe to push.
+struct RefInfo {
+    bool refs_left = false;
+    bool refs_right = false;
+    bool any = false;       // references at least one join column
+    bool pushable = true;   // false if it carries an OuterRef or a Subquery
+};
+
+// Classify the column references of `e` relative to a join whose left input has
+// `left_width` columns (join output = left.output ++ right.output).
+void scan_refs(const Expr& e, std::uint32_t left_width, RefInfo& info) {
+    if (e.kind == ExprKind::ColumnRef) {
+        info.any = true;
+        if (e.input_index < left_width) {
+            info.refs_left = true;
+        } else {
+            info.refs_right = true;
+        }
+    } else if (e.kind == ExprKind::OuterRef || e.kind == ExprKind::Subquery) {
+        // A correlated reference or an embedded subquery must not be relocated.
+        info.pushable = false;
+        return;
+    }
+    for (const auto& c : e.children) {
+        scan_refs(*c, left_width, info);
+    }
+}
+
+// Shift every positional column slot in `e` down by `delta` (used when a
+// right-only conjunct moves from the join output frame into the right input
+// frame). Right-only pushable conjuncts contain no OuterRef / Subquery.
+void remap_slots(Expr& e, std::uint32_t delta) {
+    if (e.kind == ExprKind::ColumnRef) {
+        e.input_index -= delta;
+    }
+    for (auto& c : e.children) {
+        remap_slots(*c, delta);
+    }
+}
+
+// Wrap `child` in a schema-preserving Filter carrying `pred`.
+LogicalNodePtr make_filter(LogicalNodePtr child, ExprPtr pred) {
+    auto filter = std::make_unique<LogicalNode>(LogicalOp::Filter);
+    filter->output = child->output;
+    filter->predicate = std::move(pred);
+    filter->add_child(std::move(child));
+    return filter;
+}
+
+// Recurse predicate pushdown into every embedded subquery sub-plan of `e`.
+void push_down_in_expr(ExprPtr& e) {
+    if (!e) {
+        return;
+    }
+    if (e->kind == ExprKind::Subquery && e->sub_plan) {
+        push_down_filters(e->sub_plan);
+    }
+    for (auto& c : e->children) {
+        push_down_in_expr(c);
+    }
+    if (e->kind == ExprKind::WindowFunction) {
+        for (auto& p : e->window.partition_by) push_down_in_expr(p);
+        for (auto& k : e->window.order_by) push_down_in_expr(k.expr);
+    }
+}
+
+// Split `filter_node`'s predicate and push each single-side conjunct into the
+// corresponding input of the INNER / CROSS Join beneath it. `filter_node` is
+// replaced by the bare Join if every conjunct is pushed.
+void push_filter_into_join(LogicalNodePtr& filter_node) {
+    if (!filter_node->predicate) {
+        return;  // an unconditioned Filter has nothing to split (defensive).
+    }
+    LogicalNode* join = filter_node->child(0);
+    const auto left_width = static_cast<std::uint32_t>(join->child(0)->output.size());
+    // A right-only conjunct can only be re-based by subtracting left_width when
+    // the join output is the plain concatenation left ++ right. A USING join
+    // drops the merged right duplicates, compacting the right frame, so right
+    // pushdown is disabled there (left pushdown stays valid - the left frame is
+    // always the unmodified prefix).
+    const bool full_concat =
+        join->output.size() == left_width + join->child(1)->output.size();
+
+    std::vector<ExprPtr> conjuncts;
+    collect_conjuncts(std::move(filter_node->predicate), conjuncts);
+
+    std::vector<ExprPtr> left_push;
+    std::vector<ExprPtr> right_push;
+    std::vector<ExprPtr> stay;
+    for (auto& c : conjuncts) {
+        RefInfo info;
+        scan_refs(*c, left_width, info);
+        if (info.pushable && info.any && info.refs_left && !info.refs_right) {
+            left_push.push_back(std::move(c));
+        } else if (info.pushable && info.any && info.refs_right && !info.refs_left &&
+                   full_concat) {
+            right_push.push_back(std::move(c));
+        } else {
+            stay.push_back(std::move(c));
+        }
+    }
+
+    if (!left_push.empty()) {
+        ExprPtr pred = combine_conjuncts(left_push);
+        join->children[0] = make_filter(std::move(join->children[0]), std::move(pred));
+    }
+    if (!right_push.empty()) {
+        for (auto& c : right_push) {
+            remap_slots(*c, left_width);
+        }
+        ExprPtr pred = combine_conjuncts(right_push);
+        join->children[1] = make_filter(std::move(join->children[1]), std::move(pred));
+    }
+
+    if (stay.empty()) {
+        LogicalNodePtr kept = std::move(filter_node->children[0]);  // the Join
+        filter_node = std::move(kept);
+    } else {
+        filter_node->predicate = combine_conjuncts(stay);
+    }
+}
+
 }  // namespace
 
 void fold_constants(LogicalNode* node) {
@@ -332,11 +491,54 @@ void simplify_booleans(LogicalNode* node) {
     }
 }
 
+void push_down_filters(LogicalNodePtr& node) {
+    if (!node) {
+        return;
+    }
+    // Bottom-up: settle children and embedded subquery sub-plans first.
+    for (auto& child : node->children) {
+        push_down_filters(child);
+    }
+    for_each_payload_expr(node.get(), [](ExprPtr& e) { push_down_in_expr(e); });
+
+    // Merge a Filter directly over a Filter into one (conjoined) Filter.
+    while (node->op == LogicalOp::Filter && node->child_count() == 1 &&
+           node->child(0)->op == LogicalOp::Filter) {
+        LogicalNode* inner = node->child(0);
+        std::vector<ExprPtr> parts;
+        collect_conjuncts(std::move(node->predicate), parts);
+        collect_conjuncts(std::move(inner->predicate), parts);
+        node->predicate = combine_conjuncts(parts);
+        node->children[0] = std::move(inner->children[0]);
+    }
+
+    // Drop a Filter whose predicate simplified to constant TRUE.
+    if (node->op == LogicalOp::Filter && node->child_count() == 1 && node->predicate &&
+        node->predicate->kind == ExprKind::Literal) {
+        const bool* b = std::get_if<bool>(&node->predicate->value.value);
+        if (b != nullptr && *b) {
+            LogicalNodePtr kept = std::move(node->children[0]);
+            node = std::move(kept);
+            return;
+        }
+    }
+
+    // Push conjuncts below an INNER / CROSS Join.
+    if (node->op == LogicalOp::Filter && node->child_count() == 1 &&
+        node->child(0)->op == LogicalOp::Join &&
+        (node->child(0)->join_type == ast::JoinType::Inner ||
+         node->child(0)->join_type == ast::JoinType::Cross)) {
+        push_filter_into_join(node);
+    }
+}
+
 LogicalNodePtr optimize(LogicalNodePtr plan) {
     if (plan) {
-        // Fold first so a folded `1 = 1` -> `true` feeds the boolean identities.
+        // Fold first so a folded `1 = 1` -> `true` feeds the boolean identities;
+        // simplify next so a reduced predicate feeds pushdown; then push filters.
         fold_constants(plan.get());
         simplify_booleans(plan.get());
+        push_down_filters(plan);
     }
     return plan;
 }

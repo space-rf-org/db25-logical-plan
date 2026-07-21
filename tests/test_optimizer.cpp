@@ -46,6 +46,11 @@ InMemoryCatalog make_catalog() {
         {"id", DataType::Integer, false},
         {"name", DataType::VarChar, true},
     });
+    cat.add_table("orders", {
+        {"id", DataType::Integer, false},
+        {"user_id", DataType::Integer, true},
+        {"total", DataType::Double, true},
+    });
     return cat;
 }
 
@@ -234,11 +239,15 @@ void test_and_false(const InMemoryCatalog& cat) {
 }
 
 void test_or_true(const InMemoryCatalog& cat) {
-    std::printf("[test] WHERE id = 1 OR 2 = 2  ->  true\n");
+    std::printf("[test] WHERE id = 1 OR 2 = 2  ->  filter dropped\n");
     with_optimized_plan(cat, "SELECT id FROM users WHERE id = 1 OR 2 = 2",
                         [](const LogicalNode* root) {
-        // 2 = 2 folds to true, then `x OR true` simplifies to true.
-        expect_bool_literal(filter_predicate(root), true, "predicate is true");
+        // 2 = 2 folds to true, `x OR true` simplifies to true, then the
+        // always-true Filter is dropped: Project sits directly over the Scan.
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* child = only_child(root);
+        check(child && child->op == LogicalOp::Scan,
+              "always-true Filter removed (Project over Scan)");
     });
 }
 
@@ -250,6 +259,89 @@ void test_double_negation(const InMemoryCatalog& cat) {
         check(p && p->kind == ExprKind::BinaryOp &&
                   p->bin_op == db25::ast::BinaryOp::Equal,
               "NOT (NOT (id = 1)) reduces to id = 1");
+    });
+}
+
+// Both WHERE conjuncts reference a single join side, so both push down and the
+// top Filter disappears: Project -> Join(Filter users, Filter orders).
+void test_pushdown_both_sides(const InMemoryCatalog& cat) {
+    std::printf("[test] JOIN ... WHERE u.name = 'x' AND o.total > 100  (both pushed)\n");
+    with_optimized_plan(
+        cat,
+        "SELECT u.id, o.total FROM users u INNER JOIN orders o ON u.id = o.user_id "
+        "WHERE u.name = 'x' AND o.total > 100",
+        [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* join = only_child(root);
+        check(join && join->op == LogicalOp::Join, "Filter removed; Project over Join");
+        if (join && join->op == LogicalOp::Join && join->child_count() == 2) {
+            const LogicalNode* lf = join->child(0);
+            const LogicalNode* rf = join->child(1);
+            check(lf && lf->op == LogicalOp::Filter, "left input wrapped in a Filter");
+            check(lf && lf->child(0) && lf->child(0)->op == LogicalOp::Scan &&
+                      lf->child(0)->table_name == "users", "left Filter over Scan users");
+            check(rf && rf->op == LogicalOp::Filter, "right input wrapped in a Filter");
+            check(rf && rf->child(0) && rf->child(0)->op == LogicalOp::Scan &&
+                      rf->child(0)->table_name == "orders", "right Filter over Scan orders");
+            // The right conjuncts `o.total > 100` was on join slot #4 and is
+            // remapped to slot #2 (total) in the orders input frame.
+            if (rf && rf->predicate && rf->predicate->kind == ExprKind::BinaryOp &&
+                rf->predicate->children.size() == 2) {
+                check(rf->predicate->children[0]->kind == ExprKind::ColumnRef &&
+                          rf->predicate->children[0]->input_index == 2,
+                      "right predicate remapped to orders slot #2 (total)");
+            }
+        }
+    });
+}
+
+// A conjunct spanning both join sides cannot be pushed and stays above the Join;
+// the single-side conjunct still pushes into its input.
+void test_pushdown_straddling_stays(const InMemoryCatalog& cat) {
+    std::printf("[test] JOIN ... WHERE u.name = 'x' AND u.id = o.id  (straddle stays)\n");
+    with_optimized_plan(
+        cat,
+        "SELECT u.id FROM users u INNER JOIN orders o ON u.id = o.user_id "
+        "WHERE u.name = 'x' AND u.id = o.id",
+        [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* filter = only_child(root);
+        check(filter && filter->op == LogicalOp::Filter, "straddling Filter stays");
+        // The surviving predicate is the cross-side comparison u.id = o.id (#0 = #2).
+        if (filter && filter->predicate && filter->predicate->kind == ExprKind::BinaryOp &&
+            filter->predicate->children.size() == 2) {
+            check(filter->predicate->children[0]->input_index == 0 &&
+                      filter->predicate->children[1]->input_index == 2,
+                  "surviving predicate is u.id = o.id (#0 = #2)");
+        }
+        const LogicalNode* join = filter ? only_child(filter) : nullptr;
+        check(join && join->op == LogicalOp::Join, "Filter over Join");
+        if (join && join->child_count() == 2) {
+            check(join->child(0)->op == LogicalOp::Filter, "left side got the name filter");
+        }
+    });
+}
+
+// An OUTER join is NOT eligible for pushdown (would change null-extension
+// semantics), so the WHERE Filter is left intact above the Join.
+void test_no_pushdown_outer_join(const InMemoryCatalog& cat) {
+    std::printf("[test] LEFT JOIN ... WHERE u.name = 'x'  (not pushed)\n");
+    with_optimized_plan(
+        cat,
+        "SELECT u.id FROM users u LEFT JOIN orders o ON u.id = o.user_id "
+        "WHERE u.name = 'x'",
+        [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* filter = only_child(root);
+        check(filter && filter->op == LogicalOp::Filter, "Filter stays above the OUTER join");
+        const LogicalNode* join = filter ? only_child(filter) : nullptr;
+        check(join && join->op == LogicalOp::Join &&
+                  join->join_type == db25::ast::JoinType::Left, "child is the LEFT Join");
+        if (join && join->child_count() == 2) {
+            check(join->child(0)->op == LogicalOp::Scan &&
+                      join->child(1)->op == LogicalOp::Scan,
+                  "both join inputs remain bare Scans (nothing pushed)");
+        }
     });
 }
 
@@ -270,6 +362,9 @@ int main() {
     test_and_false(cat);
     test_or_true(cat);
     test_double_negation(cat);
+    test_pushdown_both_sides(cat);
+    test_pushdown_straddling_stays(cat);
+    test_no_pushdown_outer_join(cat);
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) {
