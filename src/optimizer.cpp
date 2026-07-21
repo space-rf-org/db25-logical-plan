@@ -1384,6 +1384,77 @@ void decorrelate_in_expr(ExprPtr& e) {
     }
 }
 
+// True if the predicate's top-level AND chain carries a [NOT] EXISTS or IN
+// subquery conjunct - the shapes decorrelation can turn into a Semi / Anti join.
+bool has_top_level_subquery_conjunct(const Expr* e) {
+    if (e == nullptr) {
+        return false;
+    }
+    if (e->kind == ExprKind::BinaryOp && e->bin_op == BinaryOp::And &&
+        e->children.size() == 2) {
+        return has_top_level_subquery_conjunct(e->children[0].get()) ||
+               has_top_level_subquery_conjunct(e->children[1].get());
+    }
+    return e->kind == ExprKind::Subquery &&
+           (e->subquery_kind == SubqueryKind::Exists ||
+            e->subquery_kind == SubqueryKind::In);
+}
+
+// Decorrelate every [NOT] EXISTS / IN subquery that appears as a TOP-LEVEL
+// conjunct of a Filter predicate - not only a predicate that is entirely the
+// subquery. Each decorrelatable conjunct becomes a Semi / Anti join wrapping the
+// child; the remaining conjuncts (local predicates and any subquery the gate
+// declines) stay as a residual Filter above the join stack.
+//
+// This is what a later predicate-pushdown pass + a second decorrelation pass
+// would achieve across two optimize() runs (pushdown peels the local conjunct
+// off, isolating a bare EXISTS the next decorrelation pass then rewrites). Doing
+// it in one pass is why optimize() is now idempotent for these shapes.
+void decorrelate_filter_subqueries(LogicalNodePtr& node) {
+    std::vector<ExprPtr> conjuncts;
+    collect_conjuncts(std::move(node->predicate), conjuncts);
+
+    LogicalNodePtr child = std::move(node->children[0]);
+    std::vector<ExprPtr> residual;
+    for (auto& c : conjuncts) {
+        const bool is_sq = c->kind == ExprKind::Subquery &&
+                           (c->subquery_kind == SubqueryKind::Exists ||
+                            c->subquery_kind == SubqueryKind::In);
+        if (!is_sq) {
+            residual.push_back(std::move(c));
+            continue;
+        }
+        // Isolate this subquery conjunct as its own Filter and try to decorrelate
+        // it. On success the probe becomes a Semi / Anti join over `child`; on a
+        // gate miss it is returned unchanged and the subquery stays a conjunct.
+        const SubqueryKind kind = c->subquery_kind;
+        auto probe = std::make_unique<LogicalNode>(LogicalOp::Filter);
+        probe->output = child->output;
+        probe->predicate = std::move(c);
+        probe->add_child(std::move(child));
+        if (kind == SubqueryKind::Exists) {
+            try_decorrelate_exists_filter(probe);
+        } else {
+            try_decorrelate_in_filter(probe);
+        }
+        if (probe->op == LogicalOp::SemiJoin || probe->op == LogicalOp::AntiJoin) {
+            child = std::move(probe);  // decorrelated: new child stack
+        } else {
+            child = std::move(probe->children[0]);       // restore the child, and
+            residual.push_back(std::move(probe->predicate));  // keep the subquery
+        }
+    }
+
+    if (residual.empty()) {
+        node = std::move(child);
+        return;
+    }
+    node->predicate = combine_conjuncts(residual);
+    node->children.clear();
+    node->output = child->output;  // Filter is schema-preserving
+    node->add_child(std::move(child));
+}
+
 void decorrelate_node(LogicalNodePtr& node) {
     if (!node) {
         return;
@@ -1398,12 +1469,8 @@ void decorrelate_node(LogicalNodePtr& node) {
     }
 
     if (node->op == LogicalOp::Filter && node->child_count() == 1 && node->predicate &&
-        node->predicate->kind == ExprKind::Subquery) {
-        if (node->predicate->subquery_kind == SubqueryKind::Exists) {
-            try_decorrelate_exists_filter(node);
-        } else if (node->predicate->subquery_kind == SubqueryKind::In) {
-            try_decorrelate_in_filter(node);
-        }
+        has_top_level_subquery_conjunct(node->predicate.get())) {
+        decorrelate_filter_subqueries(node);
     }
 }
 
