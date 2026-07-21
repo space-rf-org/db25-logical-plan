@@ -337,6 +337,14 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
         // ----- Function call: window / aggregate / scalar -----
         case NodeType::FunctionCall:
         case NodeType::FunctionExpr: {
+            // An aggregate / window call surfacing above its Aggregate / Window
+            // node (e.g. in HAVING or ORDER BY) reads the already-computed output
+            // column by name rather than re-lowering the call, whose base-column
+            // arguments are no longer in scope. Self-gating: only fires when the
+            // input schema actually carries a same-named producer column.
+            if (auto precomputed = lower_precomputed_aggregate(n, input)) {
+                return precomputed;
+            }
             const ASTNode* window_spec = find_child(n, NodeType::WindowSpec);
             const std::string uname = to_upper(n->primary_text);
             const ExprKind fk = window_spec != nullptr ? ExprKind::WindowFunction

@@ -340,6 +340,75 @@ void test_having(const InMemoryCatalog& cat) {
     });
 }
 
+// HAVING that references an aggregate expression (not just COUNT(*)): the
+// aggregate is matched to the Aggregate's already-computed output column and
+// lowered to a ColumnRef, rather than being re-lowered (which would reach for
+// base columns no longer in scope above the aggregation).
+void test_having_aggregate_in_select(const InMemoryCatalog& cat) {
+    std::printf("[test] ... GROUP BY dept HAVING SUM(sal) > 1000  (SUM also selected)\n");
+    with_plan(cat,
+              "SELECT dept, SUM(sal) FROM emp GROUP BY dept HAVING SUM(sal) > 1000",
+              [](const LogicalNode* root) {
+        const LogicalNode* filter = only_child(root);
+        check(filter && filter->op == LogicalOp::Filter, "child is the HAVING Filter");
+        check(filter && filter->predicate &&
+                  filter->predicate->kind == ExprKind::BinaryOp &&
+                  filter->predicate->children.size() == 2,
+              "HAVING predicate is a comparison");
+        // The SUM(sal) operand resolved to a ColumnRef into the Aggregate output
+        // (the precomputed SUM column), NOT a re-lowered Aggregate expression.
+        if (filter && filter->predicate && filter->predicate->children.size() == 2) {
+            check(filter->predicate->children[0]->kind == ExprKind::ColumnRef,
+                  "SUM(sal) in HAVING is a ColumnRef to the precomputed aggregate");
+        }
+        const LogicalNode* agg = filter ? only_child(filter) : nullptr;
+        check(agg && agg->op == LogicalOp::Aggregate, "Filter over Aggregate");
+        // Output is the SELECT-list shape (dept, SUM); no hidden column needed
+        // because SUM(sal) is already a select output the HAVING can name.
+        check(agg && agg->output.size() == 2, "aggregate output is the 2 select cols");
+        check(root->output.size() == 2, "query result is (dept, SUM)");
+    });
+}
+
+// HAVING may reference an aggregate that is NOT in the SELECT list; the Aggregate
+// gains a hidden output column for it that the Project above drops.
+void test_having_aggregate_not_selected(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT dept FROM emp GROUP BY dept HAVING MIN(sal) > 5  (MIN not selected)\n");
+    with_plan(cat, "SELECT dept FROM emp GROUP BY dept HAVING MIN(sal) > 5",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project && root->output.size() == 1,
+              "query result is just (dept)");
+        const LogicalNode* filter = only_child(root);
+        check(filter && filter->op == LogicalOp::Filter, "child is the HAVING Filter");
+        if (filter && filter->predicate && filter->predicate->children.size() == 2) {
+            check(filter->predicate->children[0]->kind == ExprKind::ColumnRef,
+                  "MIN(sal) in HAVING resolved to a ColumnRef (the hidden aggregate)");
+        }
+        const LogicalNode* agg = filter ? only_child(filter) : nullptr;
+        // dept (select) + a hidden MIN column the HAVING references.
+        check(agg && agg->op == LogicalOp::Aggregate && agg->output.size() == 2,
+              "aggregate carries a hidden MIN output column");
+    });
+}
+
+// A selected aggregate hidden behind an alias is still referenceable by its call
+// form in HAVING (via a hidden output column).
+void test_having_aggregate_aliased(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT dept, SUM(sal) AS total ... HAVING SUM(sal) > 1000  (aliased)\n");
+    with_plan(cat,
+              "SELECT dept, SUM(sal) AS total FROM emp GROUP BY dept HAVING SUM(sal) > 1000",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project && root->output.size() == 2,
+              "query result is (dept, total)");
+        const LogicalNode* filter = only_child(root);
+        check(filter && filter->op == LogicalOp::Filter, "child is the HAVING Filter");
+        if (filter && filter->predicate && filter->predicate->children.size() == 2) {
+            check(filter->predicate->children[0]->kind == ExprKind::ColumnRef,
+                  "HAVING SUM(sal) resolved to a ColumnRef despite the SELECT alias");
+        }
+    });
+}
+
 // -------------------------------------------------------------------------
 // SELECT DISTINCT: a Distinct node directly above the Project.
 
@@ -1034,6 +1103,9 @@ int main() {
     test_implicit_aggregate_count(cat);
     test_implicit_aggregate_nested(cat);
     test_having(cat);
+    test_having_aggregate_in_select(cat);
+    test_having_aggregate_not_selected(cat);
+    test_having_aggregate_aliased(cat);
     test_distinct(cat);
     test_select_star(cat);
     test_order_by(cat);

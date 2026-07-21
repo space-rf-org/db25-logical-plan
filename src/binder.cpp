@@ -259,6 +259,18 @@ int slot_by_name(const Schema& s, std::string_view name) {
 
 }  // namespace
 
+ExprPtr Binder::lower_precomputed_aggregate(const ASTNode* call, const Schema& input) const {
+    if (call == nullptr || !(is_aggregate_call(call) || is_window_call(call))) {
+        return nullptr;
+    }
+    const int slot = slot_by_name(input, item_output_name(call));
+    if (slot < 0) {
+        return nullptr;
+    }
+    return make_column_ref(static_cast<std::uint32_t>(slot),
+                           input[static_cast<std::size_t>(slot)]);
+}
+
 Schema Binder::scan_schema(const TableInfo& table, std::uint32_t table_id) const {
     Schema schema;
     schema.reserve(table.columns.size());
@@ -562,8 +574,10 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
             collect_aggregates(item, aggregates);
         }
     }
+    std::vector<const ASTNode*> having_aggs;
     if (having != nullptr) {
-        collect_aggregates(first_child(having), aggregates);
+        collect_aggregates(first_child(having), having_aggs);
+        aggregates.insert(aggregates.end(), having_aggs.begin(), having_aggs.end());
     }
     if (order_by != nullptr) {
         for (const ASTNode* key = first_child(order_by); key != nullptr;
@@ -614,6 +628,24 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
                     col.table_id = item->context.analysis.table_id;
                     col.column_id = item->context.analysis.column_id;
                 }
+                agg->output.push_back(std::move(col));
+            }
+        }
+        // A HAVING predicate may reference an aggregate that is not in the SELECT
+        // list (`HAVING MIN(x) > 5`), or a selected aggregate whose alias hides
+        // its call name (`SELECT SUM(x) AS s ... HAVING SUM(x) > 10`). Give each
+        // such aggregate a resolvable output column so the HAVING predicate binds
+        // (via lower_precomputed_aggregate): append a hidden column, named by the
+        // aggregate's output name, for any not already present. The Project above
+        // emits only the select items, so these trailing columns are dropped from
+        // the query result.
+        for (const ASTNode* hg : having_aggs) {
+            const std::string nm = item_output_name(hg);
+            if (slot_by_name(agg->output, nm) < 0) {
+                ColumnSchema col;
+                col.name = nm;
+                col.type = analyzer_.type_of(hg);
+                col.nullable = analyzer_.nullability_of(hg) != 1;
                 agg->output.push_back(std::move(col));
             }
         }
