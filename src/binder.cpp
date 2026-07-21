@@ -652,9 +652,17 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
         }
         if (!window_fns.empty()) {
             auto window = make_node(LogicalOp::Window);
+            // Window functions lower against the node's input (the child's
+            // output, before the window result columns are appended), where
+            // their arguments and PARTITION BY / ORDER BY references live.
+            const Schema& win_input = current->output;
             window->output = current->output;  // input columns pass through
             for (const ASTNode* fn : window_fns) {
-                window->window_functions.push_back(fn);
+                auto e = lower_expr(fn, win_input, error);
+                if (!e) {
+                    return nullptr;
+                }
+                window->window_functions.push_back(std::move(e));
                 ColumnSchema col;
                 col.name = item_output_name(fn);
                 col.type = analyzer_.type_of(fn);
