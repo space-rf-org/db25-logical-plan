@@ -48,6 +48,7 @@ add_library(db25logicalplan STATIC
     src/binder.cpp
     src/expr_ir.cpp
     src/expr_lower.cpp
+    src/optimizer.cpp
     ${ANALYZER_DIR}/src/analyzer.cpp
 )
 
@@ -79,3 +80,9 @@ add_executable(test_expr_lower tests/test_expr_lower.cpp)
 target_link_libraries(test_expr_lower PRIVATE db25logicalplan)
 target_compile_options(test_expr_lower PRIVATE -fno-exceptions)
 add_test(NAME test_expr_lower COMMAND test_expr_lower)
+
+# Optimizer unit tests (constant folding over the owned Expr trees).
+add_executable(test_optimizer tests/test_optimizer.cpp)
+target_link_libraries(test_optimizer PRIVATE db25logicalplan)
+target_compile_options(test_optimizer PRIVATE -fno-exceptions)
+add_test(NAME test_optimizer COMMAND test_optimizer)
