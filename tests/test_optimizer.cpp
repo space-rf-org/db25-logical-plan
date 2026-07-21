@@ -203,6 +203,56 @@ void test_no_fold_column(const InMemoryCatalog& cat) {
     });
 }
 
+// The predicate of a Project's Filter child, or null.
+const Expr* filter_predicate(const LogicalNode* root) {
+    const LogicalNode* filter = only_child(root);
+    if (filter != nullptr && filter->op == LogicalOp::Filter) {
+        return filter->predicate.get();
+    }
+    return nullptr;
+}
+
+void test_and_true(const InMemoryCatalog& cat) {
+    std::printf("[test] WHERE id = 1 AND 1 = 1  ->  id = 1\n");
+    with_optimized_plan(cat, "SELECT id FROM users WHERE id = 1 AND 1 = 1",
+                        [](const LogicalNode* root) {
+        const Expr* p = filter_predicate(root);
+        // 1 = 1 folds to true, then `id = 1 AND true` simplifies to `id = 1`.
+        check(p && p->kind == ExprKind::BinaryOp &&
+                  p->bin_op == db25::ast::BinaryOp::Equal,
+              "predicate reduced to the id = 1 comparison");
+    });
+}
+
+void test_and_false(const InMemoryCatalog& cat) {
+    std::printf("[test] WHERE 1 = 2 AND id = 1  ->  false\n");
+    with_optimized_plan(cat, "SELECT id FROM users WHERE 1 = 2 AND id = 1",
+                        [](const LogicalNode* root) {
+        // 1 = 2 folds to false, then `false AND x` simplifies to false.
+        expect_bool_literal(filter_predicate(root), false, "predicate is false");
+    });
+}
+
+void test_or_true(const InMemoryCatalog& cat) {
+    std::printf("[test] WHERE id = 1 OR 2 = 2  ->  true\n");
+    with_optimized_plan(cat, "SELECT id FROM users WHERE id = 1 OR 2 = 2",
+                        [](const LogicalNode* root) {
+        // 2 = 2 folds to true, then `x OR true` simplifies to true.
+        expect_bool_literal(filter_predicate(root), true, "predicate is true");
+    });
+}
+
+void test_double_negation(const InMemoryCatalog& cat) {
+    std::printf("[test] WHERE NOT (NOT (id = 1))  ->  id = 1\n");
+    with_optimized_plan(cat, "SELECT id FROM users WHERE NOT (NOT (id = 1))",
+                        [](const LogicalNode* root) {
+        const Expr* p = filter_predicate(root);
+        check(p && p->kind == ExprKind::BinaryOp &&
+                  p->bin_op == db25::ast::BinaryOp::Equal,
+              "NOT (NOT (id = 1)) reduces to id = 1");
+    });
+}
+
 }  // namespace
 
 int main() {
@@ -216,6 +266,10 @@ int main() {
     test_fold_nested_unary(cat);
     test_no_fold_division_by_zero(cat);
     test_no_fold_column(cat);
+    test_and_true(cat);
+    test_and_false(cat);
+    test_or_true(cat);
+    test_double_negation(cat);
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) {
