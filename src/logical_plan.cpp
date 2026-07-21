@@ -113,11 +113,16 @@ void dump_rec(const LogicalNode* n, int depth, std::string& out) {
             }
             break;
         case LogicalOp::Sort:
-            out.append(" keys=");
-            out.append(std::to_string(n->sort_keys.size()));
-            for (const auto& k : n->sort_keys) {
+            out.append(" keys=(");
+            for (std::size_t i = 0; i < n->sort_keys.size(); ++i) {
+                if (i != 0) {
+                    out.append(", ");
+                }
+                const auto& k = n->sort_keys[i];
+                out.append(k.expr ? dump_expr(*k.expr) : "?");
                 out.append(k.descending ? " DESC" : " ASC");
             }
+            out.push_back(')');
             break;
         case LogicalOp::SetOp:
             out.append(" (");
