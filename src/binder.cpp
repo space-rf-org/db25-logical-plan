@@ -435,6 +435,20 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
     join->join_type = jt;
     const bool null_left = jt == ast::JoinType::Right || jt == ast::JoinType::Full;
     const bool null_right = jt == ast::JoinType::Left || jt == ast::JoinType::Full;
+
+    // A USING / NATURAL merged column is COALESCE(left.c, right.c). Keeping only
+    // the left copy is value-correct exactly when the left side is never
+    // null-supplied - INNER and LEFT joins. Under RIGHT / FULL the left copy is
+    // NULL for rows with no left match, so a bare reference to the merged column
+    // would wrongly read NULL: it must read the right copy (RIGHT) or the
+    // COALESCE of both (FULL). For those we keep BOTH copies in the join frame
+    // and add a Project that materializes the real COALESCE; INNER / LEFT keep
+    // the compact left-copy output unchanged.
+    const bool coalesce_merged =
+        !merged.empty() &&
+        (jt == ast::JoinType::Right || jt == ast::JoinType::Full);
+    const auto left_width = static_cast<std::uint32_t>(left->output.size());
+
     Schema out;
     for (const auto& col : left->output) {
         ColumnSchema c = col;
@@ -442,8 +456,8 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
         out.push_back(std::move(c));
     }
     for (const auto& col : right->output) {
-        if (is_merged(col.name)) {
-            continue;  // merged into the left copy
+        if (!coalesce_merged && is_merged(col.name)) {
+            continue;  // INNER / LEFT: merged into the left copy
         }
         ColumnSchema c = col;
         c.nullable = c.nullable || null_right;
@@ -457,7 +471,6 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
     // (the output is merged, so it looked right while producing wrong rows). The
     // predicate indexes the full input frame; the merged output is narrower,
     // which the optimizer's non-full-concat guard already treats conservatively.
-    const auto left_width = static_cast<std::uint32_t>(left->output.size());
     ExprPtr pred;
     for (const std::string_view name : merged) {
         const int li = slot_by_name(left->output, name);
@@ -487,9 +500,68 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
     }
     join->predicate = std::move(pred);
 
+    if (!coalesce_merged) {
+        join->add_child(std::move(left));
+        join->add_child(std::move(right));
+        return join;
+    }
+
+    // RIGHT / FULL USING/NATURAL: the join above emits the full left ++ right
+    // frame; this Project collapses each merged pair to COALESCE(left.c, right.c)
+    // and drops the duplicate right copy, reproducing the compact merged schema.
+    // The merged column keeps the LEFT column's identity (table/column id, name)
+    // so downstream references resolve exactly as they do for INNER / LEFT.
+    auto project = make_node(LogicalOp::Project);
+    Schema pout;
+    std::vector<ExprPtr> pexprs;
+    for (std::uint32_t i = 0; i < left_width; ++i) {
+        const ColumnSchema& lc = join->output[i];  // null_left-adjusted
+        if (!is_merged(lc.name)) {
+            pexprs.push_back(make_column_ref(i, lc));
+            pout.push_back(lc);
+            continue;
+        }
+        const int ri = slot_by_name(right->output, lc.name);
+        const ColumnSchema& rc =
+            join->output[left_width + static_cast<std::uint32_t>(ri)];
+        // Nullability of the merged key is driven by the side that is PRESENT in
+        // a null-extended row, using the base (pre-join-null-supply) nullability:
+        //   RIGHT: every emitted row has the right side, so it is the right key's
+        //          base nullability (the left copy is only a NULL fill).
+        //   FULL : either side may be the sole present one, so it is nullable if
+        //          either base key is nullable.
+        const bool merged_nullable =
+            (jt == ast::JoinType::Full)
+                ? (left->output[i].nullable ||
+                   right->output[static_cast<std::size_t>(ri)].nullable)
+                : right->output[static_cast<std::size_t>(ri)].nullable;
+        auto coa = std::make_unique<Expr>(ExprKind::ScalarFunction);
+        coa->func_name = "COALESCE";
+        coa->type = lc.type;
+        coa->nullability = merged_nullable ? std::uint8_t{2} : std::uint8_t{1};
+        coa->children.push_back(make_column_ref(i, lc));
+        coa->children.push_back(
+            make_column_ref(left_width + static_cast<std::uint32_t>(ri), rc));
+        ColumnSchema mc = left->output[i];  // left identity
+        mc.nullable = merged_nullable;
+        pexprs.push_back(std::move(coa));
+        pout.push_back(std::move(mc));
+    }
+    for (std::uint32_t j = 0; j < static_cast<std::uint32_t>(right->output.size()); ++j) {
+        const ColumnSchema& rc = join->output[left_width + j];
+        if (is_merged(rc.name)) {
+            continue;  // its coalesced value lives in the left section
+        }
+        pexprs.push_back(make_column_ref(left_width + j, rc));
+        pout.push_back(rc);
+    }
+    project->output = std::move(pout);
+    project->exprs = std::move(pexprs);
+
     join->add_child(std::move(left));
     join->add_child(std::move(right));
-    return join;
+    project->add_child(std::move(join));
+    return project;
 }
 
 LogicalNodePtr Binder::bind_from(const ASTNode* from_clause, std::string& error) {
