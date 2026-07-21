@@ -722,6 +722,22 @@ void test_window_rank(const InMemoryCatalog& cat) {
         const LogicalNode* window = only_child(root);
         check(window && window->op == LogicalOp::Window, "child is Window");
         check(window && window->window_functions.size() == 1, "1 window function");
+        // The window call lowers to an owned WindowFunction whose OVER clause is
+        // an owned WindowSpecIR with positional PARTITION BY (name #1) and
+        // ORDER BY (id #0) keys over the input schema [id #0, name #1].
+        if (window && window->window_functions.size() == 1) {
+            const auto& w = *window->window_functions[0];
+            check(w.kind == ExprKind::WindowFunction, "is a WindowFunction expr");
+            check(w.func_name == "RANK", "window func is RANK");
+            check(w.window.partition_by.size() == 1, "1 PARTITION BY key");
+            if (w.window.partition_by.size() == 1) {
+                expect_col_ref(w.window.partition_by[0], 1, "PARTITION BY name #1");
+            }
+            check(w.window.order_by.size() == 1, "1 ORDER BY key");
+            if (w.window.order_by.size() == 1) {
+                expect_col_ref(w.window.order_by[0].expr, 0, "ORDER BY id #0");
+            }
+        }
         // Window output = input columns (id, name) + the RANK result.
         check(window && window->output.size() == 3, "window output = 3 cols");
         if (window && window->output.size() == 3) {
@@ -769,6 +785,22 @@ void test_window_sum(const InMemoryCatalog& cat) {
         const LogicalNode* window = only_child(root);
         check(window && window->op == LogicalOp::Window, "child is Window");
         check(window && window->window_functions.size() == 1, "1 window function");
+        // SUM(sal) OVER (PARTITION BY dept): the aggregate argument (sal #2) and
+        // the PARTITION BY key (dept #1) are positional refs over emp
+        // [id #0, dept #1, sal #2].
+        if (window && window->window_functions.size() == 1) {
+            const auto& w = *window->window_functions[0];
+            check(w.kind == ExprKind::WindowFunction && w.func_name == "SUM",
+                  "window func is SUM");
+            check(w.children.size() == 1, "SUM has 1 argument");
+            if (w.children.size() == 1) {
+                expect_col_ref(w.children[0], 2, "SUM arg (sal #2)");
+            }
+            check(w.window.partition_by.size() == 1, "1 PARTITION BY key");
+            if (w.window.partition_by.size() == 1) {
+                expect_col_ref(w.window.partition_by[0], 1, "PARTITION BY dept #1");
+            }
+        }
         check(root->output.size() == 2, "project 2 cols");
         if (root->output.size() == 2) {
             expect_col(root->output[1], "SUM", DataType::Double, true, "proj[1]");

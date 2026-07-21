@@ -151,11 +151,12 @@ struct LogicalNode {
     std::vector<ExprPtr> aggregates;   // aggregate call expressions
 
     // --- Window payload ---
-    // Borrowed window-function call nodes (each a FunctionCall carrying a
-    // WindowSpec child that holds the PARTITION BY / ORDER BY / frame refs).
-    // The node's output is its child's schema with one appended column per
-    // window function, in this order.
-    std::vector<const ast::ASTNode*> window_functions;
+    // Owned, typed window-function expressions (each an ExprKind::WindowFunction
+    // carrying its lowered arguments and an owned WindowSpecIR for the PARTITION
+    // BY / ORDER BY / frame), lowered against this node's input schema. The
+    // node's output is its child's schema with one appended column per window
+    // function, in this order.
+    std::vector<ExprPtr> window_functions;
 
     // --- Subquery payload (any node that owns expression subqueries) ---
     // Sub-plans for subqueries embedded in this node's expressions: scalar

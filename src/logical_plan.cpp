@@ -152,8 +152,14 @@ void dump_rec(const LogicalNode* n, int depth, std::string& out) {
             break;
         }
         case LogicalOp::Window:
-            out.append(" fns=");
-            out.append(std::to_string(n->window_functions.size()));
+            out.append(" fns=(");
+            for (std::size_t i = 0; i < n->window_functions.size(); ++i) {
+                if (i != 0) {
+                    out.append(", ");
+                }
+                out.append(n->window_functions[i] ? dump_expr(*n->window_functions[i]) : "?");
+            }
+            out.push_back(')');
             break;
         case LogicalOp::Insert:
         case LogicalOp::Update:
