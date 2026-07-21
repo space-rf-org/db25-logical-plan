@@ -14,6 +14,9 @@
 //   * constant folding - evaluate an expression whose operands are all constant
 //     literals into a single literal (a safe, arity- and type-preserving
 //     rewrite of the owned Expr trees).
+//   * boolean simplification - apply the AND / OR identities with a boolean
+//     literal operand and eliminate double negation (`NOT (NOT x)` -> x). Runs
+//     after folding so a folded `1 = 1` -> `true` feeds these identities.
 //
 // The build matches the rest of the stack: C++23, -fno-exceptions.
 
@@ -35,5 +38,11 @@ namespace db25::plan {
 // constant literals into a single literal, throughout `node` and its children
 // (including expressions inside embedded subquery sub-plans). In place.
 void fold_constants(LogicalNode* node);
+
+// Boolean simplification: rewrite `x AND true`->x, `x AND false`->false,
+// `x OR true`->true, `x OR false`->x (all valid under SQL three-valued logic,
+// including when x is NULL), and `NOT (NOT x)`->x, throughout `node` and its
+// children (including embedded subquery sub-plans). In place.
+void simplify_booleans(LogicalNode* node);
 
 }  // namespace db25::plan

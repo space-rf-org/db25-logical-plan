@@ -174,6 +174,42 @@ ExprPtr make_folded_literal(LiteralValue value, const Expr& original) {
     return lit;
 }
 
+// A boolean-literal counterpart of make_folded_literal (for the AND / OR
+// identities that reduce to a constant true / false).
+ExprPtr make_bool_literal(bool v, const Expr& original) {
+    LiteralValue value;
+    value.value = v;
+    return make_folded_literal(std::move(value), original);
+}
+
+// Read a boolean-literal expression's value; false for any non-boolean-literal.
+bool literal_bool_expr(const Expr& e, bool& out) {
+    if (e.kind == ExprKind::Literal) {
+        if (const auto* p = std::get_if<bool>(&e.value.value)) {
+            out = *p;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Apply `fn` (an `ExprPtr&` transform) to every owned top-level expression
+// payload of `node`. The single place the operator payloads are enumerated, so a
+// pass never silently misses one (and a future payload is added here once).
+template <typename Fn>
+void for_each_payload_expr(LogicalNode* node, Fn&& fn) {
+    fn(node->predicate);
+    for (auto& e : node->exprs) fn(e);
+    for (auto& e : node->group_keys) fn(e);
+    for (auto& e : node->aggregates) fn(e);
+    for (auto& e : node->window_functions) fn(e);
+    for (auto& k : node->sort_keys) fn(k.expr);
+    for (auto& row : node->value_rows) {
+        for (auto& e : row) fn(e);
+    }
+    for (auto& a : node->assignments) fn(a.value);
+}
+
 // Fold constants within an owned expression tree (bottom-up), including the
 // expressions of a window spec and the sub-plan of an embedded subquery.
 void fold_expr(ExprPtr& e) {
@@ -210,30 +246,97 @@ void fold_expr(ExprPtr& e) {
     }
 }
 
+// Simplify boolean connectives within an owned expression tree (bottom-up),
+// including window-spec expressions and embedded subquery sub-plans.
+//
+// The AND / OR identities are valid under SQL three-valued logic even when the
+// surviving operand is NULL: `x AND false` is false and `x OR true` is true for
+// x in {true, false, NULL}; `x AND true` and `x OR false` equal x in all three
+// cases. Dropping the eliminated operand is sound because it cannot affect the
+// result (short-circuit is not observable in a WHERE-style predicate).
+void simplify_expr(ExprPtr& e) {
+    if (!e) {
+        return;
+    }
+    for (auto& child : e->children) {
+        simplify_expr(child);
+    }
+    if (e->kind == ExprKind::WindowFunction) {
+        for (auto& p : e->window.partition_by) {
+            simplify_expr(p);
+        }
+        for (auto& k : e->window.order_by) {
+            simplify_expr(k.expr);
+        }
+    }
+    if (e->kind == ExprKind::Subquery && e->sub_plan) {
+        simplify_booleans(e->sub_plan.get());
+    }
+
+    if (e->kind == ExprKind::BinaryOp && e->children.size() == 2 &&
+        (e->bin_op == BinaryOp::And || e->bin_op == BinaryOp::Or)) {
+        bool lv = false;
+        bool rv = false;
+        const bool l_is = literal_bool_expr(*e->children[0], lv);
+        const bool r_is = literal_bool_expr(*e->children[1], rv);
+        if (e->bin_op == BinaryOp::And) {
+            if ((l_is && !lv) || (r_is && !rv)) {        // x AND false -> false
+                e = make_bool_literal(false, *e);
+            } else if (l_is && lv) {                     // true AND x -> x
+                ExprPtr kept = std::move(e->children[1]);
+                e = std::move(kept);
+            } else if (r_is && rv) {                     // x AND true -> x
+                ExprPtr kept = std::move(e->children[0]);
+                e = std::move(kept);
+            }
+        } else {  // Or
+            if ((l_is && lv) || (r_is && rv)) {          // x OR true -> true
+                e = make_bool_literal(true, *e);
+            } else if (l_is && !lv) {                    // false OR x -> x
+                ExprPtr kept = std::move(e->children[1]);
+                e = std::move(kept);
+            } else if (r_is && !rv) {                    // x OR false -> x
+                ExprPtr kept = std::move(e->children[0]);
+                e = std::move(kept);
+            }
+        }
+    } else if (e->kind == ExprKind::UnaryOp && e->un_op == UnaryOp::Not &&
+               e->children.size() == 1 &&
+               e->children[0]->kind == ExprKind::UnaryOp &&
+               e->children[0]->un_op == UnaryOp::Not &&
+               e->children[0]->children.size() == 1) {
+        ExprPtr inner = std::move(e->children[0]->children[0]);  // NOT (NOT x) -> x
+        e = std::move(inner);
+    }
+}
+
 }  // namespace
 
 void fold_constants(LogicalNode* node) {
     if (node == nullptr) {
         return;
     }
-    fold_expr(node->predicate);
-    for (auto& e : node->exprs) fold_expr(e);
-    for (auto& e : node->group_keys) fold_expr(e);
-    for (auto& e : node->aggregates) fold_expr(e);
-    for (auto& e : node->window_functions) fold_expr(e);
-    for (auto& k : node->sort_keys) fold_expr(k.expr);
-    for (auto& row : node->value_rows) {
-        for (auto& e : row) fold_expr(e);
-    }
-    for (auto& a : node->assignments) fold_expr(a.value);
+    for_each_payload_expr(node, [](ExprPtr& e) { fold_expr(e); });
     for (auto& child : node->children) {
         fold_constants(child.get());
     }
 }
 
+void simplify_booleans(LogicalNode* node) {
+    if (node == nullptr) {
+        return;
+    }
+    for_each_payload_expr(node, [](ExprPtr& e) { simplify_expr(e); });
+    for (auto& child : node->children) {
+        simplify_booleans(child.get());
+    }
+}
+
 LogicalNodePtr optimize(LogicalNodePtr plan) {
     if (plan) {
+        // Fold first so a folded `1 = 1` -> `true` feeds the boolean identities.
         fold_constants(plan.get());
+        simplify_booleans(plan.get());
     }
     return plan;
 }
