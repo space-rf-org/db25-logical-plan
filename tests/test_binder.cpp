@@ -221,6 +221,50 @@ void test_inner_join(const InMemoryCatalog& cat) {
     });
 }
 
+// Self-join: two aliases of the SAME base table share (table_id, column_id), so
+// column references must be disambiguated by their qualifier (alias). Before the
+// fix, `m.sal` resolved into the LEFT scan (first (table_id, column_id) match).
+void test_self_join_alias_resolution(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT e.dept, m.sal FROM emp e JOIN emp m ON e.id = m.id\n");
+    with_plan(cat,
+              "SELECT e.dept, m.sal FROM emp e JOIN emp m ON e.id = m.id",
+              [](const LogicalNode* root) {
+        // Frame = e[id#0,dept#1,sal#2] ++ m[id#3,dept#4,sal#5].
+        check(root->op == LogicalOp::Project && root->exprs.size() == 2, "root Project of 2");
+        if (root->exprs.size() == 2) {
+            check(root->exprs[0]->kind == ExprKind::ColumnRef &&
+                      root->exprs[0]->input_index == 1,
+                  "e.dept -> #1 (left occurrence)");
+            check(root->exprs[1]->kind == ExprKind::ColumnRef &&
+                      root->exprs[1]->input_index == 5,
+                  "m.sal -> #5 (RIGHT occurrence, not the left alias)");
+        }
+        const LogicalNode* join = only_child(root);
+        check(join && join->predicate && join->predicate->children.size() == 2,
+              "join has an ON predicate");
+        if (join && join->predicate && join->predicate->children.size() == 2) {
+            check(join->predicate->children[0]->input_index == 0 &&
+                      join->predicate->children[1]->input_index == 3,
+                  "ON e.id (#0) = m.id (#3), not #0 = #0");
+        }
+    });
+}
+
+// A table-name qualifier (no explicit alias) still resolves against the single
+// occurrence - the fix must not regress the common unaliased case.
+void test_table_name_qualifier(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT emp.dept FROM emp WHERE emp.sal > 10\n");
+    with_plan(cat, "SELECT emp.dept FROM emp WHERE emp.sal > 10",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project && root->exprs.size() == 1, "root Project of 1");
+        if (root->exprs.size() == 1) {
+            check(root->exprs[0]->kind == ExprKind::ColumnRef &&
+                      root->exprs[0]->input_index == 1,
+                  "emp.dept -> #1");
+        }
+    });
+}
+
 void test_group_by(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT dept, COUNT(*) FROM emp GROUP BY dept\n");
     with_plan(cat, "SELECT dept, COUNT(*) FROM emp GROUP BY dept",
@@ -1099,6 +1143,8 @@ int main() {
     test_scan_filter_project_limit(cat);
     test_limit_offset(cat);
     test_inner_join(cat);
+    test_self_join_alias_resolution(cat);
+    test_table_name_qualifier(cat);
     test_group_by(cat);
     test_implicit_aggregate_count(cat);
     test_implicit_aggregate_nested(cat);

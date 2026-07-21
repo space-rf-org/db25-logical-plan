@@ -79,9 +79,13 @@ private:
                              const db25::ast::ASTNode* join_node,
                              std::string& error);
 
-    // Build a Scan output schema from the catalog for a base table.
+    // Build a Scan output schema from the catalog for a base table. `alias` is
+    // the relation's correlation name (or its table name when unaliased); it is
+    // stamped on every column so a self-join's otherwise-identical column
+    // references can be disambiguated by their qualifier.
     [[nodiscard]] Schema scan_schema(const db25::semantic::TableInfo& table,
-                                     std::uint32_t table_id) const;
+                                     std::uint32_t table_id,
+                                     std::string_view alias) const;
 
     // If `stmt` (an INSERT / UPDATE / DELETE) carries a RETURNING clause, wrap
     // `dml` in a Returning node whose output schema is resolved against the

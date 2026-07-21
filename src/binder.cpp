@@ -271,11 +271,14 @@ ExprPtr Binder::lower_precomputed_aggregate(const ASTNode* call, const Schema& i
                            input[static_cast<std::size_t>(slot)]);
 }
 
-Schema Binder::scan_schema(const TableInfo& table, std::uint32_t table_id) const {
+Schema Binder::scan_schema(const TableInfo& table, std::uint32_t table_id,
+                           std::string_view alias) const {
     Schema schema;
     schema.reserve(table.columns.size());
     for (const auto& c : table.columns) {
-        schema.push_back(ColumnSchema{c.name, c.type, c.nullable, table_id, c.column_id});
+        ColumnSchema col{c.name, c.type, c.nullable, table_id, c.column_id};
+        col.alias = std::string{alias};
+        schema.push_back(std::move(col));
     }
     return schema;
 }
@@ -290,7 +293,11 @@ LogicalNodePtr Binder::bind_table_ref(const ASTNode* table_ref, std::string& err
     auto scan = make_node(LogicalOp::Scan);
     scan->table_name = std::string{name};
     scan->alias = std::string{alias_of(table_ref)};
-    scan->output = scan_schema(*table, table->table_id);
+    // Qualified column references use the correlation name when one is given,
+    // otherwise the table name (`emp.id`); stamp whichever applies so self-join
+    // occurrences stay distinguishable.
+    const std::string_view eff_alias = scan->alias.empty() ? name : scan->alias;
+    scan->output = scan_schema(*table, table->table_id, eff_alias);
     return scan;
 }
 
@@ -1040,7 +1047,7 @@ LogicalNodePtr Binder::wrap_returning(LogicalNodePtr dml, const ASTNode* stmt,
     // The RETURNING items are evaluated over the target table's rows; resolve
     // them (and expand `*`) positionally against that table's schema so the
     // owned exprs stay 1:1 with `output`.
-    const Schema target = scan_schema(*table, table->table_id);
+    const Schema target = scan_schema(*table, table->table_id, dml->table_name);
     for (const ASTNode* item = first_child(returning); item != nullptr;
          item = item->next_sibling) {
         if (item->node_type == NodeType::Star) {
