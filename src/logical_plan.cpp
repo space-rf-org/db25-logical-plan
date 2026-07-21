@@ -137,6 +137,16 @@ void dump_rec(const LogicalNode* n, int depth, std::string& out) {
         case LogicalOp::Values:
             out.append(" rows=");
             out.append(std::to_string(n->value_rows.size()));
+            for (const auto& row : n->value_rows) {
+                out.append(" (");
+                for (std::size_t i = 0; i < row.size(); ++i) {
+                    if (i != 0) {
+                        out.append(", ");
+                    }
+                    out.append(row[i] ? dump_expr(*row[i]) : "?");
+                }
+                out.push_back(')');
+            }
             break;
         case LogicalOp::Aggregate: {
             out.append(" group=(");
@@ -166,8 +176,22 @@ void dump_rec(const LogicalNode* n, int depth, std::string& out) {
             }
             out.push_back(')');
             break;
-        case LogicalOp::Insert:
         case LogicalOp::Update:
+            out.push_back(' ');
+            out.append(n->table_name);
+            out.append(" set=(");
+            for (std::size_t i = 0; i < n->assignments.size(); ++i) {
+                if (i != 0) {
+                    out.append(", ");
+                }
+                out.append("col#");
+                out.append(std::to_string(n->assignments[i].target_column_id));
+                out.append(" := ");
+                out.append(n->assignments[i].value ? dump_expr(*n->assignments[i].value) : "?");
+            }
+            out.push_back(')');
+            break;
+        case LogicalOp::Insert:
         case LogicalOp::Delete:
         case LogicalOp::Returning:
             out.push_back(' ');
