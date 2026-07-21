@@ -379,6 +379,38 @@ void test_correlated_exists(const InMemoryCatalog& cat) {
 
 }  // namespace
 
+// -------------------------------------------------------------------------
+// An integer literal too large for int64 must not silently lower to NULL: it is
+// promoted to double (SQLite's numeric widening), so comparisons still evaluate.
+// -------------------------------------------------------------------------
+void test_integer_literal_overflow_promotes_double(const InMemoryCatalog& cat) {
+    std::printf("[test] (overflow) WHERE id < 9223372036854775808\n");
+    Analyzer az(cat);
+    Analyzed a;
+    analyze_into(a, cat, az,
+                 "SELECT id FROM orders o WHERE o.id < 9223372036854775808");
+    if (!a.ok) return;
+
+    const ASTNode* pred = where_predicate(a.stmt);
+    check(pred != nullptr, "found WHERE predicate");
+    const Schema input = schema_of(cat, "orders");
+
+    Binder binder(az, cat);
+    std::string err;
+    ExprPtr e = BinderExprTestAccess::lower(binder, pred, input, err);
+    check(e != nullptr, std::string{"lowered predicate: "} + err);
+    if (!e || e->children.size() != 2) return;
+
+    const Expr& rhs = *e->children[1];
+    check(rhs.kind == ExprKind::Literal, "rhs is Literal");
+    // INT64_MAX + 1 overflows int64: promoted to Double with a real value, NOT
+    // silently left as a NULL (monostate) with an Integer type.
+    check(rhs.type == DataType::Double,
+          "overflowing integer literal promoted to Double");
+    check(std::holds_alternative<double>(rhs.value.value),
+          "literal value is a double, not NULL");
+}
+
 int main() {
     const InMemoryCatalog cat = make_catalog();
 
@@ -387,6 +419,7 @@ int main() {
     test_columnref_handbuilt_schema(cat);
     test_join_concatenated_index(cat);
     test_correlated_exists(cat);
+    test_integer_literal_overflow_promotes_double(cat);
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) {

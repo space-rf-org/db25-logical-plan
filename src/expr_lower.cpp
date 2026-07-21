@@ -337,6 +337,24 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
             const auto [ptr, ec] = std::from_chars(t.data(), t.data() + t.size(), v);
             if (ec == std::errc{} && ptr == t.data() + t.size()) {
                 e->value.value = v;
+            } else {
+                // The literal does not fit in int64 (e.g. 9223372036854775808).
+                // Leaving value.value at its default (monostate == NULL) while the
+                // type stays Integer silently turns every comparison against it
+                // into UNKNOWN and drops rows. Promote it to double instead -
+                // the numeric widening SQLite applies to oversized integer
+                // literals - so the value is preserved and comparisons evaluate.
+                double dv = 0.0;
+                const auto [dptr, dec] =
+                    std::from_chars(t.data(), t.data() + t.size(), dv);
+                if (dec == std::errc{} && dptr == t.data() + t.size()) {
+                    e->value.value = dv;
+                    e->type = ast::DataType::Double;
+                } else {
+                    error = "integer literal '" + std::string{t} +
+                            "' is not a valid number";
+                    return nullptr;
+                }
             }
             return e;
         }
