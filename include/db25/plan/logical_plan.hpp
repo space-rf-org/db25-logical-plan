@@ -99,26 +99,13 @@ struct Assignment {
     ExprPtr value;
 };
 
-struct LogicalNode;  // forward declaration for SubPlan
-
-// How a subquery is used in the expression that owns it.
+// How a subquery is used in the expression that owns it. Carried on the owned
+// ExprKind::Subquery node (see expr_ir.hpp), which owns its bound inner plan
+// inline; there is no separate borrowed subquery payload on a LogicalNode.
 enum class SubqueryKind : std::uint8_t {
     Scalar,  // a scalar subquery: (SELECT ...) yielding a single value
     In,      // expr IN (SELECT ...)
     Exists,  // [NOT] EXISTS (SELECT ...)
-};
-
-// A subquery embedded in an expression (a SELECT-list item or a WHERE
-// predicate), faithfully represented rather than dropped. `plan` is the bound
-// inner query block; `expr` borrows the AST Subquery node it came from; and
-// `correlated` records Analyzer::is_correlated for that subquery. Decorrelation
-// of correlated subqueries is deliberately left to a later optimizer pass (TODO)
-// - the binder only represents the subquery and its correlation status here.
-struct SubPlan {
-    const ast::ASTNode* expr = nullptr;         // borrowed Subquery AST node
-    SubqueryKind kind = SubqueryKind::Scalar;   // how it is used
-    bool correlated = false;                    // Analyzer::is_correlated(expr)
-    std::unique_ptr<LogicalNode> plan;          // bound inner query sub-plan
 };
 
 // A node in the logical plan tree. Payload fields are grouped by the operator
@@ -168,11 +155,9 @@ struct LogicalNode {
     // function, in this order.
     std::vector<ExprPtr> window_functions;
 
-    // --- Subquery payload (any node that owns expression subqueries) ---
-    // Sub-plans for subqueries embedded in this node's expressions: scalar
-    // subqueries in a Project's SELECT list, or IN / EXISTS subqueries in a
-    // Filter's predicate.
-    std::vector<SubPlan> subplans;
+    // (Subqueries embedded in a node's expressions - scalar in a Project item, IN
+    // / EXISTS in a Filter predicate - are owned inline by their ExprKind::Subquery
+    // node, which holds the bound inner plan; there is no separate payload here.)
 
     // --- Sort payload ---
     std::vector<SortKeyIR> sort_keys;   // ORDER BY keys, in order
