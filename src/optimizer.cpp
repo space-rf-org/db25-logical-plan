@@ -703,6 +703,71 @@ std::vector<int> prune(LogicalNodePtr& node, const std::vector<bool>& required) 
             return out_remap;
         }
 
+        case LogicalOp::SemiJoin:
+        case LogicalOp::AntiJoin: {
+            // A semi / anti join's output is exactly its LEFT input's schema (the
+            // right side contributes no columns, only the existence test). So the
+            // output slots map 1:1 to the left input, and the right input is
+            // needed ONLY for the columns its join condition references - typically
+            // just the correlation key, which lets the whole rest of the right
+            // relation be pruned away.
+            LogicalNode* left = node->child(0);
+            LogicalNode* right = node->child(1);
+            const std::size_t lw = left->output.size();
+            const std::size_t rw = right->output.size();
+            if (node->output.size() != lw) {
+                return identity_remap(out_w);  // defensive: unexpected shape
+            }
+            std::vector<bool> lreq(lw, false);
+            std::vector<bool> rreq(rw, false);
+            // Parent-required output columns are left columns at the same index.
+            for (std::size_t i = 0; i < out_w; ++i) {
+                if (required[i]) {
+                    lreq[i] = true;
+                }
+            }
+            // The join condition spans the left ++ right frame.
+            bool has_subquery = false;
+            if (node->predicate) {
+                std::vector<bool> pref(lw + rw, false);
+                collect_slots(*node->predicate, pref, has_subquery);
+                for (std::size_t i = 0; i < lw; ++i) {
+                    if (pref[i]) lreq[i] = true;
+                }
+                for (std::size_t j = 0; j < rw; ++j) {
+                    if (pref[lw + j]) rreq[j] = true;
+                }
+            }
+            if (has_subquery) {
+                std::fill(lreq.begin(), lreq.end(), true);
+                std::fill(rreq.begin(), rreq.end(), true);
+            }
+            const std::vector<int> lrm = prune(node->children[0], lreq);
+            const std::vector<int> rrm = prune(node->children[1], rreq);
+            const std::size_t new_lw = node->child(0)->output.size();
+
+            // Remap the condition across the pruned left ++ right frame.
+            if (node->predicate) {
+                std::vector<int> pred_remap(lw + rw, -1);
+                for (std::size_t i = 0; i < lw; ++i) {
+                    pred_remap[i] = lrm[i];
+                }
+                for (std::size_t j = 0; j < rw; ++j) {
+                    if (rrm[j] >= 0) {
+                        pred_remap[lw + j] = static_cast<int>(new_lw) + rrm[j];
+                    }
+                }
+                remap_expr_slots(*node->predicate, pred_remap);
+            }
+            // Output is the pruned left schema (same remap as the left input).
+            std::vector<int> out_remap(out_w, -1);
+            for (std::size_t i = 0; i < lw; ++i) {
+                out_remap[i] = lrm[i];
+            }
+            apply_output_remap(node->output, out_remap);
+            return out_remap;
+        }
+
         case LogicalOp::Aggregate: {
             // The Aggregate output is a fresh, non-passthrough schema (group keys
             // + aggregate results), so keep it intact and prune the child by what
@@ -1402,6 +1467,22 @@ void push_down_filters(LogicalNodePtr& node) {
         (node->child(0)->join_type == ast::JoinType::Inner ||
          node->child(0)->join_type == ast::JoinType::Cross)) {
         push_filter_into_join(node);
+    }
+
+    // Push a whole Filter below a Semi / Anti join into its LEFT input. The join's
+    // output is exactly the left schema, so every conjunct references only left
+    // columns (at the same indices) - no split or remap is needed, and moving the
+    // filter is valid for both polarities: a semi/anti join only decides which
+    // LEFT rows survive, so selecting on left columns before vs. after the join
+    // yields the same rows. Recurse so the moved filter can push further.
+    if (node->op == LogicalOp::Filter && node->child_count() == 1 && node->predicate &&
+        (node->child(0)->op == LogicalOp::SemiJoin ||
+         node->child(0)->op == LogicalOp::AntiJoin)) {
+        LogicalNodePtr join = std::move(node->children[0]);
+        join->children[0] =
+            make_filter(std::move(join->children[0]), std::move(node->predicate));
+        node = std::move(join);
+        push_down_filters(node->children[0]);
     }
 }
 
