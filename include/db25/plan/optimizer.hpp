@@ -21,6 +21,10 @@
 //     INNER / CROSS Join to the side whose columns it references (remapping the
 //     positional slots), merge adjacent Filters, and drop a Filter whose
 //     predicate simplified to constant `true`.
+//   * column pruning - drop columns that no operator above consumes, narrowing
+//     Scans and Projects and remapping the positional slots throughout. Conserv-
+//     ative around operators whose column flow is intricate (set operations,
+//     VALUES, DML) and around any operator carrying an embedded subquery.
 //
 // The build matches the rest of the stack: C++23, -fno-exceptions.
 
@@ -48,6 +52,18 @@ void fold_constants(LogicalNode* node);
 // including when x is NULL), and `NOT (NOT x)`->x, throughout `node` and its
 // children (including embedded subquery sub-plans). In place.
 void simplify_booleans(LogicalNode* node);
+
+// Column pruning: drop output columns that no ancestor consumes, narrowing the
+// data that flows through the plan. Scans and Projects shed unreferenced columns
+// outright; passthrough operators, Joins, and Aggregates keep only the columns
+// their consumers or their own expressions need, with every positional column
+// slot remapped to the compacted layout. The root's output is fully preserved
+// (it is the query result). Set operations, VALUES, DML, and any operator that
+// carries an embedded subquery are treated conservatively (their inputs are kept
+// intact) so a correlated outer reference can never lose the column it needs.
+// Embedded subquery sub-plans are pruned independently. In place; takes `node`
+// by owning reference because pruning can shrink the root's own layout.
+void prune_columns(LogicalNodePtr& node);
 
 // Predicate pushdown: for a Filter over an INNER / CROSS Join, split the
 // predicate into conjuncts and push each conjunct that references only one

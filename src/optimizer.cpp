@@ -7,6 +7,7 @@
 
 #include "db25/plan/expr_ir.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <utility>
@@ -469,6 +470,297 @@ void push_filter_into_join(LogicalNodePtr& filter_node) {
     }
 }
 
+// ---- Column pruning helpers -------------------------------------------------
+
+// Mark every input slot an expression reads into `used` (sized to the operator's
+// input width) and flag an embedded subquery. OuterRef is intentionally ignored:
+// it references an enclosing query block, not this operator's input. A subquery's
+// own sub-plan is not descended (it is a separate block pruned on its own).
+void collect_slots(const Expr& e, std::vector<bool>& used, bool& has_subquery) {
+    if (e.kind == ExprKind::ColumnRef) {
+        if (e.input_index < used.size()) {
+            used[e.input_index] = true;
+        }
+    } else if (e.kind == ExprKind::Subquery) {
+        has_subquery = true;
+    }
+    for (const auto& c : e.children) {
+        collect_slots(*c, used, has_subquery);
+    }
+    if (e.kind == ExprKind::WindowFunction) {
+        for (const auto& p : e.window.partition_by) collect_slots(*p, used, has_subquery);
+        for (const auto& k : e.window.order_by) collect_slots(*k.expr, used, has_subquery);
+    }
+}
+
+// Rewrite each positional column slot in `e` through `remap` (old index -> new
+// index; a kept slot is always >= 0). OuterRef and subquery sub-plans are left
+// untouched (they belong to other schemas).
+void remap_expr_slots(Expr& e, const std::vector<int>& remap) {
+    if (e.kind == ExprKind::ColumnRef && e.input_index < remap.size() &&
+        remap[e.input_index] >= 0) {
+        e.input_index = static_cast<std::uint32_t>(remap[e.input_index]);
+    }
+    for (auto& c : e.children) {
+        remap_expr_slots(*c, remap);
+    }
+    if (e.kind == ExprKind::WindowFunction) {
+        for (auto& p : e.window.partition_by) remap_expr_slots(*p, remap);
+        for (auto& k : e.window.order_by) remap_expr_slots(*k.expr, remap);
+    }
+}
+
+// old-index -> new-index remap that keeps the `required` slots in order.
+std::vector<int> compact_required(const std::vector<bool>& required) {
+    std::vector<int> remap(required.size(), -1);
+    int next = 0;
+    for (std::size_t i = 0; i < required.size(); ++i) {
+        if (required[i]) {
+            remap[i] = next++;
+        }
+    }
+    return remap;
+}
+
+// Rewrite a schema to keep only the remapped columns, placing each surviving
+// column at its new index.
+void apply_output_remap(Schema& out, const std::vector<int>& remap) {
+    int new_size = 0;
+    for (int v : remap) {
+        new_size = std::max(new_size, v + 1);
+    }
+    Schema pruned(static_cast<std::size_t>(new_size));
+    for (std::size_t old = 0; old < remap.size() && old < out.size(); ++old) {
+        if (remap[old] >= 0) {
+            pruned[static_cast<std::size_t>(remap[old])] = std::move(out[old]);
+        }
+    }
+    out = std::move(pruned);
+}
+
+// An identity remap over `n` slots (nothing dropped or moved).
+std::vector<int> identity_remap(std::size_t n) {
+    std::vector<int> remap(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        remap[i] = static_cast<int>(i);
+    }
+    return remap;
+}
+
+// Recursively prune every embedded subquery sub-plan of an expression, as an
+// independent query block (its correlated OuterRefs resolve against enclosing
+// inputs, which are kept intact because a subquery-bearing operator is a pruning
+// barrier). Forward-declared: it drives the public prune_columns.
+void prune_subplans_in_expr(ExprPtr& e);
+
+// Prune `node`'s columns so it produces only the slots flagged in `required`
+// (sized to the node's current output), returning the old-index -> new-index
+// remap the parent uses to rewrite its references. Recurses into children with
+// their computed requirements. In place.
+std::vector<int> prune(LogicalNodePtr& node, const std::vector<bool>& required) {
+    const std::size_t out_w = node->output.size();
+
+    switch (node->op) {
+        case LogicalOp::Scan: {
+            std::vector<int> remap = compact_required(required);
+            apply_output_remap(node->output, remap);
+            return remap;
+        }
+
+        case LogicalOp::Project: {
+            LogicalNode* child = node->child(0);
+            std::vector<bool> child_req(child->output.size(), false);
+            bool has_subquery = false;
+            for (std::size_t i = 0; i < node->exprs.size(); ++i) {
+                if (i < required.size() && required[i] && node->exprs[i]) {
+                    collect_slots(*node->exprs[i], child_req, has_subquery);
+                }
+            }
+            if (has_subquery) {
+                std::fill(child_req.begin(), child_req.end(), true);
+            }
+            const std::vector<int> child_remap = prune(node->children[0], child_req);
+
+            std::vector<ExprPtr> new_exprs;
+            Schema new_out;
+            std::vector<int> out_remap(out_w, -1);
+            int next = 0;
+            for (std::size_t i = 0; i < out_w; ++i) {
+                if (required[i]) {
+                    if (node->exprs[i]) {
+                        remap_expr_slots(*node->exprs[i], child_remap);
+                    }
+                    new_exprs.push_back(std::move(node->exprs[i]));
+                    new_out.push_back(std::move(node->output[i]));
+                    out_remap[i] = next++;
+                }
+            }
+            node->exprs = std::move(new_exprs);
+            node->output = std::move(new_out);
+            return out_remap;
+        }
+
+        case LogicalOp::Filter:
+        case LogicalOp::Limit: {
+            // True passthrough: output == child output (same width). (Distinct is
+            // NOT here - its row multiplicity depends on all its input columns.)
+            LogicalNode* child = node->child(0);
+            std::vector<bool> child_req = required;
+            child_req.resize(child->output.size(), false);
+            bool has_subquery = false;
+            if (node->predicate) {
+                collect_slots(*node->predicate, child_req, has_subquery);
+            }
+            if (has_subquery) {
+                std::fill(child_req.begin(), child_req.end(), true);
+            }
+            const std::vector<int> child_remap = prune(node->children[0], child_req);
+            if (node->predicate) {
+                remap_expr_slots(*node->predicate, child_remap);
+            }
+            node->output = node->child(0)->output;  // adopt the pruned child schema
+            return child_remap;
+        }
+
+        case LogicalOp::Sort:
+        case LogicalOp::Distinct:
+        case LogicalOp::Window: {
+            // These operators' output layout depends positionally on their child,
+            // so they require ALL of their child's columns and keep their own
+            // output intact:
+            //   * Sort may hide sort-only columns (output narrower than child);
+            //   * Distinct's row multiplicity depends on every input column;
+            //   * Window passes the child schema through and appends one column
+            //     per window function.
+            // The child (typically a Project) still prunes the scan beneath it by
+            // what its own expressions read, so pruning value is preserved. With
+            // the child kept intact, child_remap is the identity, so remapping the
+            // node's own expressions below is a no-op.
+            LogicalNode* child = node->child(0);
+            std::vector<bool> child_req(child->output.size(), true);
+            const std::vector<int> child_remap = prune(node->children[0], child_req);
+            for (auto& k : node->sort_keys) {
+                if (k.expr) remap_expr_slots(*k.expr, child_remap);
+            }
+            for (auto& e : node->window_functions) {
+                if (e) remap_expr_slots(*e, child_remap);
+            }
+            return identity_remap(out_w);
+        }
+
+        case LogicalOp::Join: {
+            LogicalNode* left = node->child(0);
+            LogicalNode* right = node->child(1);
+            const std::size_t lw = left->output.size();
+            // Only a plain-concatenation join (output == left ++ right) has a
+            // right frame whose input index is `output_slot - lw`. A USING /
+            // NATURAL join drops the merged right duplicates, compacting the
+            // right frame, so that arithmetic would mis-index; treat such a join
+            // as a barrier (prune nothing here) rather than corrupt slots.
+            if (node->output.size() != lw + right->output.size()) {
+                return identity_remap(out_w);
+            }
+            std::vector<bool> lreq(lw, false);
+            std::vector<bool> rreq(right->output.size(), false);
+            for (std::size_t i = 0; i < out_w; ++i) {
+                if (required[i]) {
+                    (i < lw ? lreq[i] : rreq[i - lw]) = true;
+                }
+            }
+            bool has_subquery = false;
+            if (node->predicate) {
+                std::vector<bool> pref(out_w, false);
+                collect_slots(*node->predicate, pref, has_subquery);
+                for (std::size_t i = 0; i < out_w; ++i) {
+                    if (pref[i]) {
+                        (i < lw ? lreq[i] : rreq[i - lw]) = true;
+                    }
+                }
+            }
+            if (has_subquery) {
+                std::fill(lreq.begin(), lreq.end(), true);
+                std::fill(rreq.begin(), rreq.end(), true);
+            }
+            const std::vector<int> lrm = prune(node->children[0], lreq);
+            const std::vector<int> rrm = prune(node->children[1], rreq);
+            const std::size_t new_lw = node->child(0)->output.size();
+
+            std::vector<int> out_remap(out_w, -1);
+            for (std::size_t i = 0; i < lw; ++i) {
+                if (lrm[i] >= 0) {
+                    out_remap[i] = lrm[i];
+                }
+            }
+            for (std::size_t i = lw; i < out_w; ++i) {
+                if (rrm[i - lw] >= 0) {
+                    out_remap[i] = static_cast<int>(new_lw) + rrm[i - lw];
+                }
+            }
+            if (node->predicate) {
+                remap_expr_slots(*node->predicate, out_remap);
+            }
+            apply_output_remap(node->output, out_remap);
+            return out_remap;
+        }
+
+        case LogicalOp::Aggregate: {
+            // The Aggregate output is a fresh, non-passthrough schema (group keys
+            // + aggregate results), so keep it intact and prune the child by what
+            // the grouping keys and aggregate calls read.
+            LogicalNode* child = node->child(0);
+            std::vector<bool> child_req(child->output.size(), false);
+            bool has_subquery = false;
+            for (auto& e : node->group_keys) if (e) collect_slots(*e, child_req, has_subquery);
+            for (auto& e : node->aggregates) if (e) collect_slots(*e, child_req, has_subquery);
+            if (has_subquery) {
+                std::fill(child_req.begin(), child_req.end(), true);
+            }
+            const std::vector<int> child_remap = prune(node->children[0], child_req);
+            for (auto& e : node->group_keys) if (e) remap_expr_slots(*e, child_remap);
+            for (auto& e : node->aggregates) if (e) remap_expr_slots(*e, child_remap);
+            return identity_remap(out_w);
+        }
+
+        default:
+            // Conservative barrier (SetOp, Values, Insert / Update / Delete /
+            // Returning): keep this node and its inputs intact. Column flow
+            // through these operators is intricate (branch-arity matching, target
+            // column mapping), so nothing below is pruned here.
+            return identity_remap(out_w);
+    }
+}
+
+void prune_all_subplans(LogicalNode* node);
+
+// Prune every embedded subquery sub-plan reachable from an expression, each as
+// its own query block.
+void prune_subplans_in_expr(ExprPtr& e) {
+    if (!e) {
+        return;
+    }
+    if (e->kind == ExprKind::Subquery && e->sub_plan) {
+        prune_columns(e->sub_plan);
+    }
+    for (auto& c : e->children) {
+        prune_subplans_in_expr(c);
+    }
+    if (e->kind == ExprKind::WindowFunction) {
+        for (auto& p : e->window.partition_by) prune_subplans_in_expr(p);
+        for (auto& k : e->window.order_by) prune_subplans_in_expr(k.expr);
+    }
+}
+
+// Walk the plan tree and prune each embedded subquery sub-plan independently.
+void prune_all_subplans(LogicalNode* node) {
+    if (node == nullptr) {
+        return;
+    }
+    for_each_payload_expr(node, [](ExprPtr& e) { prune_subplans_in_expr(e); });
+    for (auto& child : node->children) {
+        prune_all_subplans(child.get());
+    }
+}
+
 }  // namespace
 
 void fold_constants(LogicalNode* node) {
@@ -532,13 +824,26 @@ void push_down_filters(LogicalNodePtr& node) {
     }
 }
 
+void prune_columns(LogicalNodePtr& node) {
+    if (!node) {
+        return;
+    }
+    // The root's full output is the query result, so nothing there is dropped.
+    std::vector<bool> keep_all(node->output.size(), true);
+    prune(node, keep_all);
+    // Prune embedded subquery sub-plans as independent blocks.
+    prune_all_subplans(node.get());
+}
+
 LogicalNodePtr optimize(LogicalNodePtr plan) {
     if (plan) {
         // Fold first so a folded `1 = 1` -> `true` feeds the boolean identities;
-        // simplify next so a reduced predicate feeds pushdown; then push filters.
+        // simplify next so a reduced predicate feeds pushdown; push filters so
+        // they narrow inputs before pruning; then drop unreferenced columns.
         fold_constants(plan.get());
         simplify_booleans(plan.get());
         push_down_filters(plan);
+        prune_columns(plan);
     }
     return plan;
 }

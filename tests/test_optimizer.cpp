@@ -51,6 +51,11 @@ InMemoryCatalog make_catalog() {
         {"user_id", DataType::Integer, true},
         {"total", DataType::Double, true},
     });
+    cat.add_table("emp", {
+        {"id", DataType::Integer, false},
+        {"dept", DataType::VarChar, true},
+        {"sal", DataType::Double, true},
+    });
     return cat;
 }
 
@@ -283,13 +288,16 @@ void test_pushdown_both_sides(const InMemoryCatalog& cat) {
             check(rf && rf->op == LogicalOp::Filter, "right input wrapped in a Filter");
             check(rf && rf->child(0) && rf->child(0)->op == LogicalOp::Scan &&
                       rf->child(0)->table_name == "orders", "right Filter over Scan orders");
-            // The right conjuncts `o.total > 100` was on join slot #4 and is
-            // remapped to slot #2 (total) in the orders input frame.
+            // `o.total > 100` was on join slot #4; pushdown re-bases it into the
+            // orders frame and column pruning then drops the unused orders.id, so
+            // the orders scan becomes [user_id, total] and total lands at slot #1.
+            check(rf && rf->child(0) && rf->child(0)->output.size() == 2,
+                  "orders scan pruned to [user_id, total]");
             if (rf && rf->predicate && rf->predicate->kind == ExprKind::BinaryOp &&
                 rf->predicate->children.size() == 2) {
                 check(rf->predicate->children[0]->kind == ExprKind::ColumnRef &&
-                          rf->predicate->children[0]->input_index == 2,
-                      "right predicate remapped to orders slot #2 (total)");
+                          rf->predicate->children[0]->input_index == 1,
+                      "right predicate at pruned orders slot #1 (total)");
             }
         }
     });
@@ -345,6 +353,131 @@ void test_no_pushdown_outer_join(const InMemoryCatalog& cat) {
     });
 }
 
+// Descend through single-child operators to the first Scan of the given table.
+const LogicalNode* find_scan(const LogicalNode* n, std::string_view table) {
+    if (n == nullptr) {
+        return nullptr;
+    }
+    if (n->op == LogicalOp::Scan && n->table_name == table) {
+        return n;
+    }
+    for (std::size_t i = 0; i < n->child_count(); ++i) {
+        if (const LogicalNode* s = find_scan(n->child(i), table)) {
+            return s;
+        }
+    }
+    return nullptr;
+}
+
+// A column read by nobody is dropped from the Scan.
+void test_prune_single_table(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id FROM users  (name pruned from scan)\n");
+    with_optimized_plan(cat, "SELECT id FROM users", [](const LogicalNode* root) {
+        const LogicalNode* scan = find_scan(root, "users");
+        check(scan && scan->output.size() == 1, "users scan pruned to [id]");
+        if (scan && scan->output.size() == 1) {
+            check(scan->output[0].name == "id", "surviving column is id");
+        }
+    });
+}
+
+// A wide scan under an Aggregate keeps only the grouped / aggregated columns.
+void test_prune_under_aggregate(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT dept, COUNT(*) FROM emp GROUP BY dept  (emp pruned to [dept])\n");
+    with_optimized_plan(cat, "SELECT dept, COUNT(*) FROM emp GROUP BY dept",
+                        [](const LogicalNode* root) {
+        const LogicalNode* scan = find_scan(root, "emp");
+        check(scan && scan->output.size() == 1, "emp scan pruned to [dept]");
+        if (scan && scan->output.size() == 1) {
+            check(scan->output[0].name == "dept", "surviving column is dept");
+        }
+    });
+}
+
+// A join input drops the columns neither the join, a filter, nor the projection
+// needs (here orders.id).
+void test_prune_join_input(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT u.id, o.total FROM users u JOIN orders o ...  (orders.id pruned)\n");
+    with_optimized_plan(
+        cat,
+        "SELECT u.id, o.total FROM users u INNER JOIN orders o ON u.id = o.user_id",
+        [](const LogicalNode* root) {
+        const LogicalNode* orders = find_scan(root, "orders");
+        // orders keeps user_id (join key) and total (projected); id is dropped.
+        check(orders && orders->output.size() == 2, "orders scan pruned to [user_id, total]");
+    });
+}
+
+// Nothing is dropped when every column is consumed.
+void test_no_prune_all_used(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id, name FROM users  (nothing pruned)\n");
+    with_optimized_plan(cat, "SELECT id, name FROM users", [](const LogicalNode* root) {
+        const LogicalNode* scan = find_scan(root, "users");
+        check(scan && scan->output.size() == 2, "users scan keeps [id, name]");
+    });
+}
+
+// Safety: a correlated subquery makes its owning operator a pruning barrier, so
+// the outer column its OuterRef needs (users.id) is NOT dropped even though the
+// projection only selects name.
+void test_prune_barrier_correlated_subquery(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT name FROM users WHERE EXISTS (... users.id ...)  (id kept)\n");
+    with_optimized_plan(
+        cat,
+        "SELECT name FROM users WHERE EXISTS "
+        "(SELECT 1 FROM orders WHERE orders.user_id = users.id)",
+        [](const LogicalNode* root) {
+        const LogicalNode* scan = find_scan(root, "users");
+        // id must survive: the correlated EXISTS references it via an OuterRef.
+        check(scan && scan->output.size() == 2,
+              "users scan keeps [id, name] (id needed by the correlated subquery)");
+    });
+}
+
+// Regression: a Window passes its child schema through positionally, so pruning
+// must not drop passthrough columns nor shift them. The scan under the Window is
+// kept intact and the projection's `id` stays at slot #0 (not replaced by sal).
+void test_window_passthrough_not_corrupted(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id, RANK() OVER (ORDER BY sal) FROM emp  (window passthrough)\n");
+    with_optimized_plan(cat, "SELECT id, RANK() OVER (ORDER BY sal) FROM emp",
+                        [](const LogicalNode* root) {
+        const LogicalNode* scan = find_scan(root, "emp");
+        check(scan && scan->output.size() == 3, "emp scan kept intact under Window");
+        check(root->op == LogicalOp::Project && root->exprs.size() == 2, "Project of 2");
+        if (root->op == LogicalOp::Project && root->exprs.size() == 2) {
+            check(root->exprs[0] && root->exprs[0]->kind == ExprKind::ColumnRef &&
+                      root->exprs[0]->input_index == 0,
+                  "id stays at slot #0 (not corrupted to sal)");
+        }
+    });
+}
+
+// Regression: a USING join compacts its right frame, so slot arithmetic would
+// mis-index; the pass must barrier it and prune nothing (keeping o.total correct).
+void test_using_join_not_corrupted(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT u.id, o.total FROM users u JOIN orders o USING (id)  (barrier)\n");
+    with_optimized_plan(cat,
+                        "SELECT u.id, o.total FROM users u JOIN orders o USING (id)",
+                        [](const LogicalNode* root) {
+        const LogicalNode* orders = find_scan(root, "orders");
+        check(orders && orders->output.size() == 3,
+              "orders scan kept intact under a USING join (no mis-indexed prune)");
+    });
+}
+
+// Regression: DISTINCT de-duplication depends on all its input columns, so a
+// column the outer query does not select must not be pruned away underneath it.
+void test_distinct_keeps_all_columns(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id FROM (SELECT DISTINCT id, name FROM users) sub  (name kept)\n");
+    with_optimized_plan(cat,
+                        "SELECT id FROM (SELECT DISTINCT id, name FROM users) sub",
+                        [](const LogicalNode* root) {
+        const LogicalNode* scan = find_scan(root, "users");
+        check(scan && scan->output.size() == 2,
+              "users scan keeps [id, name] (name needed for DISTINCT multiplicity)");
+    });
+}
+
 }  // namespace
 
 int main() {
@@ -365,6 +498,14 @@ int main() {
     test_pushdown_both_sides(cat);
     test_pushdown_straddling_stays(cat);
     test_no_pushdown_outer_join(cat);
+    test_prune_single_table(cat);
+    test_prune_under_aggregate(cat);
+    test_prune_join_input(cat);
+    test_no_prune_all_used(cat);
+    test_prune_barrier_correlated_subquery(cat);
+    test_window_passthrough_not_corrupted(cat);
+    test_using_join_not_corrupted(cat);
+    test_distinct_keeps_all_columns(cat);
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) {
