@@ -304,6 +304,82 @@ void test_group_by(const InMemoryCatalog& cat) {
     });
 }
 
+// The Aggregate output is group_keys ++ aggregates, independent of SELECT order.
+// `SELECT COUNT(*), dept` puts the aggregate first in the select list but the
+// Aggregate output is still [dept (key), COUNT (agg)]; the Project reorders it
+// back, mapping select item #0 (COUNT) to output slot #1 and #1 (dept) to #0.
+// The old select-list-shaped model declared the output in select order, which an
+// executor emitting keys++aggs would have mis-mapped (columns swapped).
+void test_group_by_select_reordered(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT COUNT(*), dept FROM emp GROUP BY dept  (agg before key)\n");
+    with_plan(cat, "SELECT COUNT(*), dept FROM emp GROUP BY dept",
+              [](const LogicalNode* root) {
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->op == LogicalOp::Aggregate, "child is Aggregate");
+        check(agg && agg->output.size() == 2, "aggregate output is [dept, COUNT]");
+        if (agg && agg->output.size() == 2) {
+            // Canonical order: group key first, aggregate result second.
+            check(agg->output[0].name == "dept", "output #0 is the group key dept");
+            check(agg->output[1].name == "COUNT", "output #1 is the aggregate COUNT");
+        }
+        check(root->exprs.size() == 2, "project has 2 exprs");
+        if (root->exprs.size() == 2) {
+            // Select order is (COUNT, dept); the Project maps it onto the
+            // keys++aggs output: COUNT -> slot #1, dept -> slot #0.
+            expect_col_ref(root->exprs[0], 1, "proj expr[0] COUNT -> agg slot #1");
+            expect_col_ref(root->exprs[1], 0, "proj expr[1] dept -> agg slot #0");
+        }
+    });
+}
+
+// Two aggregates that share a function name but differ in argument
+// (`SUM(sal)` vs `SUM(id)`) get DISTINCT output columns, and each select item
+// resolves to its own column. By-name matching would alias both to the first
+// "SUM"; structural matching keeps them apart.
+void test_group_by_same_name_aggregates(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT SUM(sal), SUM(id) FROM emp GROUP BY dept  (name collision)\n");
+    with_plan(cat, "SELECT SUM(sal), SUM(id) FROM emp GROUP BY dept",
+              [](const LogicalNode* root) {
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->op == LogicalOp::Aggregate, "child is Aggregate");
+        // [dept (key), SUM(sal), SUM(id)] - the two SUMs are separate columns.
+        check(agg && agg->output.size() == 3, "aggregate output is [dept, SUM, SUM]");
+        check(agg && agg->aggregates.size() == 2, "two distinct aggregates");
+        if (agg && agg->aggregates.size() == 2) {
+            // SUM(sal): arg sal is emp slot #2; SUM(id): arg id is emp slot #0.
+            expect_col_ref(agg->aggregates[0]->children[0], 2, "SUM(sal) arg -> #2");
+            expect_col_ref(agg->aggregates[1]->children[0], 0, "SUM(id) arg -> #0");
+        }
+        check(root->exprs.size() == 2, "project has 2 exprs");
+        if (root->exprs.size() == 2) {
+            // Each select SUM maps to ITS OWN aggregate column, not the first.
+            expect_col_ref(root->exprs[0], 1, "SUM(sal) -> agg slot #1");
+            expect_col_ref(root->exprs[1], 2, "SUM(id) -> agg slot #2 (not aliased to #1)");
+        }
+    });
+}
+
+// COUNT(DISTINCT x) and COUNT(x) share their name AND argument - the DISTINCT
+// modifier lives only in semantic_flags - so they must still be kept as two
+// separate aggregate columns and not deduped into one.
+void test_group_by_distinct_vs_plain(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT COUNT(DISTINCT sal), COUNT(sal) FROM emp GROUP BY dept\n");
+    with_plan(cat, "SELECT COUNT(DISTINCT sal), COUNT(sal) FROM emp GROUP BY dept",
+              [](const LogicalNode* root) {
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->op == LogicalOp::Aggregate, "child is Aggregate");
+        // [dept (key), COUNT(DISTINCT sal), COUNT(sal)] - NOT deduped.
+        check(agg && agg->output.size() == 3,
+              "DISTINCT and plain COUNT are separate columns");
+        check(agg && agg->aggregates.size() == 2, "two distinct aggregates");
+        check(root->exprs.size() == 2, "project has 2 exprs");
+        if (root->exprs.size() == 2) {
+            expect_col_ref(root->exprs[0], 1, "COUNT(DISTINCT sal) -> agg slot #1");
+            expect_col_ref(root->exprs[1], 2, "COUNT(sal) -> agg slot #2 (not merged)");
+        }
+    });
+}
+
 // -------------------------------------------------------------------------
 // Implicit aggregation: an aggregate with no GROUP BY collapses the input to a
 // single group (Aggregate with EMPTY group keys) below the Project.
@@ -356,6 +432,21 @@ void test_implicit_aggregate_nested(const InMemoryCatalog& cat) {
         check(scan && scan->op == LogicalOp::Scan && scan->table_name == "emp",
               "leaf scan emp");
         check(root->output.size() == 1, "project has 1 col");
+        // The Aggregate output is the canonical [SUM] (one aggregate result),
+        // and the Project reshapes it back into `SUM(sal) + 1` - the `+ 1`
+        // wrapper is preserved (the old select-list-shaped model dropped it,
+        // collapsing the item to a bare ColumnRef).
+        check(agg && agg->output.size() == 1, "aggregate output is [SUM]");
+        check(root->exprs.size() == 1, "project has 1 expr");
+        if (root->exprs.size() == 1) {
+            const auto& p = *root->exprs[0];
+            check(p.kind == ExprKind::BinaryOp && p.bin_op == db25::ast::BinaryOp::Add,
+                  "project keeps SUM(sal)+1 as an Add (the +1 is not dropped)");
+            if (p.kind == ExprKind::BinaryOp && p.children.size() == 2) {
+                expect_col_ref(p.children[0], 0, "Add lhs is the precomputed SUM (#0)");
+                check(p.children[1]->kind == ExprKind::Literal, "Add rhs is a literal");
+            }
+        }
     });
 }
 
@@ -407,15 +498,17 @@ void test_having_aggregate_in_select(const InMemoryCatalog& cat) {
         }
         const LogicalNode* agg = filter ? only_child(filter) : nullptr;
         check(agg && agg->op == LogicalOp::Aggregate, "Filter over Aggregate");
-        // Output is the SELECT-list shape (dept, SUM); no hidden column needed
-        // because SUM(sal) is already a select output the HAVING can name.
-        check(agg && agg->output.size() == 2, "aggregate output is the 2 select cols");
+        // Canonical output [dept (key), SUM (agg)]: the HAVING SUM(sal) and the
+        // SELECT SUM(sal) dedup to that one aggregate column (both resolve to it
+        // structurally), so the output stays at 2 columns.
+        check(agg && agg->output.size() == 2, "aggregate output is [dept, SUM]");
         check(root->output.size() == 2, "query result is (dept, SUM)");
     });
 }
 
-// HAVING may reference an aggregate that is NOT in the SELECT list; the Aggregate
-// gains a hidden output column for it that the Project above drops.
+// HAVING may reference an aggregate that is NOT in the SELECT list. It is a
+// first-class aggregate result column (collected from HAVING into the payload);
+// the Project simply does not select it, so it is absent from the query result.
 void test_having_aggregate_not_selected(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT dept FROM emp GROUP BY dept HAVING MIN(sal) > 5  (MIN not selected)\n");
     with_plan(cat, "SELECT dept FROM emp GROUP BY dept HAVING MIN(sal) > 5",
@@ -426,17 +519,18 @@ void test_having_aggregate_not_selected(const InMemoryCatalog& cat) {
         check(filter && filter->op == LogicalOp::Filter, "child is the HAVING Filter");
         if (filter && filter->predicate && filter->predicate->children.size() == 2) {
             check(filter->predicate->children[0]->kind == ExprKind::ColumnRef,
-                  "MIN(sal) in HAVING resolved to a ColumnRef (the hidden aggregate)");
+                  "MIN(sal) in HAVING resolved to a ColumnRef into the aggregate output");
         }
         const LogicalNode* agg = filter ? only_child(filter) : nullptr;
-        // dept (select) + a hidden MIN column the HAVING references.
+        // Canonical output [dept (key), MIN (agg)]; the Project emits only dept.
         check(agg && agg->op == LogicalOp::Aggregate && agg->output.size() == 2,
-              "aggregate carries a hidden MIN output column");
+              "aggregate output is [dept, MIN]");
     });
 }
 
 // A selected aggregate hidden behind an alias is still referenceable by its call
-// form in HAVING (via a hidden output column).
+// form in HAVING: the aggregate output column is named by the call (not the
+// SELECT alias), so HAVING resolves structurally regardless of the alias.
 void test_having_aggregate_aliased(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT dept, SUM(sal) AS total ... HAVING SUM(sal) > 1000  (aliased)\n");
     with_plan(cat,
@@ -450,6 +544,33 @@ void test_having_aggregate_aliased(const InMemoryCatalog& cat) {
             check(filter->predicate->children[0]->kind == ExprKind::ColumnRef,
                   "HAVING SUM(sal) resolved to a ColumnRef despite the SELECT alias");
         }
+    });
+}
+
+// ORDER BY an aggregate that is NOT selected. It is collected into the Aggregate
+// payload (a first-class result column); the Sort resolves the key against the
+// Aggregate output via the frame, appending a hidden Project column that carries
+// the precomputed aggregate. (Under the old model the ORDER-BY-only aggregate got
+// no output column, so this key had nothing to resolve to.)
+void test_order_by_aggregate_not_selected(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT dept FROM emp GROUP BY dept ORDER BY SUM(sal)\n");
+    with_plan(cat, "SELECT dept FROM emp GROUP BY dept ORDER BY SUM(sal)",
+              [](const LogicalNode* root) {
+        // Sort -> Project(dept + hidden SUM) -> Aggregate[dept, SUM] -> Scan
+        check(root->op == LogicalOp::Sort, "root is Sort");
+        check(root->sort_keys.size() == 1, "one sort key");
+        const LogicalNode* project = only_child(root);
+        check(project && project->op == LogicalOp::Project, "sort child is Project");
+        // dept (visible) + a hidden SUM column appended for the sort key.
+        check(project && project->output.size() == 2, "project has dept + hidden SUM");
+        if (project && project->exprs.size() == 2) {
+            // The hidden column is the precomputed SUM: a ColumnRef into the
+            // Aggregate output slot #1 (dept is key #0, SUM is agg #1).
+            expect_col_ref(project->exprs[1], 1, "hidden sort col -> agg SUM slot #1");
+        }
+        const LogicalNode* agg = project ? only_child(project) : nullptr;
+        check(agg && agg->op == LogicalOp::Aggregate && agg->output.size() == 2,
+              "aggregate output is [dept, SUM]");
     });
 }
 
@@ -1202,12 +1323,16 @@ int main() {
     test_self_join_alias_resolution(cat);
     test_table_name_qualifier(cat);
     test_group_by(cat);
+    test_group_by_select_reordered(cat);
+    test_group_by_same_name_aggregates(cat);
+    test_group_by_distinct_vs_plain(cat);
     test_implicit_aggregate_count(cat);
     test_implicit_aggregate_nested(cat);
     test_having(cat);
     test_having_aggregate_in_select(cat);
     test_having_aggregate_not_selected(cat);
     test_having_aggregate_aliased(cat);
+    test_order_by_aggregate_not_selected(cat);
     test_distinct(cat);
     test_select_star(cat);
     test_order_by(cat);

@@ -23,13 +23,29 @@
 #include "db25/semantic/analyzer.hpp"
 #include "db25/semantic/catalog.hpp"
 
+#include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace db25::plan {
 
 // Test-only accessor (defined in the test TU) for the private lowering surface.
 struct BinderExprTestAccess;
+
+// A precomputed-column frame for lowering the expressions that sit directly
+// above an Aggregate (its Project, HAVING filter, and hidden ORDER BY keys).
+// Each entry pairs a producing AST expression - a GROUP BY key or an aggregate
+// call - with the slot of its result column in the Aggregate output
+// (group_keys ++ aggregates). A subexpression lowered above the aggregate that
+// structurally matches a producer becomes a ColumnRef into that slot instead of
+// being re-lowered against base columns the aggregate no longer exposes (so
+// `SELECT SUM(x)+1` keeps the `+1`, and `SELECT COUNT(*), dept GROUP BY dept`
+// reorders correctly). Matching is structural, not by name, because a call's
+// name is not unique - `SUM(x)` and `SUM(y)` share the text "SUM".
+struct AggregateFrame {
+    std::vector<std::pair<const db25::ast::ASTNode*, std::uint32_t>> producers;
+};
 
 // Outcome of binding. On success `root` is the plan tree and `ok` is true. On
 // failure `root` is null and `error` explains why (no exceptions are thrown -
@@ -124,6 +140,24 @@ private:
     [[nodiscard]] ExprPtr lower_precomputed_aggregate(const db25::ast::ASTNode* call,
                                                       const Schema& input) const;
 
+    // If `n` structurally matches a producer in the active Aggregate frame
+    // (`agg_frame_`), return that producer's output slot; otherwise -1. This is
+    // the aggregate producer map applied inside expression lowering: an aggregate
+    // call or group-key expression that surfaces above its Aggregate node - in
+    // the SELECT list, HAVING, or ORDER BY - resolves to the already-computed
+    // column instead of being re-lowered against base columns that are no longer
+    // in scope. Returns -1 when no frame is active.
+    [[nodiscard]] int aggregate_frame_slot(const db25::ast::ASTNode* n) const;
+
+    // Structural equality of two producer expressions (an aggregate call or a
+    // group key) for Aggregate-frame matching and aggregate dedup. A column
+    // reference compares by resolved (table_id, column_id) so a qualifier or
+    // alias difference still matches the same base column; other nodes compare
+    // on node_type + operator text with structurally-equal children. This tells
+    // `SUM(x)` and `SUM(y)` apart, which by-name matching cannot.
+    [[nodiscard]] static bool same_producer_expr(const db25::ast::ASTNode* a,
+                                                 const db25::ast::ASTNode* b);
+
     // Lower a SELECT-list / RETURNING projection into owned expressions, one per
     // output column, appended to `out`. `child` is the operator feeding the
     // projection (its `output` is the input schema against which items are
@@ -136,15 +170,14 @@ private:
                                         const LogicalNode* child,
                                         std::vector<ExprPtr>& out, std::string& error);
 
-    // Lower a single non-star projected item at ordinal `index` against `input`
-    // (the child's output schema). When the child is an Aggregate its output is
-    // 1:1 with the select list, so the item maps positionally; otherwise a
-    // precomputed aggregate / window item is referenced by output name (the
-    // producer map) and anything else is lowered as a fresh expression. Returns
-    // null on failure.
+    // Lower a single non-star projected item against `input` (the child's output
+    // schema). Over an Aggregate the active `agg_frame_` resolves a group key or
+    // aggregate call (including one wrapped in a larger expression like
+    // `SUM(x)+1`) to a ColumnRef into the precomputed output; a precomputed
+    // window item is referenced by output name; anything else is lowered as a
+    // fresh expression. Returns null on failure.
     [[nodiscard]] ExprPtr lower_projection_item(const db25::ast::ASTNode* item,
-                                                const Schema& input, std::size_t index,
-                                                bool child_is_aggregate, std::string& error);
+                                                const Schema& input, std::string& error);
 
     // Fold a scalar / IN / EXISTS subquery into an owned Subquery Expr: bind the
     // inner block into `sub_plan` (with `input` pushed as an enclosing schema for
@@ -168,6 +201,15 @@ private:
     // immediately-enclosing block is back(): OuterRef depth 1 is `outer_inputs_`
     // back(), depth 2 the one before it, and so on.
     std::vector<const Schema*> outer_inputs_;
+
+    // The Aggregate frame active while lowering the Project / HAVING / hidden
+    // ORDER BY expressions directly above an Aggregate (see AggregateFrame).
+    // Null everywhere else - including while lowering the aggregate's own
+    // group-key / aggregate payloads against its pre-aggregation input, and
+    // while lowering an ORDER BY key against the visible Project output (a
+    // different frame). bind_select saves and restores it so a nested block (a
+    // scalar subquery in a select item) does not clobber the enclosing frame.
+    const AggregateFrame* agg_frame_ = nullptr;
 
     friend struct BinderExprTestAccess;
 };

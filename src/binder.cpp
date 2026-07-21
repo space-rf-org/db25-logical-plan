@@ -563,6 +563,17 @@ LogicalNodePtr Binder::bind_setop(const ASTNode* setop, std::string& error) {
 }
 
 LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& error) {
+    // This block's Aggregate frame is local; a scalar subquery in a select item
+    // recurses into bind_select and would clobber `agg_frame_`. Save the
+    // enclosing frame, run with none active (the aggregate payload below lowers
+    // against pre-aggregation columns), and restore on every exit.
+    struct FrameGuard {
+        Binder* b;
+        const AggregateFrame* prev;
+        ~FrameGuard() { b->agg_frame_ = prev; }
+    } frame_guard{this, agg_frame_};
+    agg_frame_ = nullptr;
+
     // --- FROM -> Scan / Join subtree (or a synthetic single row) ---
     LogicalNodePtr current;
     const ASTNode* from = find_child(select_stmt, NodeType::FromClause);
@@ -628,68 +639,80 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
         }
     }
 
+    // The precomputed-column frame for the Project / HAVING / hidden ORDER BY
+    // expressions above the Aggregate. Empty (and never enabled) when the query
+    // does not aggregate; populated below in output order (group keys, then
+    // aggregate results) so a producer's index equals its Aggregate output slot.
+    AggregateFrame agg_frame;
+
     if (group_by != nullptr || !aggregates.empty()) {
         auto agg = make_node(LogicalOp::Aggregate);
         // Group keys and aggregate calls are lowered against the Aggregate's
         // input (its child's output), where their base-column references live.
         const Schema& agg_input = current->output;
+        // The Aggregate output is the canonical shape an executor emits: one
+        // column per group key (in GROUP BY order), then one column per aggregate
+        // result, positional 1:1 with the group_keys / aggregates payloads. The
+        // Project above reshapes this into the SELECT list (reordering, wrapping
+        // `SUM(x)+1`, dropping keys) by resolving each item against `agg_frame`.
+        //
         // Group keys: the GROUP BY expressions, or empty for implicit
         // aggregation. Keys are base-column references or expressions over the
         // input, which lower directly. (GROUP BY by output ordinal `GROUP BY 1`
         // or by select alias is rejected upstream by the analyzer, so it never
-        // reaches a clean bind and is not resolved here.)
+        // reaches a clean bind and is not resolved here.) A bare-column key
+        // additionally carries its source (table_id, column_id) so an operator
+        // above resolves it by id rather than only structurally.
+        std::uint32_t slot = 0;
         for (const ASTNode* key = group_by != nullptr ? first_child(group_by) : nullptr;
              key != nullptr; key = key->next_sibling) {
             auto e = lower_expr(key, agg_input, error);
             if (!e) {
                 return nullptr;
             }
+            ColumnSchema col;
+            col.name = item_output_name(key);
+            col.type = analyzer_.type_of(key);
+            col.nullable = analyzer_.nullability_of(key) != 1;
+            if (key->node_type == NodeType::ColumnRef ||
+                key->node_type == NodeType::Identifier) {
+                col.table_id = key->context.analysis.table_id;
+                col.column_id = key->context.analysis.column_id;
+            }
+            agg->output.push_back(std::move(col));
             agg->group_keys.push_back(std::move(e));
+            agg_frame.producers.emplace_back(key, slot);
+            ++slot;
         }
+        // Aggregate results: one column per DISTINCT aggregate call collected
+        // across SELECT + HAVING + ORDER BY. The same aggregate appearing in more
+        // than one clause (`SELECT COUNT(*) ... HAVING COUNT(*)`) is a separate
+        // AST node each time; dedup it to a single result column - a
+        // structurally-equal producer already registered covers every occurrence,
+        // since the frame routes each by structure to that one slot.
         for (const ASTNode* call : aggregates) {
+            bool duplicate = false;
+            for (const auto& [producer, existing] : agg_frame.producers) {
+                if (same_producer_expr(call, producer)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                continue;
+            }
             auto e = lower_expr(call, agg_input, error);
             if (!e) {
                 return nullptr;
             }
+            ColumnSchema col;
+            col.name = item_output_name(call);
+            col.type = analyzer_.type_of(call);
+            col.nullable = analyzer_.nullability_of(call) != 1;
+            agg->output.push_back(std::move(col));
             agg->aggregates.push_back(std::move(e));
-        }
-        // Derive the aggregate output by walking the SELECT list in order,
-        // reading each item's type / nullability back from the analyzer. A
-        // group-key passthrough (a bare column reference) additionally carries
-        // its source (table_id, column_id) so an operator above resolves it by
-        // id rather than only by name.
-        if (select_list != nullptr) {
-            for (const ASTNode* item = first_child(select_list); item != nullptr;
-                 item = item->next_sibling) {
-                ColumnSchema col;
-                col.name = item_output_name(item);
-                col.type = analyzer_.type_of(item);
-                col.nullable = analyzer_.nullability_of(item) != 1;
-                if (item->node_type == NodeType::ColumnRef ||
-                    item->node_type == NodeType::Identifier) {
-                    col.table_id = item->context.analysis.table_id;
-                    col.column_id = item->context.analysis.column_id;
-                }
-                agg->output.push_back(std::move(col));
-            }
-        }
-        // A HAVING predicate may reference an aggregate that is not in the SELECT
-        // list (`HAVING MIN(x) > 5`), or a selected aggregate whose alias hides
-        // its call name (`SELECT SUM(x) AS s ... HAVING SUM(x) > 10`). Give each
-        // such aggregate a resolvable output column so the HAVING predicate binds
-        // (via lower_precomputed_aggregate): append a hidden column, named by the
-        // aggregate's output name, for any not already present. The Project above
-        // emits only the select items, so these trailing columns are dropped from
-        // the query result.
-        for (const ASTNode* hg : having_aggs) {
-            const std::string nm = item_output_name(hg);
-            if (slot_by_name(agg->output, nm) < 0) {
-                ColumnSchema col;
-                col.name = nm;
-                col.type = analyzer_.type_of(hg);
-                col.nullable = analyzer_.nullability_of(hg) != 1;
-                agg->output.push_back(std::move(col));
-            }
+            agg_frame.producers.emplace_back(call, slot);
+            ++slot;
         }
         agg->add_child(std::move(current));
         current = std::move(agg);
@@ -699,9 +722,12 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
             const ASTNode* pred_ast = first_child(having);  // the HAVING condition
             auto filter = make_node(LogicalOp::Filter);
             filter->output = current->output;   // schema-preserving
-            // Lower against the aggregate's output (the HAVING filter's input);
-            // any embedded subquery folds inline into the owned predicate.
+            // Lower against the aggregate's output (the HAVING filter's input)
+            // with the frame active, so `HAVING SUM(x) > 10` resolves SUM(x) to
+            // its precomputed column; any embedded subquery folds inline.
+            agg_frame_ = &agg_frame;
             filter->predicate = lower_expr(pred_ast, current->output, error);
+            agg_frame_ = nullptr;
             if (!filter->predicate) {
                 return nullptr;
             }
@@ -760,11 +786,17 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
         return nullptr;
     }
     if (select_list != nullptr) {
-        // Lower the SELECT list into owned, typed projected expressions. A scalar
+        // Lower the SELECT list into owned, typed projected expressions. Over an
+        // Aggregate the frame resolves each item's group keys / aggregate calls
+        // (including wrapped ones, `SUM(x)+1`) to precomputed columns. A scalar
         // subquery embedded in an item folds inline into that item's owned Expr
         // (an ExprKind::Subquery owning its sub_plan), with correlated references
         // resolved against the Project's input (the child's output).
-        if (!lower_projection(select_list, current.get(), project->exprs, error)) {
+        agg_frame_ = &agg_frame;
+        const bool projected = lower_projection(select_list, current.get(),
+                                                project->exprs, error);
+        agg_frame_ = nullptr;
+        if (!projected) {
             return nullptr;
         }
         // Invariant: exactly one projected expression per output column. A
@@ -857,7 +889,14 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
                         local_error;
                 return nullptr;
             }
+            // Lower against the Project's input (the Aggregate / HAVING-filter
+            // output) with the frame active, so an ORDER-BY-only aggregate such
+            // as `ORDER BY SUM(sal)` resolves to its precomputed column. The
+            // visible attempt above deliberately runs without the frame - it
+            // targets the Project output, a different (narrower) frame.
+            agg_frame_ = &agg_frame;
             auto hidden = lower_expr(key, *proj_input, error);
+            agg_frame_ = nullptr;
             if (!hidden) {
                 return nullptr;
             }
@@ -1127,43 +1166,20 @@ LogicalNodePtr Binder::wrap_returning(LogicalNodePtr dml, const ASTNode* stmt,
 // Projection lowering (SELECT list -> owned, typed expressions).
 //
 // One owned Expr per output column. A `*` expands to one positional ColumnRef
-// per covered child column; a projected aggregate / window item that a child
-// Aggregate / Window has already computed becomes a ColumnRef into that child
-// column (the producer map) rather than a re-evaluated expression tree.
+// per covered child column. Over an Aggregate, a group key or aggregate call
+// (bare or wrapped, `SUM(x)+1`) resolves through the active frame (in lower_expr)
+// to a ColumnRef into the precomputed output; a projected window item that a
+// child Window already computed becomes a ColumnRef into that child column (the
+// by-name producer map) rather than a re-evaluated expression tree.
 // ---------------------------------------------------------------------------
 ExprPtr Binder::lower_projection_item(const ASTNode* item, const Schema& input,
-                                      std::size_t index, bool child_is_aggregate,
                                       std::string& error) {
-    // Over an Aggregate child the output is 1:1 with the select list (it was
-    // built by walking the same items in order), so every item maps positionally
-    // - including an expression over an aggregate such as `SUM(x) + 1`, whose
-    // inner argument is not in the aggregate's output and so must not be
-    // re-lowered here.
-    if (child_is_aggregate) {
-        // Exception: a scalar subquery that is *itself* a whole select item is
-        // NOT produced by the Aggregate, so mapping it positionally would
-        // reference a phantom output column and drop the subquery's plan. Lower
-        // it fresh (against the aggregate's output) so its inner plan is bound
-        // and owned inline. (A subquery buried inside an aggregate expression,
-        // e.g. `SUM(x) + (SELECT ...)`, still maps positionally and is not
-        // separately represented - a known limitation of the simplified
-        // per-select-item aggregate output model, where such an item collapses
-        // to a single output column with no sub-structure.)
-        if (item->node_type != NodeType::Subquery &&
-            item->node_type != NodeType::SubqueryExpr) {
-            if (index < input.size()) {
-                return make_column_ref(static_cast<std::uint32_t>(index), input[index]);
-            }
-            error = "projection item past the aggregate's output";
-            return nullptr;
-        }
-    }
-    // A precomputed aggregate / window output (a window function, or an aggregate
-    // surfacing above a HAVING filter): reference the child column by its output
-    // name instead of re-evaluating it. These are matched by name first because
-    // re-lowering them as fresh calls would reach for arguments the child no
-    // longer exposes.
-    if (is_aggregate_call(item) || is_window_call(item)) {
+    // A precomputed window output: reference the child column by its output name
+    // instead of re-evaluating it (re-lowering would reach for arguments the
+    // child no longer exposes). Aggregate calls are NOT matched by name here -
+    // a call name is not unique (SUM(x) / SUM(y) share "SUM") - they resolve
+    // structurally through the Aggregate frame inside lower_expr below.
+    if (is_window_call(item)) {
         const int slot = slot_by_name(input, item_output_name(item));
         if (slot >= 0) {
             return make_column_ref(static_cast<std::uint32_t>(slot), input[slot]);
@@ -1171,10 +1187,9 @@ ExprPtr Binder::lower_projection_item(const ASTNode* item, const Schema& input,
         return lower_expr(item, input, error);
     }
     // A plain column passthrough: resolve by (table_id, column_id) first so
-    // same-named columns from different inputs stay distinct, then fall back to
-    // the output name for a producer whose ids were not carried through (e.g. a
-    // group key surfacing above a HAVING filter, whose Aggregate output column
-    // has no provenance ids).
+    // same-named columns from different inputs stay distinct (over an Aggregate
+    // a group-key column also matches structurally through the frame), then fall
+    // back to the output name for a producer whose ids were not carried through.
     if (item->node_type == NodeType::ColumnRef || item->node_type == NodeType::Identifier) {
         std::string local_error;
         if (auto e = lower_expr(item, input, local_error)) {
@@ -1194,8 +1209,6 @@ ExprPtr Binder::lower_projection_item(const ASTNode* item, const Schema& input,
 bool Binder::lower_projection(const ASTNode* select_list, const LogicalNode* child,
                               std::vector<ExprPtr>& out, std::string& error) {
     const Schema& input = child->output;
-    const bool child_is_aggregate = child->op == LogicalOp::Aggregate;
-    std::size_t index = 0;
     for (const ASTNode* item = first_child(select_list); item != nullptr;
          item = item->next_sibling) {
         if (item->node_type == NodeType::Star) {
@@ -1211,15 +1224,13 @@ bool Binder::lower_projection(const ASTNode* select_list, const LogicalNode* chi
             for (std::size_t s = 0; s < input.size(); ++s) {
                 out.push_back(make_column_ref(static_cast<std::uint32_t>(s), input[s]));
             }
-            ++index;
             continue;
         }
-        auto e = lower_projection_item(item, input, index, child_is_aggregate, error);
+        auto e = lower_projection_item(item, input, error);
         if (!e) {
             return false;
         }
         out.push_back(std::move(e));
-        ++index;
     }
     return true;
 }
