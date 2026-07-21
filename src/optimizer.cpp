@@ -1075,6 +1075,231 @@ void try_decorrelate_in_filter(LogicalNodePtr& filter_node) {
     filter_node = std::move(join);
 }
 
+// Build a positional ColumnRef into the current operator frame.
+ExprPtr make_column_ref(std::uint32_t index, ast::DataType type, std::uint8_t nullability) {
+    auto e = std::make_unique<Expr>(ExprKind::ColumnRef);
+    e->input_index = index;
+    e->type = type;
+    e->nullability = nullability;
+    return e;
+}
+
+// An aggregate whose value over the EMPTY set is NULL, so a LEFT JOIN's
+// non-match NULL reproduces the scalar subquery's result exactly. COUNT is
+// deliberately excluded: it yields 0 (not NULL) over the empty set, which a bare
+// LEFT JOIN cannot reproduce, so a COUNT scalar subquery is left represented.
+bool aggregate_null_over_empty(const std::string& fn) {
+    return fn == "SUM" || fn == "MIN" || fn == "MAX" || fn == "AVG";
+}
+
+// A single correlation conjunct is hoistable into a group-by / equi-join only if
+// it is `<bare depth-1 OuterRef> = <outer-ref-free inner expr>` (either operand
+// order). The inner side becomes a GROUP BY key; the outer side becomes the
+// join's left key.
+bool valid_equi_correlation(const Expr& c) {
+    if (c.kind != ExprKind::BinaryOp || c.bin_op != BinaryOp::Equal ||
+        c.children.size() != 2) {
+        return false;
+    }
+    const Expr* a = c.children[0].get();
+    const Expr* b = c.children[1].get();
+    const Expr* outer = (a->kind == ExprKind::OuterRef) ? a
+                       : (b->kind == ExprKind::OuterRef) ? b : nullptr;
+    const Expr* innr = (a->kind == ExprKind::OuterRef) ? b
+                      : (b->kind == ExprKind::OuterRef) ? a : nullptr;
+    if (!outer || outer->outer_depth != 1) {
+        return false;  // correlation not a bare depth-1 outer reference
+    }
+    return !expr_has_outer_ref(*innr);  // the other side must be pure inner
+}
+
+// Read-only: verify every correlated top-level AND conjunct of `pred` is a valid
+// equi-correlation, counting them. A conjunct with no outer ref is a local
+// filter and is unconstrained.
+bool inspect_scalar_correlation(const Expr* pred, int& corr_count) {
+    if (pred->kind == ExprKind::BinaryOp && pred->bin_op == BinaryOp::And &&
+        pred->children.size() == 2) {
+        return inspect_scalar_correlation(pred->children[0].get(), corr_count) &&
+               inspect_scalar_correlation(pred->children[1].get(), corr_count);
+    }
+    if (expr_has_outer_ref(*pred)) {
+        if (!valid_equi_correlation(*pred)) return false;
+        ++corr_count;
+    }
+    return true;
+}
+
+// If `s` is a correlated aggregate scalar subquery of the handled shape, build a
+// decorrelating LEFT JOIN under `proj` (left = proj's current child, right = the
+// inner relation grouped by the correlation keys with the aggregate computed per
+// group) and return the ColumnRef that replaces `s` in the projection. Returns
+// null (no mutation) for any shape outside the contract, which is left as a
+// represented subquery. Handled shape:
+//   Project(one pass-through ColumnRef #0)
+//     Aggregate group=() aggs=(one NULL-over-empty, outer-ref-free aggregate)
+//       Filter(equi-correlation [AND local], every correlation a bare depth-1
+//              OuterRef = inner expr, nothing correlated below the Filter)
+//         relation
+//
+// The left child's columns keep their positions (they are the join's left
+// input), so the projection's other expressions need no remap; only the new
+// aggregate column is appended, at index W + n.
+ExprPtr try_build_scalar_join(Expr* s, LogicalNode* proj) {
+    if (!s->sub_plan) {
+        return nullptr;
+    }
+    // Project must be a bare pass-through of the single aggregate column (#0).
+    LogicalNode* inner_proj = s->sub_plan.get();
+    if (inner_proj->op != LogicalOp::Project || inner_proj->child_count() != 1 ||
+        inner_proj->exprs.size() != 1 || !inner_proj->exprs[0] ||
+        inner_proj->exprs[0]->kind != ExprKind::ColumnRef ||
+        inner_proj->exprs[0]->input_index != 0) {
+        return nullptr;
+    }
+    LogicalNode* agg = inner_proj->child(0);
+    if (agg->op != LogicalOp::Aggregate || !agg->group_keys.empty() ||
+        agg->aggregates.size() != 1 || !agg->aggregates[0] || agg->child_count() != 1 ||
+        agg->output.empty()) {
+        return nullptr;
+    }
+    const Expr* agg_call = agg->aggregates[0].get();
+    if (agg_call->kind != ExprKind::Aggregate ||
+        !aggregate_null_over_empty(agg_call->func_name) || expr_has_outer_ref(*agg_call)) {
+        return nullptr;
+    }
+    // Correlation must live entirely in a single Filter directly under the Aggregate.
+    LogicalNode* filt = agg->child(0);
+    if (filt->op != LogicalOp::Filter || !filt->predicate || filt->child_count() != 1) {
+        return nullptr;
+    }
+    if (subtree_has_outer_ref(filt->child(0))) {
+        return nullptr;  // correlation reaches below the correlation Filter.
+    }
+    int corr_count = 0;
+    if (!inspect_scalar_correlation(filt->predicate.get(), corr_count) || corr_count == 0) {
+        return nullptr;  // a correlation conjunct is not a hoistable equi-correlation.
+    }
+
+    // ---- Gate passed; commit (no further bail) ----
+    const auto W = static_cast<std::uint32_t>(proj->children[0]->output.size());
+
+    LogicalNodePtr inner_proj_owned = std::move(s->sub_plan);
+    LogicalNodePtr agg_owned = std::move(inner_proj_owned->children[0]);
+    LogicalNodePtr filt_owned = std::move(agg_owned->children[0]);
+    LogicalNodePtr relation = std::move(filt_owned->children[0]);
+
+    std::vector<ExprPtr> conjuncts;
+    collect_conjuncts(std::move(filt_owned->predicate), conjuncts);
+    std::vector<ExprPtr> group_keys;  // inner exprs, in the relation frame
+    std::vector<ExprPtr> left_keys;   // outer columns, parallel to group_keys
+    std::vector<ExprPtr> local_conj;
+    for (auto& c : conjuncts) {
+        if (!expr_has_outer_ref(*c)) {
+            local_conj.push_back(std::move(c));
+            continue;
+        }
+        const bool a_outer = c->children[0]->kind == ExprKind::OuterRef;
+        ExprPtr outer = std::move(c->children[a_outer ? 0 : 1]);
+        ExprPtr innr = std::move(c->children[a_outer ? 1 : 0]);
+        left_keys.push_back(make_column_ref(outer->input_index, outer->type, outer->nullability));
+        group_keys.push_back(std::move(innr));
+    }
+    const auto n = static_cast<std::uint32_t>(group_keys.size());
+
+    // Grouped-inner Aggregate: group by the correlation keys, keep the aggregate.
+    auto grouped = std::make_unique<LogicalNode>(LogicalOp::Aggregate);
+    Schema g_out;
+    for (const auto& gk : group_keys) {
+        ColumnSchema cs;
+        cs.type = gk->type;
+        cs.nullable = gk->nullability != 1;
+        g_out.push_back(cs);
+    }
+    g_out.push_back(agg_owned->output[0]);  // the aggregate column schema
+    grouped->group_keys = std::move(group_keys);
+    grouped->aggregates.push_back(std::move(agg_owned->aggregates[0]));
+    grouped->output = std::move(g_out);
+    if (local_conj.empty()) {
+        grouped->add_child(std::move(relation));
+    } else {
+        auto lf = std::make_unique<LogicalNode>(LogicalOp::Filter);
+        lf->output = relation->output;
+        lf->predicate = combine_conjuncts(local_conj);
+        lf->add_child(std::move(relation));
+        grouped->add_child(std::move(lf));
+    }
+
+    // Join condition: left_key[i] = right group key at #(W + i).
+    std::vector<ExprPtr> on;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        auto rk = make_column_ref(W + i, grouped->output[i].type,
+                                  grouped->output[i].nullable ? 2 : 1);
+        auto eq = std::make_unique<Expr>(ExprKind::BinaryOp);
+        eq->bin_op = BinaryOp::Equal;
+        eq->type = ast::DataType::Boolean;
+        eq->children.push_back(std::move(left_keys[i]));
+        eq->children.push_back(std::move(rk));
+        on.push_back(std::move(eq));
+    }
+
+    // LEFT JOIN: left keeps its column positions; the grouped right is appended
+    // and its columns are nullable (a non-matching outer row gets NULLs).
+    auto join = std::make_unique<LogicalNode>(LogicalOp::Join);
+    join->join_type = ast::JoinType::Left;
+    LogicalNodePtr left = std::move(proj->children[0]);
+    join->output = left->output;
+    for (const auto& col : grouped->output) {
+        ColumnSchema c = col;
+        c.nullable = true;
+        join->output.push_back(c);
+    }
+    join->predicate = combine_conjuncts(on);
+    join->add_child(std::move(left));
+    join->add_child(std::move(grouped));
+    proj->children[0] = std::move(join);
+
+    // The aggregate value is the last appended column (#W + n); a non-match makes
+    // it NULL, so the replacement column is nullable.
+    return make_column_ref(W + n, s->type, 2);
+}
+
+// Rewrite the first handled correlated scalar subquery found anywhere within `e`
+// (mutating `e` and wrapping `proj`'s child). Returns whether it rewrote one, so
+// the caller can loop to catch several in one projected expression.
+bool rewrite_scalar_subqueries(ExprPtr& e, LogicalNode* proj) {
+    if (!e) {
+        return false;
+    }
+    if (e->kind == ExprKind::Subquery && e->subquery_kind == SubqueryKind::Scalar &&
+        e->sub_plan) {
+        if (auto repl = try_build_scalar_join(e.get(), proj)) {
+            e = std::move(repl);
+            return true;
+        }
+        return false;
+    }
+    for (auto& c : e->children) {
+        if (rewrite_scalar_subqueries(c, proj)) return true;
+    }
+    if (e->kind == ExprKind::WindowFunction) {
+        for (auto& p : e->window.partition_by) if (rewrite_scalar_subqueries(p, proj)) return true;
+        for (auto& k : e->window.order_by) if (rewrite_scalar_subqueries(k.expr, proj)) return true;
+    }
+    return false;
+}
+
+// Decorrelate correlated aggregate scalar subqueries in a Project's expressions.
+void try_decorrelate_scalar_in_project(LogicalNode* proj) {
+    if (proj->op != LogicalOp::Project || proj->child_count() != 1) {
+        return;
+    }
+    for (auto& e : proj->exprs) {
+        while (rewrite_scalar_subqueries(e, proj)) {
+            // keep going: a single expression may hold several scalar subqueries.
+        }
+    }
+}
+
 void decorrelate_node(LogicalNodePtr& node);
 
 // Recurse decorrelation into every embedded subquery sub-plan of an expression.
@@ -1102,6 +1327,10 @@ void decorrelate_node(LogicalNodePtr& node) {
         decorrelate_node(child);
     }
     for_each_payload_expr(node.get(), [](ExprPtr& e) { decorrelate_in_expr(e); });
+
+    if (node->op == LogicalOp::Project) {
+        try_decorrelate_scalar_in_project(node.get());
+    }
 
     if (node->op == LogicalOp::Filter && node->child_count() == 1 && node->predicate &&
         node->predicate->kind == ExprKind::Subquery) {

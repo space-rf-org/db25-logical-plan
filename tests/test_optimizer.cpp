@@ -645,8 +645,98 @@ void test_decorrelate_not_in_not_null(const InMemoryCatalog& cat) {
     });
 }
 
-// A shape that is not handled (a scalar subquery in the SELECT list) is left as
-// a represented subquery, not rewritten.
+// A correlated aggregate scalar subquery becomes a LEFT JOIN whose right input
+// is the inner relation grouped by the correlation key, with the subquery expr
+// replaced by a ColumnRef to the aggregate column.
+void test_decorrelate_scalar_sum(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id, (SELECT SUM(total) FROM orders WHERE user_id = id)  ->  LEFT JOIN\n");
+    with_optimized_plan(
+        cat,
+        "SELECT u.id, (SELECT SUM(o.total) FROM orders o WHERE o.user_id = u.id) "
+        "FROM users u",
+        [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project && root->exprs.size() == 2, "root Project of 2");
+        // The scalar subquery item is now a bare ColumnRef (into the joined frame).
+        if (root->exprs.size() == 2) {
+            check(root->exprs[1] && root->exprs[1]->kind == ExprKind::ColumnRef,
+                  "scalar subquery replaced by a ColumnRef");
+        }
+        const LogicalNode* join = only_child(root);
+        check(join && join->op == LogicalOp::Join &&
+                  join->join_type == db25::ast::JoinType::Left, "child is a LEFT Join");
+        if (join && join->child_count() == 2) {
+            check(find_scan(join->child(0), "users") != nullptr, "left input is users");
+            const LogicalNode* g = join->child(1);
+            check(g && g->op == LogicalOp::Aggregate && g->group_keys.size() == 1 &&
+                      g->aggregates.size() == 1, "right input is a grouped Aggregate");
+            check(join->predicate && join->predicate->kind == ExprKind::BinaryOp &&
+                      join->predicate->bin_op == db25::ast::BinaryOp::Equal,
+                  "join condition is the correlation equality");
+        }
+    });
+}
+
+// A local (uncorrelated) predicate inside the scalar subquery is preserved as a
+// Filter under the grouped Aggregate on the right.
+void test_decorrelate_scalar_local_filter(const InMemoryCatalog& cat) {
+    std::printf("[test] scalar subquery with a local WHERE  ->  Filter under the Aggregate\n");
+    with_optimized_plan(
+        cat,
+        "SELECT u.id, (SELECT MAX(o.total) FROM orders o "
+        "WHERE o.user_id = u.id AND o.total > 5) FROM users u",
+        [](const LogicalNode* root) {
+        const LogicalNode* join = only_child(root);
+        check(join && join->op == LogicalOp::Join, "child is a Join");
+        if (join && join->child_count() == 2) {
+            const LogicalNode* g = join->child(1);
+            check(g && g->op == LogicalOp::Aggregate && g->child_count() == 1 &&
+                      g->child(0)->op == LogicalOp::Filter,
+                  "the local predicate is a Filter under the Aggregate");
+        }
+    });
+}
+
+// The subquery may sit nested inside a larger projected expression; only the
+// subquery node is replaced, the surrounding arithmetic is preserved.
+void test_decorrelate_scalar_nested(const InMemoryCatalog& cat) {
+    std::printf("[test] (SELECT SUM(total) ...) + 100  ->  BinaryOp over a ColumnRef\n");
+    with_optimized_plan(
+        cat,
+        "SELECT u.id, (SELECT SUM(o.total) FROM orders o WHERE o.user_id = u.id) + 100 "
+        "FROM users u",
+        [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project && root->exprs.size() == 2, "root Project of 2");
+        if (root->exprs.size() == 2) {
+            check(root->exprs[1] && root->exprs[1]->kind == ExprKind::BinaryOp,
+                  "the projected item stays a BinaryOp (+ 100)");
+            check(root->exprs[1] && root->exprs[1]->children.size() == 2 &&
+                      root->exprs[1]->children[0]->kind == ExprKind::ColumnRef,
+                  "its left operand is the substituted aggregate ColumnRef");
+        }
+        check(only_child(root) && only_child(root)->op == LogicalOp::Join, "child is a Join");
+    });
+}
+
+// COUNT is NOT decorrelated: it yields 0 over the empty set, which a LEFT JOIN's
+// NULL cannot reproduce, so it is left as a represented subquery.
+void test_no_decorrelate_scalar_count(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id, (SELECT COUNT(*) FROM orders WHERE user_id = id)  (left as-is)\n");
+    with_optimized_plan(
+        cat,
+        "SELECT u.id, (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) FROM users u",
+        [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project && root->exprs.size() == 2, "root Project of 2");
+        if (root->exprs.size() == 2) {
+            check(root->exprs[1] && root->exprs[1]->kind == ExprKind::Subquery,
+                  "COUNT scalar subquery left as a Subquery expr");
+        }
+        check(only_child(root) && only_child(root)->op == LogicalOp::Scan,
+              "no join introduced (still a bare Scan child)");
+    });
+}
+
+// An uncorrelated scalar subquery in the SELECT list is left as a represented
+// subquery, not rewritten (this pass only decorrelates correlated ones).
 void test_no_decorrelate_scalar_subquery(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT id, (SELECT MAX(total) FROM orders) FROM users  (left as-is)\n");
     with_optimized_plan(cat, "SELECT id, (SELECT MAX(total) FROM orders) FROM users",
@@ -696,6 +786,10 @@ int main() {
     test_decorrelate_in_local_filter(cat);
     test_no_decorrelate_not_in_nullable(cat);
     test_decorrelate_not_in_not_null(cat);
+    test_decorrelate_scalar_sum(cat);
+    test_decorrelate_scalar_local_filter(cat);
+    test_decorrelate_scalar_nested(cat);
+    test_no_decorrelate_scalar_count(cat);
     test_no_decorrelate_scalar_subquery(cat);
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
