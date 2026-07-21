@@ -556,6 +556,95 @@ void test_no_decorrelate_skip_level_correlation(const InMemoryCatalog& cat) {
     });
 }
 
+// x IN (uncorrelated subquery) becomes a SemiJoin on the IN equality
+// (users.id = orders.user_id -> #0 = #3 in the left ++ right frame).
+void test_decorrelate_in_uncorrelated(const InMemoryCatalog& cat) {
+    std::printf("[test] WHERE id IN (SELECT user_id FROM orders)  ->  SemiJoin\n");
+    with_optimized_plan(
+        cat, "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders)",
+        [](const LogicalNode* root) {
+        const LogicalNode* sj = only_child(root);
+        check(sj && sj->op == LogicalOp::SemiJoin, "child is a SemiJoin");
+        check(sj && sj->predicate && sj->predicate->kind == ExprKind::BinaryOp &&
+                  sj->predicate->bin_op == db25::ast::BinaryOp::Equal,
+              "condition is the IN equality");
+        if (sj && sj->predicate && sj->predicate->children.size() == 2) {
+            check(sj->predicate->children[0]->input_index == 0 &&
+                      sj->predicate->children[1]->input_index == 3,
+                  "condition is #0 (users.id) = #3 (orders.user_id)");
+        }
+    });
+}
+
+// A correlated IN hoists BOTH the IN equality and the correlation predicate into
+// the join condition: (#0 = #2) AND (#3 = #0).
+void test_decorrelate_in_correlated(const InMemoryCatalog& cat) {
+    std::printf("[test] WHERE id IN (SELECT id FROM orders WHERE user_id = users.id)  ->  SemiJoin\n");
+    with_optimized_plan(
+        cat,
+        "SELECT id FROM users WHERE id IN "
+        "(SELECT id FROM orders WHERE orders.user_id = users.id)",
+        [](const LogicalNode* root) {
+        const LogicalNode* sj = only_child(root);
+        check(sj && sj->op == LogicalOp::SemiJoin, "child is a SemiJoin");
+        check(sj && sj->predicate && sj->predicate->kind == ExprKind::BinaryOp &&
+                  sj->predicate->bin_op == db25::ast::BinaryOp::And,
+              "condition is a conjunction (IN eq AND hoisted correlation)");
+        // No residual subquery: the right input is a bare orders relation.
+        check(sj && sj->child_count() == 2 &&
+                  find_scan(sj->child(1), "orders") != nullptr, "right is orders relation");
+    });
+}
+
+// A local (uncorrelated) WHERE inside the IN subquery is preserved as a Filter on
+// the right input, below the SemiJoin.
+void test_decorrelate_in_local_filter(const InMemoryCatalog& cat) {
+    std::printf("[test] WHERE id IN (SELECT user_id FROM orders WHERE total > 10)  ->  SemiJoin over Filter\n");
+    with_optimized_plan(
+        cat,
+        "SELECT id FROM users WHERE id IN "
+        "(SELECT user_id FROM orders WHERE orders.total > 10)",
+        [](const LogicalNode* root) {
+        const LogicalNode* sj = only_child(root);
+        check(sj && sj->op == LogicalOp::SemiJoin, "child is a SemiJoin");
+        if (sj && sj->child_count() == 2) {
+            check(sj->child(1)->op == LogicalOp::Filter, "right input keeps the local Filter");
+            check(find_scan(sj->child(1), "orders") != nullptr, "Filter is over orders");
+        }
+    });
+}
+
+// NOT IN over a NULLABLE projected column must stay a represented subquery: an
+// AntiJoin would change results under SQL's three-valued NOT IN semantics.
+void test_no_decorrelate_not_in_nullable(const InMemoryCatalog& cat) {
+    std::printf("[test] WHERE id NOT IN (SELECT user_id FROM orders)  (nullable -> left as-is)\n");
+    with_optimized_plan(
+        cat, "SELECT id FROM users WHERE id NOT IN (SELECT user_id FROM orders)",
+        [](const LogicalNode* root) {
+        const LogicalNode* child = only_child(root);
+        check(child && child->op == LogicalOp::Filter,
+              "child is still a Filter (nullable NOT IN not decorrelated)");
+        check(child && child->predicate &&
+                  child->predicate->kind == ExprKind::Subquery,
+              "the NOT IN predicate is left as a represented Subquery");
+    });
+}
+
+// NOT IN where BOTH the probe value and the projected column are NOT NULL is
+// sound to turn into an AntiJoin.
+void test_decorrelate_not_in_not_null(const InMemoryCatalog& cat) {
+    std::printf("[test] WHERE id NOT IN (SELECT id FROM orders)  (not-null -> AntiJoin)\n");
+    with_optimized_plan(
+        cat, "SELECT id FROM users WHERE id NOT IN (SELECT id FROM orders)",
+        [](const LogicalNode* root) {
+        const LogicalNode* aj = only_child(root);
+        check(aj && aj->op == LogicalOp::AntiJoin, "child is an AntiJoin");
+        check(aj && aj->predicate && aj->predicate->kind == ExprKind::BinaryOp &&
+                  aj->predicate->bin_op == db25::ast::BinaryOp::Equal,
+              "condition is the IN equality");
+    });
+}
+
 // A shape that is not handled (a scalar subquery in the SELECT list) is left as
 // a represented subquery, not rewritten.
 void test_no_decorrelate_scalar_subquery(const InMemoryCatalog& cat) {
@@ -602,6 +691,11 @@ int main() {
     test_decorrelate_not_exists(cat);
     test_decorrelate_exists_uncorrelated(cat);
     test_no_decorrelate_skip_level_correlation(cat);
+    test_decorrelate_in_uncorrelated(cat);
+    test_decorrelate_in_correlated(cat);
+    test_decorrelate_in_local_filter(cat);
+    test_no_decorrelate_not_in_nullable(cat);
+    test_decorrelate_not_in_not_null(cat);
     test_no_decorrelate_scalar_subquery(cat);
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
