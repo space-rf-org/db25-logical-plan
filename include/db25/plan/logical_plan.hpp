@@ -91,6 +91,14 @@ struct SortKeyIR {
     bool nulls_first = false;            // meaningful when nulls_order_explicit
 };
 
+// One UPDATE SET assignment, owned. `target_column_id` is the catalog column id
+// of the assignment target; `value` is the lowered RHS expression (lowered
+// against the rows being updated, so `SET x = x + 1` resolves the read of x).
+struct Assignment {
+    std::uint32_t target_column_id = 0;
+    ExprPtr value;
+};
+
 struct LogicalNode;  // forward declaration for SubPlan
 
 // How a subquery is used in the expression that owns it.
@@ -170,9 +178,9 @@ struct LogicalNode {
     std::vector<SortKeyIR> sort_keys;   // ORDER BY keys, in order
 
     // --- Values payload ---
-    // Each row is a list of borrowed value expressions. A FROM-less SELECT is
+    // Each row is a list of owned value expressions. A FROM-less SELECT is
     // lowered over a single empty row (one row, zero columns).
-    std::vector<std::vector<const ast::ASTNode*>> value_rows;
+    std::vector<std::vector<ExprPtr>> value_rows;
 
     // --- Limit payload ---
     bool has_limit = false;
@@ -186,11 +194,10 @@ struct LogicalNode {
     // --- DML payload (Insert / Update / Delete) ---
     // The target relation name is carried in `table_name`. For INSERT,
     // `target_columns` is the explicit target column list (empty = all columns
-    // in declaration order). For UPDATE, `assignments` holds the borrowed SET
-    // assignment nodes (each a BinaryExpr whose primary_text is the target
-    // column and whose first child is the value expression).
+    // in declaration order). For UPDATE, `assignments` holds the owned SET
+    // assignments (each a target column id plus a lowered value expression).
     std::vector<std::string> target_columns;
-    std::vector<const ast::ASTNode*> assignments;
+    std::vector<Assignment> assignments;
 
     explicit LogicalNode(LogicalOp o) : op(o) {}
 

@@ -863,11 +863,18 @@ LogicalNodePtr Binder::bind_insert(const ASTNode* insert_stmt, std::string& erro
     // Source of rows: a VALUES clause or a query (INSERT ... SELECT / set op).
     if (const ASTNode* values = find_child(insert_stmt, NodeType::ValuesClause)) {
         auto vnode = make_node(LogicalOp::Values);
+        // VALUES rows are constant expressions with no column references, so
+        // they lower against an empty input schema.
+        const Schema no_input;
         for (const ASTNode* row = first_child(values); row != nullptr;
              row = row->next_sibling) {
-            std::vector<const ASTNode*> vals;
+            std::vector<ExprPtr> vals;
             for (const ASTNode* v = first_child(row); v != nullptr; v = v->next_sibling) {
-                vals.push_back(v);
+                auto e = lower_expr(v, no_input, error);
+                if (!e) {
+                    return nullptr;
+                }
+                vals.push_back(std::move(e));
             }
             vnode->value_rows.push_back(std::move(vals));
         }
@@ -922,13 +929,26 @@ LogicalNodePtr Binder::bind_update(const ASTNode* update_stmt, std::string& erro
 
     auto node = make_node(LogicalOp::Update);
     node->table_name = std::string{table_ref->primary_text};
-    // SET assignments: each a BinaryExpr (primary_text = target column, first
-    // child = value expression). Kept borrowed; deeper checking is the
-    // analyzer's job. TODO: model the post-update output columns.
+    // SET assignments: each a BinaryExpr whose primary_text is the target column
+    // and whose first child is the value expression. Lower to an owned
+    // Assignment{target column id, value}; the value lowers against the rows
+    // being updated (child->output), so `SET x = x + 1` resolves the read of x.
+    const TableInfo* target = catalog_.find_table(node->table_name);
     if (const ASTNode* set_clause = find_child(update_stmt, NodeType::SetClause)) {
         for (const ASTNode* asgn = first_child(set_clause); asgn != nullptr;
              asgn = asgn->next_sibling) {
-            node->assignments.push_back(asgn);
+            Assignment assignment;
+            const std::string_view col = split_column_ref(asgn->primary_text).column;
+            if (target != nullptr) {
+                if (const auto* ci = target->find_column(col)) {
+                    assignment.target_column_id = ci->column_id;
+                }
+            }
+            assignment.value = lower_expr(first_child(asgn), child->output, error);
+            if (!assignment.value) {
+                return nullptr;
+            }
+            node->assignments.push_back(std::move(assignment));
         }
     }
     node->add_child(std::move(child));

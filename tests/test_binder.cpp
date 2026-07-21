@@ -490,6 +490,12 @@ void test_select_no_from_const(const InMemoryCatalog& cat) {
         const LogicalNode* values = only_child(root);
         check(values && values->op == LogicalOp::Values, "child is Values");
         check(values && values->value_rows.size() == 1, "one synthetic row");
+        check(values && values->value_rows.size() == 1 && values->value_rows[0].empty(),
+              "synthetic row has zero columns");
+        // The projected `1 + 2` computes over the empty Values row.
+        check(root->exprs.size() == 1 && root->exprs[0] &&
+                  root->exprs[0]->kind == ExprKind::BinaryOp,
+              "projection is the 1+2 BinaryOp");
         check(root->output.size() == 1, "one output col");
         if (root->output.size() == 1) {
             expect_col(root->output[0], "s", DataType::Integer, false, "const");
@@ -658,6 +664,13 @@ void test_insert_values(const InMemoryCatalog& cat) {
         check(src && src->value_rows.size() == 2, "2 value rows");
         if (src && src->value_rows.size() == 2) {
             check(src->value_rows[0].size() == 2, "row 0 has 2 values");
+            // Each VALUES entry lowers to an owned typed literal.
+            if (src->value_rows[0].size() == 2) {
+                check(src->value_rows[0][0] && src->value_rows[0][0]->kind == ExprKind::Literal,
+                      "row0 col0 is a Literal");
+                check(src->value_rows[0][1] && src->value_rows[0][1]->kind == ExprKind::Literal,
+                      "row0 col1 is a Literal");
+            }
         }
     });
 }
@@ -681,6 +694,13 @@ void test_update(const InMemoryCatalog& cat) {
         check(root->op == LogicalOp::Update, "root is Update");
         check(root->table_name == "users", "target users");
         check(root->assignments.size() == 1, "1 SET assignment");
+        if (root->assignments.size() == 1) {
+            // SET name = 'x' -> target column id 2 (users.name), owned literal value.
+            check(root->assignments[0].target_column_id == 2, "assigns column id 2 (name)");
+            check(root->assignments[0].value &&
+                      root->assignments[0].value->kind == ExprKind::Literal,
+                  "assignment value is a Literal");
+        }
         const LogicalNode* filter = only_child(root);
         check(filter && filter->op == LogicalOp::Filter, "child is Filter");
         check(filter && filter->predicate != nullptr, "filter has predicate");

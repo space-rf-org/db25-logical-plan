@@ -107,12 +107,8 @@ struct WindowSpecIR {
     FrameIR frame;
 };
 
-// One UPDATE SET assignment, owned. `target_column_id` is the catalog column id
-// of the assignment target; `value` is the lowered RHS expression.
-struct Assignment {
-    std::uint32_t target_column_id = 0;
-    ExprPtr value;
-};
+// Assignment (one owned UPDATE SET assignment) is defined in logical_plan.hpp
+// alongside the other operator-payload helper structs it lives in.
 
 // A single owned, typed expression node. `kind` selects which payload fields
 // are meaningful (union-by-convention, the same discipline LogicalNode uses).
