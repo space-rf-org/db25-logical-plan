@@ -17,6 +17,10 @@
 //   * boolean simplification - apply the AND / OR identities with a boolean
 //     literal operand and eliminate double negation (`NOT (NOT x)` -> x). Runs
 //     after folding so a folded `1 = 1` -> `true` feeds these identities.
+//   * predicate pushdown - split a Filter's conjuncts and push each below an
+//     INNER / CROSS Join to the side whose columns it references (remapping the
+//     positional slots), merge adjacent Filters, and drop a Filter whose
+//     predicate simplified to constant `true`.
 //
 // The build matches the rest of the stack: C++23, -fno-exceptions.
 
@@ -44,5 +48,15 @@ void fold_constants(LogicalNode* node);
 // including when x is NULL), and `NOT (NOT x)`->x, throughout `node` and its
 // children (including embedded subquery sub-plans). In place.
 void simplify_booleans(LogicalNode* node);
+
+// Predicate pushdown: for a Filter over an INNER / CROSS Join, split the
+// predicate into conjuncts and push each conjunct that references only one
+// join input down into that input (remapping right-side positional column
+// slots by the left input's width); conjuncts spanning both sides, or carrying
+// a subquery / outer reference, stay above the Join. Also merges a Filter
+// directly over a Filter and removes a Filter whose predicate is constant
+// `true`. Takes `node` by owning reference because a pushed-empty Filter is
+// replaced by its child. Recurses children and embedded subquery sub-plans.
+void push_down_filters(LogicalNodePtr& node);
 
 }  // namespace db25::plan
