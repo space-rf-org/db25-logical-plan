@@ -29,8 +29,12 @@
 //     [NOT] EXISTS or a `x [NOT] IN (subquery)` into a Semi / Anti join,
 //     hoisting a correlated subquery's correlation predicate (and, for IN, the
 //     IN equality) into the join condition. NOT IN is only turned into an
-//     AntiJoin when neither side can be NULL. Handled shapes only; anything else
-//     is left as a represented subquery (still correct).
+//     AntiJoin when neither side can be NULL. Additionally, a correlated
+//     aggregate scalar subquery in a Project is rewritten to a LEFT JOIN against
+//     the inner relation grouped by the correlation key (the aggregate computed
+//     per group), with the subquery expression replaced by the joined column.
+//     Handled shapes only; anything else is left as a represented subquery
+//     (still correct).
 //
 // The build matches the rest of the stack: C++23, -fno-exceptions.
 
@@ -86,6 +90,15 @@ void prune_columns(LogicalNodePtr& node);
 // input. Positive IN is always safe to make a SemiJoin (in a Filter, FALSE and
 // UNKNOWN both drop the row); NOT IN is only turned into an AntiJoin when both
 // the probe value and the projected column are provably NOT NULL.
+//
+// A correlated aggregate scalar subquery in a Project (e.g.
+// `SELECT u.id, (SELECT SUM(o.x) FROM o WHERE o.k = u.k) FROM u`) is instead
+// rewritten to a LEFT JOIN whose left input is the Project's child and whose
+// right input is the inner relation grouped by the correlation key with the
+// aggregate computed per group; the subquery expression is replaced by a
+// ColumnRef to that per-group aggregate. Only aggregates whose value over the
+// empty set is NULL (SUM / MIN / MAX / AVG) are handled, so a non-matching outer
+// row's LEFT-JOIN NULL reproduces the scalar result; COUNT is left represented.
 //
 // Any shape not matching this is left untouched as a represented subquery, so
 // the rewrite is always either a valid decorrelation or a no-op. Takes `node` by
