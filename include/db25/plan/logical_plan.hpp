@@ -80,10 +80,12 @@ struct ColumnSchema {
 
 using Schema = std::vector<ColumnSchema>;
 
-// One ORDER BY key on a Sort node: a borrowed sort expression plus its
-// direction and (optional) NULLS placement, decoded from the parser's flags.
-struct SortKey {
-    const ast::ASTNode* expr = nullptr;  // borrowed ORDER BY expression
+// One ORDER BY key on a Sort node (or an OVER (...) window clause): an owned,
+// typed sort expression plus its direction and (optional) NULLS placement,
+// decoded from the parser's flags. Defined here (rather than in expr_ir.hpp)
+// so both the Sort payload and WindowSpecIR can share it.
+struct SortKeyIR {
+    ExprPtr expr;                        // owned ORDER BY expression
     bool descending = false;             // ASC (false) / DESC (true)
     bool nulls_order_explicit = false;   // whether NULLS FIRST/LAST was written
     bool nulls_first = false;            // meaningful when nulls_order_explicit
@@ -165,7 +167,7 @@ struct LogicalNode {
     std::vector<SubPlan> subplans;
 
     // --- Sort payload ---
-    std::vector<SortKey> sort_keys;   // ORDER BY keys, in order
+    std::vector<SortKeyIR> sort_keys;   // ORDER BY keys, in order
 
     // --- Values payload ---
     // Each row is a list of borrowed value expressions. A FROM-less SELECT is

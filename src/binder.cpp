@@ -730,19 +730,86 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
     // --- ORDER BY -> Sort (real sort keys + directions) ---
     if (order_by != nullptr) {
         auto sort = make_node(LogicalOp::Sort);
-        // Each ORDER BY child is a sort expression; the parser records ASC/DESC
-        // and NULLS placement in its semantic_flags (bit 7 = DESC, bit 5 = NULLS
-        // ordering explicit, bit 4 = NULLS FIRST).
+        LogicalNode* input_node = current.get();  // the Project or Distinct below
+        const bool over_distinct = input_node->op == LogicalOp::Distinct;
+        // The Sort's visible output is its input's current output (the projected,
+        // possibly de-duplicated columns), captured before any hidden sort-only
+        // columns are appended below.
+        const Schema visible = input_node->output;
+        // A non-DISTINCT query may ORDER BY an expression that is not a selected
+        // output column (e.g. `SELECT id ... ORDER BY name`). Such a key is
+        // computed as a HIDDEN sort-only column appended to the Project (lowered
+        // against the Project's input); the Sort orders by it and then drops it
+        // from its output. Under DISTINCT this is illegal - SQL requires ORDER BY
+        // items to appear in the select list - so it is rejected rather than
+        // adding a column below the Distinct (which would change de-duplication).
+        LogicalNode* project = over_distinct ? nullptr : input_node;
+        const Schema* proj_input =
+            (project != nullptr && project->child_count() > 0)
+                ? &project->child(0)->output
+                : nullptr;
+
+        // The parser records ASC/DESC and NULLS placement in each key's
+        // semantic_flags (bit 7 = DESC, bit 5 = NULLS ordering explicit, bit 4 =
+        // NULLS FIRST).
         for (const ASTNode* key = first_child(order_by); key != nullptr;
              key = key->next_sibling) {
-            SortKey sk;
-            sk.expr = key;
+            SortKeyIR sk;
             sk.descending = (key->semantic_flags & (1u << 7)) != 0;
             sk.nulls_order_explicit = (key->semantic_flags & (1u << 5)) != 0;
             sk.nulls_first = (key->semantic_flags & (1u << 4)) != 0;
-            sort->sort_keys.push_back(sk);
+
+            std::int64_t ordinal = 0;
+            if (key->node_type == NodeType::IntegerLiteral &&
+                parse_int_literal(key, ordinal)) {
+                // ORDER BY <ordinal>: the N-th visible output column.
+                if (ordinal < 1 ||
+                    static_cast<std::size_t>(ordinal) > visible.size()) {
+                    error = "ORDER BY ordinal " + std::to_string(ordinal) + " out of range";
+                    return nullptr;
+                }
+                sk.expr = make_column_ref(static_cast<std::uint32_t>(ordinal - 1),
+                                          visible[static_cast<std::size_t>(ordinal - 1)]);
+                sort->sort_keys.push_back(std::move(sk));
+                continue;
+            }
+
+            // Resolve against the input's current output (a selected column, an
+            // output alias, or a prior hidden sort column already appended).
+            std::string local_error;
+            if (auto e = lower_expr(key, input_node->output, local_error)) {
+                sk.expr = std::move(e);
+                sort->sort_keys.push_back(std::move(sk));
+                continue;
+            }
+            // Not a visible output column: append a hidden sort column (or reject
+            // under DISTINCT).
+            if (over_distinct || proj_input == nullptr) {
+                error = "ORDER BY item must appear in the SELECT list (DISTINCT): " +
+                        local_error;
+                return nullptr;
+            }
+            auto hidden = lower_expr(key, *proj_input, error);
+            if (!hidden) {
+                return nullptr;
+            }
+            ColumnSchema hcol;
+            hcol.name = item_output_name(key);
+            hcol.type = hidden->type;
+            hcol.nullable = hidden->nullability != 1;
+            // Carry the source column's provenance (a plain base-column key) so a
+            // repeated ORDER BY of the same column resolves against this hidden
+            // slot by id next time instead of appending a duplicate.
+            hcol.table_id = hidden->ref_table_id;
+            hcol.column_id = hidden->ref_column_id;
+            project->output.push_back(hcol);
+            project->exprs.push_back(std::move(hidden));
+            sk.expr = make_column_ref(
+                static_cast<std::uint32_t>(project->output.size() - 1),
+                project->output.back());
+            sort->sort_keys.push_back(std::move(sk));
         }
-        sort->output = current->output;  // sort is schema-preserving
+        sort->output = visible;  // the Sort drops any hidden sort columns
         sort->add_child(std::move(current));
         current = std::move(sort);
     }

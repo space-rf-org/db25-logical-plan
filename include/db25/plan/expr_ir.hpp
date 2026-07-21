@@ -90,14 +90,8 @@ struct LiteralValue {
     }
 };
 
-// One ORDER BY key, owned. The owned counterpart of logical_plan.hpp's borrowed
-// SortKey (kept as a distinct type during the incremental migration).
-struct SortKeyIR {
-    ExprPtr expr;
-    bool descending = false;            // ASC (false) / DESC (true)
-    bool nulls_order_explicit = false;  // whether NULLS FIRST/LAST was written
-    bool nulls_first = false;           // meaningful when nulls_order_explicit
-};
+// SortKeyIR (one owned ORDER BY key) is defined in logical_plan.hpp so it can be
+// shared by the Sort operator payload and the window OVER clause below.
 
 // A window frame specification (ROWS/RANGE ... ). Kept as best-effort text for
 // now; the frame is not semantically consumed at this layer yet.

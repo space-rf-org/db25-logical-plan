@@ -383,14 +383,18 @@ void test_order_by(const InMemoryCatalog& cat) {
         check(root->op == LogicalOp::Sort, "root is Sort");
         check(root->sort_keys.size() == 2, "sort has 2 keys");
         if (root->sort_keys.size() == 2) {
+            // Both keys are selected columns -> positional refs into the output
+            // (name #1 DESC, id #0 ASC), no hidden sort column needed.
             check(root->sort_keys[0].descending, "key[0] DESC (name)");
-            check(root->sort_keys[0].expr != nullptr, "key[0] has expr");
+            expect_col_ref(root->sort_keys[0].expr, 1, "key[0] -> name #1");
             check(!root->sort_keys[1].descending, "key[1] ASC (id)");
+            expect_col_ref(root->sort_keys[1].expr, 0, "key[1] -> id #0");
         }
-        // Sort is schema-preserving: same output as its Project child.
+        // Sort is schema-preserving here: same output as its Project child.
         check(root->output.size() == 2, "sort preserves 2 cols");
         const LogicalNode* project = only_child(root);
         check(project && project->op == LogicalOp::Project, "child is Project");
+        check(project && project->exprs.size() == 2, "no hidden sort column added");
     });
 }
 
@@ -405,7 +409,74 @@ void test_order_by_nulls(const InMemoryCatalog& cat) {
             check(root->sort_keys[0].nulls_order_explicit, "NULLS explicit");
             check(root->sort_keys[0].nulls_first, "NULLS FIRST");
         }
+        // ORDER BY a NON-selected column (name): the Project is extended with a
+        // hidden sort column [id, name], the sort key references it at #1, and
+        // the Sort drops it so the visible output is just [id].
+        check(root->output.size() == 1, "sort output is visible [id] only");
+        if (root->sort_keys.size() == 1) {
+            expect_col_ref(root->sort_keys[0].expr, 1, "sort key -> hidden name #1");
+        }
+        const LogicalNode* project = only_child(root);
+        check(project && project->op == LogicalOp::Project, "child is Project");
+        check(project && project->output.size() == 2, "Project extended to [id, name]");
+        check(project && project->exprs.size() == 2, "Project has hidden sort expr");
+        if (project && project->output.size() == 2) {
+            expect_col(project->output[1], "name", DataType::VarChar, true, "hidden col");
+            expect_col_ref(project->exprs[1], 1, "hidden expr -> scan name #1");
+        }
     });
+}
+
+// ORDER BY by output ordinal (`ORDER BY 1`) references the N-th visible column.
+void test_order_by_ordinal(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id, name FROM users ORDER BY 2 DESC\n");
+    with_plan(cat, "SELECT id, name FROM users ORDER BY 2 DESC",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Sort, "root is Sort");
+        check(root->sort_keys.size() == 1, "1 sort key");
+        if (root->sort_keys.size() == 1) {
+            check(root->sort_keys[0].descending, "DESC");
+            // ORDER BY 2 -> the 2nd output column (name), a ref to #1.
+            expect_col_ref(root->sort_keys[0].expr, 1, "ordinal 2 -> name #1");
+        }
+    });
+}
+
+// A non-selected column repeated in ORDER BY reuses a single hidden sort column
+// (the hidden column carries the source column's provenance ids, so the second
+// key resolves against it rather than appending a duplicate).
+void test_order_by_repeated_hidden_dedup(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id FROM users ORDER BY name, name\n");
+    with_plan(cat, "SELECT id FROM users ORDER BY name, name",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Sort, "root is Sort");
+        check(root->sort_keys.size() == 2, "2 sort keys");
+        const LogicalNode* project = only_child(root);
+        // One hidden column added, not two: Project is [id, name] (2 cols).
+        check(project && project->output.size() == 2, "single hidden column reused");
+        if (root->sort_keys.size() == 2) {
+            expect_col_ref(root->sort_keys[0].expr, 1, "key[0] -> hidden name #1");
+            expect_col_ref(root->sort_keys[1].expr, 1, "key[1] -> same hidden #1");
+        }
+    });
+}
+
+// SELECT DISTINCT ... ORDER BY <non-selected column> is illegal: the sort item
+// must appear in the select list, so the bind fails cleanly (no hidden column
+// is added below the Distinct, which would change de-duplication).
+void test_order_by_distinct_nonoutput_rejected(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT DISTINCT id FROM users ORDER BY name (rejected)\n");
+    db25::parser::Parser parser;
+    auto parsed = parser.parse("SELECT DISTINCT id FROM users ORDER BY name");
+    check(parsed.has_value(), "parse DISTINCT+ORDER BY");
+    if (!parsed) {
+        return;
+    }
+    Analyzer analyzer(cat);
+    analyzer.analyze(parsed.value());
+    Binder binder(analyzer, cat);
+    BindResult res = binder.bind(parsed.value());
+    check(!res.ok, "bind rejects ORDER BY of a non-selected column under DISTINCT");
 }
 
 // -------------------------------------------------------------------------
@@ -895,6 +966,9 @@ int main() {
     test_select_star(cat);
     test_order_by(cat);
     test_order_by_nulls(cat);
+    test_order_by_ordinal(cat);
+    test_order_by_repeated_hidden_dedup(cat);
+    test_order_by_distinct_nonoutput_rejected(cat);
     test_select_no_from_const(cat);
     test_select_no_from_func(cat);
     test_comma_join(cat);
