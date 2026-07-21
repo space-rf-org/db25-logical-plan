@@ -785,6 +785,23 @@ bool expr_has_outer_ref(const Expr& e) {
     return false;
 }
 
+// True if `e` embeds any represented Subquery (at any depth in its operand
+// tree). Used to keep the IN rewrite off expressions whose frame remap would
+// have to reach into a nested sub-plan.
+bool expr_has_subquery(const Expr& e) {
+    if (e.kind == ExprKind::Subquery) {
+        return true;
+    }
+    for (const auto& c : e.children) {
+        if (expr_has_subquery(*c)) return true;
+    }
+    if (e.kind == ExprKind::WindowFunction) {
+        for (const auto& p : e.window.partition_by) if (expr_has_subquery(*p)) return true;
+        for (const auto& k : e.window.order_by) if (expr_has_subquery(*k.expr)) return true;
+    }
+    return false;
+}
+
 bool subtree_has_outer_ref(const LogicalNode* node) {
     if (node == nullptr) {
         return false;
@@ -936,6 +953,128 @@ void try_decorrelate_exists_filter(LogicalNodePtr& filter_node) {
     filter_node = std::move(join);
 }
 
+// True only if `op` is provably NOT NULL. A ColumnRef is judged by its column's
+// schema nullability (the authoritative source); any other expression falls back
+// to its baked 2-bit nullability (1 == not-null). Conservative: an "unknown"
+// nullability answers false.
+bool operand_not_null(const Expr& op, const Schema& left_schema) {
+    if (op.kind == ExprKind::ColumnRef && op.input_index < left_schema.size()) {
+        return !left_schema[op.input_index].nullable;
+    }
+    return op.nullability == 1;
+}
+
+// If `filter_node` is a Filter whose entire predicate is a `x [NOT] IN (subquery)`
+// of a handled shape, replace it with a Semi / Anti join whose condition is the
+// IN equality `x = <the subquery's projected column>` conjoined with any hoisted
+// correlation. Otherwise leaves it unchanged (the subquery stays represented).
+//
+// Positive IN is rewritten to a SemiJoin unconditionally: in a Filter, a row is
+// kept only when the predicate is TRUE, so the SQL distinction between IN being
+// FALSE and being UNKNOWN (an unmatched value, a NULL on either side) collapses -
+// both drop the row, exactly as an equi-SemiJoin does.
+//
+// NOT IN is rewritten to an AntiJoin ONLY when both the probe value and the
+// subquery's projected column are provably NOT NULL. With a NULL anywhere, SQL
+// NOT IN yields UNKNOWN (never TRUE) rather than the AntiJoin's "no match -> keep",
+// so a nullable side is left as a represented subquery.
+void try_decorrelate_in_filter(LogicalNodePtr& filter_node) {
+    Expr* subq = filter_node->predicate.get();
+    if (!subq->sub_plan || subq->children.empty()) {
+        return;  // need both the inner plan and the probe value (children[0]).
+    }
+    // Only `Project(1 column) -> [Filter] -> relation` is handled. A row-valued
+    // IN (multiple projected columns) or a set operation is left as a subquery.
+    LogicalNode* proj = subq->sub_plan.get();
+    if (proj->op != LogicalOp::Project || proj->child_count() != 1 ||
+        proj->exprs.size() != 1 || !proj->exprs[0]) {
+        return;
+    }
+    const Expr* projected = proj->exprs[0].get();
+    if (expr_has_outer_ref(*projected) || expr_has_subquery(*projected)) {
+        return;  // the projected value must map cleanly into the right frame.
+    }
+
+    const bool is_anti = subq->negated();
+    LogicalNode* below = proj->child(0);
+
+    // ---- Gate (no mutation) ----
+    const bool correlated = subtree_has_outer_ref(proj);
+    if (correlated) {
+        // Correlation must live entirely in a single top Filter of hoistable
+        // depth-1 comparisons (mirrors the EXISTS contract).
+        if (below->op != LogicalOp::Filter || !below->predicate ||
+            below->child_count() != 1) {
+            return;
+        }
+        if (subtree_has_outer_ref(below->child(0))) {
+            return;  // correlation reaches below the top Filter.
+        }
+        if (!correlation_hoistable(*below->predicate)) {
+            return;  // a correlation conjunct is not hoistable (deep ref / subquery).
+        }
+    }
+    if (is_anti) {
+        // AntiJoin is only NOT-IN-equivalent when neither side can be NULL.
+        if (!operand_not_null(*subq->children[0], filter_node->child(0)->output) ||
+            proj->output.empty() || proj->output[0].nullable) {
+            return;
+        }
+    }
+
+    // ---- Commit (gate passed, no further bail) ----
+    const auto left_width =
+        static_cast<std::uint32_t>(filter_node->child(0)->output.size());
+
+    LogicalNodePtr proj_owned = std::move(subq->sub_plan);
+    ExprPtr probe = std::move(subq->children[0]);          // left frame, no remap
+    ExprPtr projected_owned = std::move(proj_owned->exprs[0]);
+    rewrite_correlation(*projected_owned, left_width);      // shift into the right frame
+
+    auto in_eq = std::make_unique<Expr>(ExprKind::BinaryOp);
+    in_eq->bin_op = BinaryOp::Equal;
+    in_eq->type = ast::DataType::Boolean;
+    in_eq->children.push_back(std::move(probe));
+    in_eq->children.push_back(std::move(projected_owned));
+
+    std::vector<ExprPtr> join_conjuncts;
+    join_conjuncts.push_back(std::move(in_eq));
+
+    LogicalNodePtr below_owned = std::move(proj_owned->children[0]);
+    LogicalNodePtr right;
+    if (below_owned->op == LogicalOp::Filter && below_owned->predicate &&
+        below_owned->child_count() == 1) {
+        std::vector<ExprPtr> conjuncts;
+        collect_conjuncts(std::move(below_owned->predicate), conjuncts);
+        std::vector<ExprPtr> local;
+        for (auto& c : conjuncts) {
+            if (expr_has_outer_ref(*c)) {
+                rewrite_correlation(*c, left_width);
+                join_conjuncts.push_back(std::move(c));
+            } else {
+                local.push_back(std::move(c));
+            }
+        }
+        if (local.empty()) {
+            right = std::move(below_owned->children[0]);  // drop the now-empty Filter
+        } else {
+            below_owned->predicate = combine_conjuncts(local);
+            right = std::move(below_owned);
+        }
+    } else {
+        right = std::move(below_owned);
+    }
+
+    LogicalNodePtr left = std::move(filter_node->children[0]);
+    auto join = std::make_unique<LogicalNode>(is_anti ? LogicalOp::AntiJoin
+                                                      : LogicalOp::SemiJoin);
+    join->output = left->output;  // semi / anti join produces only the left schema
+    join->predicate = combine_conjuncts(join_conjuncts);
+    join->add_child(std::move(left));
+    join->add_child(std::move(right));
+    filter_node = std::move(join);
+}
+
 void decorrelate_node(LogicalNodePtr& node);
 
 // Recurse decorrelation into every embedded subquery sub-plan of an expression.
@@ -965,9 +1104,12 @@ void decorrelate_node(LogicalNodePtr& node) {
     for_each_payload_expr(node.get(), [](ExprPtr& e) { decorrelate_in_expr(e); });
 
     if (node->op == LogicalOp::Filter && node->child_count() == 1 && node->predicate &&
-        node->predicate->kind == ExprKind::Subquery &&
-        node->predicate->subquery_kind == SubqueryKind::Exists) {
-        try_decorrelate_exists_filter(node);
+        node->predicate->kind == ExprKind::Subquery) {
+        if (node->predicate->subquery_kind == SubqueryKind::Exists) {
+            try_decorrelate_exists_filter(node);
+        } else if (node->predicate->subquery_kind == SubqueryKind::In) {
+            try_decorrelate_in_filter(node);
+        }
     }
 }
 
