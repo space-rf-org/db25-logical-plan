@@ -865,6 +865,50 @@ void test_join_using_multi(const InMemoryCatalog& cat) {
     });
 }
 
+// `SELECT *` over a USING join projects the MERGED frame: the coalesced join
+// column once, then the remaining columns. The analyzer's projection lists the
+// un-merged columns (it does not model USING coalescing), so the binder trusts
+// the child's merged output schema here - otherwise the arity check rejected it.
+void test_select_star_over_using(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT * FROM users u JOIN orders o USING (id)\n");
+    with_plan(cat, "SELECT * FROM users u JOIN orders o USING (id)",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        // users(id,name) ++ orders(id,user_id,total) with id merged -> 4 columns.
+        check(root->output.size() == 4, "star over USING -> 4 merged cols");
+        if (root->output.size() == 4) {
+            check(root->output[0].name == "id", "col0 is the merged id");
+            check(root->output[1].name == "name", "col1 users.name");
+            check(root->output[2].name == "user_id", "col2 orders.user_id");
+            check(root->output[3].name == "total", "col3 orders.total");
+            int id_count = 0;
+            for (const auto& c : root->output) if (c.name == "id") ++id_count;
+            check(id_count == 1, "id appears exactly once (coalesced)");
+        }
+        check(root->exprs.size() == 4, "one column-ref per merged column");
+    });
+}
+
+// A QUALIFIED `t.*` over a join is NOT a whole-child star: it must resolve to
+// only t's columns. That table-scoped expansion is not yet lowered, so the bind
+// must fail CLEANLY rather than silently project the whole join frame. Guards
+// the bare-star fast path against swallowing a qualified star (whose qualifier
+// lives in the Star node's schema_name, not its primary_text "*").
+void test_qualified_star_over_join_rejected(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT u.* FROM users u JOIN orders o USING (id) (rejected)\n");
+    db25::parser::Parser parser;
+    auto parsed = parser.parse("SELECT u.* FROM users u JOIN orders o USING (id)");
+    check(parsed.has_value(), "parse qualified star over join");
+    if (!parsed) {
+        return;
+    }
+    Analyzer analyzer(cat);
+    analyzer.analyze(parsed.value());
+    Binder binder(analyzer, cat);
+    BindResult res = binder.bind(parsed.value());
+    check(!res.ok, "bind rejects qualified t.* over a join (not silently full frame)");
+}
+
 // -------------------------------------------------------------------------
 // Derived tables / subqueries in FROM.
 
@@ -1346,6 +1390,8 @@ int main() {
     test_cross_join(cat);
     test_join_using(cat);
     test_join_using_multi(cat);
+    test_select_star_over_using(cat);
+    test_qualified_star_over_join_rejected(cat);
     test_derived_table(cat);
     test_union(cat);
     test_union_all(cat);

@@ -775,8 +775,29 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
     }
 
     // --- SELECT list -> Project (authoritative output schema) ---
+    // A bare, unqualified `SELECT *` projects exactly the child's output columns.
+    // Over a USING / NATURAL join the child output is the merged frame (the join
+    // column coalesced to one), which the analyzer's projection does not model -
+    // it lists the un-merged columns and so disagrees on arity with the star
+    // expansion. Trust the child schema for that case (it is what `*` covers, and
+    // equals the analyzer's projection for every non-merged input).
+    // A Star node stores its qualifier in schema_name / catalog_name (its
+    // primary_text is just "*"), so a qualified `t.*` must be excluded by those
+    // fields - it is NOT a whole-child star and keeps using the analyzer's
+    // projection (which correctly covers only t's columns; a qualified star over
+    // a join still hits the not-yet-lowered arity guard rather than binding to
+    // the full frame).
+    const ASTNode* only_item =
+        select_list != nullptr ? first_child(select_list) : nullptr;
+    const bool bare_star =
+        only_item != nullptr && only_item->next_sibling == nullptr &&
+        only_item->node_type == NodeType::Star &&
+        only_item->schema_name.empty() && only_item->catalog_name.empty();
+
     auto project = make_node(LogicalOp::Project);
-    if (const auto* proj = analyzer_.projection_of(select_stmt)) {
+    if (bare_star) {
+        project->output = current->output;
+    } else if (const auto* proj = analyzer_.projection_of(select_stmt)) {
         project->output.reserve(proj->size());
         for (const auto& c : *proj) {
             project->output.push_back(to_schema(c));
