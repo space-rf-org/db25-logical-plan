@@ -13,6 +13,7 @@
 #include "db25/semantic/catalog.hpp"
 
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -367,6 +368,63 @@ const LogicalNode* find_scan(const LogicalNode* n, std::string_view table) {
         }
     }
     return nullptr;
+}
+
+// First node of a given op anywhere in the tree (pre-order), or null.
+const LogicalNode* find_op(const LogicalNode* n, LogicalOp op) {
+    if (n == nullptr) {
+        return nullptr;
+    }
+    if (n->op == op) {
+        return n;
+    }
+    for (std::size_t i = 0; i < n->child_count(); ++i) {
+        if (const LogicalNode* r = find_op(n->child(i), op)) {
+            return r;
+        }
+    }
+    return nullptr;
+}
+
+// True if any Subquery Expr remains represented anywhere in the tree's payloads.
+bool any_represented_subquery(const LogicalNode* n) {
+    if (n == nullptr) {
+        return false;
+    }
+    bool found = false;
+    std::function<void(const Expr*)> scan = [&](const Expr* e) {
+        if (e == nullptr) return;
+        if (e->kind == ExprKind::Subquery) found = true;
+        for (const auto& c : e->children) scan(c.get());
+    };
+    if (n->predicate) scan(n->predicate.get());
+    for (const auto& e : n->exprs) scan(e.get());
+    for (const auto& e : n->aggregates) scan(e.get());
+    for (std::size_t i = 0; i < n->child_count(); ++i) {
+        if (any_represented_subquery(n->child(i))) found = true;
+    }
+    return found;
+}
+
+// A correlated EXISTS that is only ONE conjunct of a Filter over a join must
+// still decorrelate to a SemiJoin in a SINGLE optimize() pass - it must not
+// depend on a later pushdown isolating the subquery first (which made optimize()
+// non-idempotent). The local conjunct is preserved (pushed toward its scan).
+void test_decorrelate_exists_in_conjunction(const InMemoryCatalog& cat) {
+    std::printf("[test] WHERE local AND EXISTS (correlated) over a join -> SemiJoin (one pass)\n");
+    with_optimized_plan(
+        cat,
+        "SELECT e.dept FROM emp e JOIN orders o ON e.id = o.user_id "
+        "WHERE e.sal > 100 AND EXISTS (SELECT 1 FROM users u WHERE u.id = e.id)",
+        [](const LogicalNode* root) {
+        check(find_op(root, LogicalOp::SemiJoin) != nullptr,
+              "conjunctive EXISTS decorrelated to a SemiJoin in one pass");
+        check(!any_represented_subquery(root),
+              "no represented subquery remains (EXISTS fully decorrelated)");
+        // The local conjunct e.sal > 100 survives as a filter somewhere.
+        check(find_op(root, LogicalOp::Filter) != nullptr,
+              "the local conjunct e.sal > 100 is preserved as a Filter");
+    });
 }
 
 // A column read by nobody is dropped from the Scan.
@@ -834,7 +892,11 @@ void test_pushdown_through_semijoin() {
 }
 
 // optimize() must be idempotent: a filter over stacked joins is pushed all the
-// way to its base scan in ONE pass, so a second optimize() changes nothing.
+// way to its base scan in ONE pass, so a second optimize() changes nothing. The
+// EXISTS/IN cases also pin the conjunctive-subquery fix: a `local AND EXISTS`
+// filter over a join must decorrelate to a Semi/Anti join in the SAME pass (not
+// only after a later pushdown isolates the subquery), or optimize() would differ
+// between the first and second run.
 void test_optimize_idempotent(const InMemoryCatalog& cat) {
     std::printf("[test] optimize() is idempotent over stacked joins\n");
     const char* sqls[] = {
@@ -842,6 +904,12 @@ void test_optimize_idempotent(const InMemoryCatalog& cat) {
         "JOIN users u ON e.id = u.id WHERE e.sal > 100",
         "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id "
         "WHERE o.total > 5 AND u.id > 1",
+        // local conjunct AND correlated EXISTS, over a join.
+        "SELECT e.dept FROM emp e JOIN orders o ON e.id = o.user_id "
+        "WHERE e.sal > 100 AND EXISTS (SELECT 1 FROM users u WHERE u.id = e.id)",
+        // local conjunct AND IN-subquery, over a join.
+        "SELECT e.dept FROM emp e JOIN orders o ON e.id = o.user_id "
+        "WHERE e.sal > 100 AND e.id IN (SELECT id FROM users)",
     };
     for (const char* sql : sqls) {
         db25::parser::Parser parser;
@@ -892,6 +960,7 @@ int main() {
     test_using_join_not_corrupted(cat);
     test_distinct_keeps_all_columns(cat);
     test_decorrelate_exists(cat);
+    test_decorrelate_exists_in_conjunction(cat);
     test_decorrelate_not_exists(cat);
     test_decorrelate_exists_uncorrelated(cat);
     test_no_decorrelate_skip_level_correlation(cat);
