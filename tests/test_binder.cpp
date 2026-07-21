@@ -685,6 +685,62 @@ void test_join_using(const InMemoryCatalog& cat) {
             }
             check(id_count == 1, "single merged id column");
         }
+        // The USING equality must be materialized as the join predicate over the
+        // pre-merge (left ++ right) frame: users.id (slot 0) = orders.id
+        // (slot 2 = left_width 2 + 0). Without it the join is a silent cross
+        // product that merely *looks* right because the output schema is merged.
+        check(join && join->predicate != nullptr, "USING carries an equi-predicate");
+        if (join && join->predicate) {
+            const auto& p = *join->predicate;
+            check(p.kind == ExprKind::BinaryOp &&
+                      p.bin_op == db25::ast::BinaryOp::Equal,
+                  "USING predicate is an '=' BinaryOp");
+            if (p.kind == ExprKind::BinaryOp && p.children.size() == 2) {
+                check(p.children[0]->kind == ExprKind::ColumnRef &&
+                          p.children[0]->input_index == 0,
+                      "lhs is left.id (slot 0)");
+                check(p.children[1]->kind == ExprKind::ColumnRef &&
+                          p.children[1]->input_index == 2,
+                      "rhs is right.id (slot 2 = left_width + 0)");
+            }
+        }
+    });
+}
+
+void test_join_using_multi(const InMemoryCatalog& cat) {
+    std::printf("[test] users u1 JOIN users u2 USING (id, name)\n");
+    with_plan(cat, "SELECT u1.id FROM users u1 JOIN users u2 USING (id, name)",
+              [](const LogicalNode* root) {
+        const LogicalNode* join = only_child(root);
+        check(join && join->op == LogicalOp::Join, "child is Join");
+        // Both columns merge, so the right frame contributes nothing:
+        // output = left (id, name) = 2 cols.
+        check(join && join->output.size() == 2, "both cols merge -> 2 cols");
+        // Two USING columns AND-chain into a conjunction of two equalities over
+        // the pre-merge frame: (u1.id=u2.id) AND (u1.name=u2.name), with the
+        // right side at left_width (2) + its own slot.
+        check(join && join->predicate != nullptr, "multi-USING carries a predicate");
+        if (join && join->predicate) {
+            const auto& p = *join->predicate;
+            check(p.kind == ExprKind::BinaryOp &&
+                      p.bin_op == db25::ast::BinaryOp::And,
+                  "top predicate is AND of two equalities");
+            if (p.kind == ExprKind::BinaryOp && p.bin_op == db25::ast::BinaryOp::And &&
+                p.children.size() == 2) {
+                const auto& lhs = *p.children[0];  // id equality
+                const auto& rhs = *p.children[1];  // name equality
+                check(lhs.kind == ExprKind::BinaryOp &&
+                          lhs.bin_op == db25::ast::BinaryOp::Equal &&
+                          lhs.children[0]->input_index == 0 &&
+                          lhs.children[1]->input_index == 2,
+                      "id equality: 0 = 2");
+                check(rhs.kind == ExprKind::BinaryOp &&
+                          rhs.bin_op == db25::ast::BinaryOp::Equal &&
+                          rhs.children[0]->input_index == 1 &&
+                          rhs.children[1]->input_index == 3,
+                      "name equality: 1 = 3");
+            }
+        }
     });
 }
 
@@ -1164,6 +1220,7 @@ int main() {
     test_comma_join(cat);
     test_cross_join(cat);
     test_join_using(cat);
+    test_join_using_multi(cat);
     test_derived_table(cat);
     test_union(cat);
     test_union_all(cat);
