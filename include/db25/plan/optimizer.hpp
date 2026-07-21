@@ -22,9 +22,11 @@
 //     positional slots), merge adjacent Filters, and drop a Filter whose
 //     predicate simplified to constant `true`.
 //   * column pruning - drop columns that no operator above consumes, narrowing
-//     Scans and Projects and remapping the positional slots throughout. Conserv-
-//     ative around operators whose column flow is intricate (set operations,
-//     VALUES, DML) and around any operator carrying an embedded subquery.
+//     Scans and Projects and remapping the positional slots throughout. A semi /
+//     anti join's right input is pruned to just the columns its condition uses
+//     (the right side produces no output). Conservative around operators whose
+//     column flow is intricate (set operations, VALUES, DML) and around any
+//     operator carrying an embedded subquery.
 //   * subquery decorrelation - rewrite a Filter whose whole predicate is a
 //     [NOT] EXISTS or a `x [NOT] IN (subquery)` into a Semi / Anti join,
 //     hoisting a correlated subquery's correlation predicate (and, for IN, the
@@ -67,7 +69,9 @@ void simplify_booleans(LogicalNode* node);
 // data that flows through the plan. Scans and Projects shed unreferenced columns
 // outright; passthrough operators, Joins, and Aggregates keep only the columns
 // their consumers or their own expressions need, with every positional column
-// slot remapped to the compacted layout. The root's output is fully preserved
+// slot remapped to the compacted layout. A semi / anti join outputs only its
+// left schema, so its right input is kept only for the columns its condition
+// reads. The root's output is fully preserved
 // (it is the query result). Set operations, VALUES, DML, and any operator that
 // carries an embedded subquery are treated conservatively (their inputs are kept
 // intact) so a correlated outer reference can never lose the column it needs.
@@ -110,9 +114,12 @@ void decorrelate_exists(LogicalNodePtr& node);
 // predicate into conjuncts and push each conjunct that references only one
 // join input down into that input (remapping right-side positional column
 // slots by the left input's width); conjuncts spanning both sides, or carrying
-// a subquery / outer reference, stay above the Join. Also merges a Filter
-// directly over a Filter and removes a Filter whose predicate is constant
-// `true`. Takes `node` by owning reference because a pushed-empty Filter is
+// a subquery / outer reference, stay above the Join. A Filter over a Semi / Anti
+// join is pushed whole into the join's left input (the join outputs the left
+// schema, so every conjunct references left columns at the same indices, and
+// selecting the left before vs. after the existence test yields the same rows).
+// Also merges a Filter directly over a Filter and removes a Filter whose
+// predicate is constant `true`. Takes `node` by owning reference because a pushed-empty Filter is
 // replaced by its child. Recurses children and embedded subquery sub-plans.
 void push_down_filters(LogicalNodePtr& node);
 

@@ -479,7 +479,9 @@ void test_distinct_keeps_all_columns(const InMemoryCatalog& cat) {
 }
 
 // A correlated EXISTS filter becomes a SemiJoin whose condition is the hoisted
-// correlation (orders.user_id = users.id -> #3 = #0 in the left ++ right frame).
+// correlation orders.user_id = users.id. After column pruning the right input is
+// narrowed to just [user_id] and the left to [id], so in the pruned left ++ right
+// frame the condition is #1 (orders.user_id) = #0 (users.id).
 void test_decorrelate_exists(const InMemoryCatalog& cat) {
     std::printf("[test] WHERE EXISTS (correlated)  ->  SemiJoin\n");
     with_optimized_plan(
@@ -494,13 +496,16 @@ void test_decorrelate_exists(const InMemoryCatalog& cat) {
             check(sj->child(0)->op == LogicalOp::Scan &&
                       sj->child(0)->table_name == "users", "left is Scan users");
             check(find_scan(sj->child(1), "orders") != nullptr, "right is orders relation");
+            // Pruning narrowed the right (orders) input to only the join key.
+            check(sj->child(1)->output.size() == 1,
+                  "right input pruned to the single join-key column");
             check(sj->predicate && sj->predicate->kind == ExprKind::BinaryOp &&
                       sj->predicate->bin_op == db25::ast::BinaryOp::Equal,
                   "condition is the hoisted equality");
             if (sj->predicate && sj->predicate->children.size() == 2) {
-                check(sj->predicate->children[0]->input_index == 3 &&
+                check(sj->predicate->children[0]->input_index == 1 &&
                           sj->predicate->children[1]->input_index == 0,
-                      "condition is #3 (orders.user_id) = #0 (users.id)");
+                      "condition is #1 (orders.user_id) = #0 (users.id) after pruning");
             }
         }
         // The subquery is gone: no owned Subquery remains in the plan.
@@ -557,7 +562,9 @@ void test_no_decorrelate_skip_level_correlation(const InMemoryCatalog& cat) {
 }
 
 // x IN (uncorrelated subquery) becomes a SemiJoin on the IN equality
-// (users.id = orders.user_id -> #0 = #3 in the left ++ right frame).
+// users.id = orders.user_id. After pruning the right input is narrowed to just
+// [user_id], so in the pruned frame the condition is #0 (users.id) = #1
+// (orders.user_id).
 void test_decorrelate_in_uncorrelated(const InMemoryCatalog& cat) {
     std::printf("[test] WHERE id IN (SELECT user_id FROM orders)  ->  SemiJoin\n");
     with_optimized_plan(
@@ -570,8 +577,8 @@ void test_decorrelate_in_uncorrelated(const InMemoryCatalog& cat) {
               "condition is the IN equality");
         if (sj && sj->predicate && sj->predicate->children.size() == 2) {
             check(sj->predicate->children[0]->input_index == 0 &&
-                      sj->predicate->children[1]->input_index == 3,
-                  "condition is #0 (users.id) = #3 (orders.user_id)");
+                      sj->predicate->children[1]->input_index == 1,
+                  "condition is #0 (users.id) = #1 (orders.user_id) after pruning");
         }
     });
 }
@@ -749,6 +756,83 @@ void test_no_decorrelate_scalar_subquery(const InMemoryCatalog& cat) {
     });
 }
 
+// Column pruning treats a semi/anti join as non-opaque: its output is the left
+// schema, and the right input is needed only for the columns its condition uses.
+// A decorrelated IN over the full orders table keeps only [user_id] on the right.
+void test_prune_semijoin_inputs(const InMemoryCatalog& cat) {
+    std::printf("[test] SemiJoin right input pruned to the join key\n");
+    with_optimized_plan(
+        cat, "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders)",
+        [](const LogicalNode* root) {
+        const LogicalNode* sj = only_child(root);
+        check(sj && sj->op == LogicalOp::SemiJoin, "child is a SemiJoin");
+        if (sj && sj->child_count() == 2) {
+            const LogicalNode* r = find_scan(sj->child(1), "orders");
+            check(r && r->output.size() == 1,
+                  "orders (right) pruned to [user_id] only (was [id,user_id,total])");
+            check(sj->child(0)->op == LogicalOp::Scan && sj->child(0)->output.size() == 1,
+                  "users (left) pruned to [id] only");
+        }
+    });
+}
+
+// Predicate pushdown moves a whole Filter below a Semi / Anti join into its LEFT
+// input (every conjunct references only left columns, since the join outputs the
+// left schema). This shape is not produced by the current SQL front end, so it is
+// exercised with a hand-built plan.
+void test_pushdown_through_semijoin() {
+    std::printf("[test] Filter over SemiJoin -> filter pushed into the left input\n");
+    auto mkscan = [](const char* nm, db25::plan::Schema sch) {
+        auto s = std::make_unique<LogicalNode>(LogicalOp::Scan);
+        s->table_name = nm;
+        s->output = std::move(sch);
+        return s;
+    };
+    auto colref = [](std::uint32_t idx) {
+        auto e = std::make_unique<Expr>(ExprKind::ColumnRef);
+        e->input_index = idx;
+        e->type = DataType::Integer;
+        return e;
+    };
+    // SemiJoin( Scan A[a0,a1], Scan B[b0] ) ON #0 = #2
+    auto semi = std::make_unique<LogicalNode>(LogicalOp::SemiJoin);
+    auto left = mkscan("A", {{"a0", DataType::Integer, false, 0, 0},
+                             {"a1", DataType::Integer, true, 0, 0}});
+    auto right = mkscan("B", {{"b0", DataType::Integer, true, 0, 0}});
+    auto cond = std::make_unique<Expr>(ExprKind::BinaryOp);
+    cond->bin_op = db25::ast::BinaryOp::Equal;
+    cond->children.push_back(colref(0));
+    cond->children.push_back(colref(2));
+    semi->output = left->output;  // semi join output = left schema
+    semi->predicate = std::move(cond);
+    semi->add_child(std::move(left));
+    semi->add_child(std::move(right));
+    // Filter(#1 > 5) directly over the SemiJoin (a1 > 5, a left column).
+    auto flt = std::make_unique<LogicalNode>(LogicalOp::Filter);
+    auto gt = std::make_unique<Expr>(ExprKind::BinaryOp);
+    gt->bin_op = db25::ast::BinaryOp::GreaterThan;
+    auto five = std::make_unique<Expr>(ExprKind::Literal);
+    five->value.value = static_cast<std::int64_t>(5);
+    gt->children.push_back(colref(1));
+    gt->children.push_back(std::move(five));
+    flt->predicate = std::move(gt);
+    flt->output = semi->output;
+    flt->add_child(std::move(semi));
+
+    db25::plan::LogicalNodePtr root = std::move(flt);
+    db25::plan::push_down_filters(root);
+
+    check(root->op == LogicalOp::SemiJoin, "root is now the SemiJoin (filter no longer on top)");
+    if (root->op == LogicalOp::SemiJoin && root->child_count() == 2) {
+        check(root->child(0)->op == LogicalOp::Filter, "filter pushed into the LEFT input");
+        check(root->child(0)->child_count() == 1 &&
+                  root->child(0)->child(0)->table_name == "A",
+              "the pushed Filter now sits directly over left Scan A");
+        check(root->child(1)->op == LogicalOp::Scan && root->child(1)->table_name == "B",
+              "right input untouched");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -791,6 +875,8 @@ int main() {
     test_decorrelate_scalar_nested(cat);
     test_no_decorrelate_scalar_count(cat);
     test_no_decorrelate_scalar_subquery(cat);
+    test_prune_semijoin_inputs(cat);
+    test_pushdown_through_semijoin();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) {
