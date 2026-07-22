@@ -679,9 +679,147 @@ LogicalNodePtr Binder::bind_setop(const ASTNode* setop, std::string& error) {
         error = "analyzer produced no projection for this set operation";
         return nullptr;
     }
+
+    // --- Hoist a trailing ORDER BY / LIMIT off the last branch ------------
+    // A trailing ORDER BY / LIMIT that follows a set operation scopes to the
+    // WHOLE result. SQL forbids a set-op branch from carrying its own ORDER BY
+    // (without parentheses), so any ORDER BY / LIMIT the grammar hangs on the
+    // last branch belongs to the set operation - but the parser attaches it to
+    // that last SelectStmt and bind_query bound it INSIDE the branch (a Sort
+    // and/or Limit at the top of `right`). Peel those off, build the SetOp over
+    // the branch core, and re-apply them ABOVE the SetOp (Sort directly above,
+    // Limit above the Sort). The ORDER BY keys are re-lowered against the
+    // reconciled set-op output so `ORDER BY <col>` binds to the set operation's
+    // output column (not to a same-named base column of the last branch).
+    //
+    // Conservative: only the last branch, and only when it is a plain
+    // SelectStmt whose bound form exposes a Sort / Limit at its very top. A
+    // parenthesized subquery with its own interior ORDER BY binds as a derived
+    // table and does not expose a top Sort / Limit here, so it is left alone.
+    bool hoist_sort = false;
+    bool hoist_limit = false;
+    bool sl_has_limit = false, sl_has_offset = false;
+    std::int64_t sl_limit = -1, sl_offset = 0;
+    if (right_q->node_type == NodeType::SelectStmt) {
+        // Peel the outermost Limit (Limit -> Sort -> core or Limit -> core).
+        if (right->op == LogicalOp::Limit && right->child_count() == 1) {
+            hoist_limit = true;
+            sl_has_limit = right->has_limit;
+            sl_limit = right->limit;
+            sl_has_offset = right->has_offset;
+            sl_offset = right->offset;
+            right = std::move(right->children[0]);
+        }
+        // Peel the outermost Sort (now the top node, if present).
+        if (right->op == LogicalOp::Sort && right->child_count() == 1) {
+            hoist_sort = true;
+            right = std::move(right->children[0]);
+            // The branch's own Sort may have appended hidden sort-only columns
+            // to the core Project; the set operation reconciles only the visible
+            // columns, so drop the hidden ones to keep the branch's arity in
+            // step with the set-op output. (Under DISTINCT no hidden columns are
+            // ever added, so `right` is a plain Project here whenever there are
+            // extra columns to drop.)
+            const std::size_t n = node->output.size();
+            if (right->op == LogicalOp::Project && right->output.size() > n) {
+                right->output.resize(n);
+                right->exprs.resize(n);
+            }
+        }
+    }
+
     node->add_child(std::move(left));
     node->add_child(std::move(right));
-    return node;
+    LogicalNodePtr result = std::move(node);
+
+    // Re-apply the ORDER BY as a Sort above the SetOp, keyed on the reconciled
+    // set-op output. Mirrors the ordinal / column / ASC-DESC / NULLS handling in
+    // bind_select, minus the hidden-column path (an ORDER BY over a set op must
+    // reference an output column).
+    if (hoist_sort) {
+        const ASTNode* order_by = find_child(right_q, NodeType::OrderByClause);
+        if (order_by == nullptr) {
+            error = "internal: hoisted set-op ORDER BY lost its clause";
+            return nullptr;
+        }
+        auto sort = make_node(LogicalOp::Sort);
+        const Schema& out = result->output;
+        for (const ASTNode* key = first_child(order_by); key != nullptr;
+             key = key->next_sibling) {
+            SortKeyIR sk;
+            sk.descending = (key->semantic_flags & (1u << 7)) != 0;
+            sk.nulls_order_explicit = (key->semantic_flags & (1u << 5)) != 0;
+            sk.nulls_first = (key->semantic_flags & (1u << 4)) != 0;
+
+            std::int64_t ordinal = 0;
+            if (key->node_type == NodeType::IntegerLiteral &&
+                parse_int_literal(key, ordinal)) {
+                if (ordinal < 1 ||
+                    static_cast<std::size_t>(ordinal) > out.size()) {
+                    error = "ORDER BY ordinal " + std::to_string(ordinal) +
+                            " out of range";
+                    return nullptr;
+                }
+                sk.expr = make_column_ref(static_cast<std::uint32_t>(ordinal - 1),
+                                          out[static_cast<std::size_t>(ordinal - 1)]);
+                sort->sort_keys.push_back(std::move(sk));
+                continue;
+            }
+
+            // A trailing set-op ORDER BY resolves by the reconciled OUTPUT
+            // column (SQL scopes it to the set operation, whose columns take
+            // their names/positions from the first branch), NOT by the base
+            // column the analyzer bound the key to inside the last branch. So a
+            // bare `ORDER BY <name>` is matched by name against the set-op
+            // output first; only if that misses do we fall back to lowering by
+            // the analyzer's provenance (an expression, or a same-named column
+            // whose ids happen to line up).
+            if (key->node_type == NodeType::ColumnRef ||
+                key->node_type == NodeType::Identifier) {
+                const std::string_view name =
+                    split_column_ref(key->primary_text).column;
+                bool matched = false;
+                for (std::size_t i = 0; i < out.size(); ++i) {
+                    if (out[i].name == name) {
+                        sk.expr = make_column_ref(static_cast<std::uint32_t>(i),
+                                                  out[i]);
+                        sort->sort_keys.push_back(std::move(sk));
+                        matched = true;
+                        break;
+                    }
+                }
+                if (matched) {
+                    continue;
+                }
+            }
+            std::string local_error;
+            auto e = lower_expr(key, out, local_error);
+            if (!e) {
+                error = "ORDER BY item must reference a set-operation output "
+                        "column: " + local_error;
+                return nullptr;
+            }
+            sk.expr = std::move(e);
+            sort->sort_keys.push_back(std::move(sk));
+        }
+        sort->output = out;  // schema-preserving over the set-op output
+        sort->add_child(std::move(result));
+        result = std::move(sort);
+    }
+
+    // Re-apply the LIMIT above the Sort.
+    if (hoist_limit) {
+        auto lim = make_node(LogicalOp::Limit);
+        lim->has_limit = sl_has_limit;
+        lim->limit = sl_limit;
+        lim->has_offset = sl_has_offset;
+        lim->offset = sl_offset;
+        lim->output = result->output;  // limit is schema-preserving
+        lim->add_child(std::move(result));
+        result = std::move(lim);
+    }
+
+    return result;
 }
 
 LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& error) {

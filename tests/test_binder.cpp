@@ -1210,6 +1210,69 @@ void test_union_chain(const InMemoryCatalog& cat) {
     });
 }
 
+void test_setop_trailing_order_by_limit_hoisted(const InMemoryCatalog& cat) {
+    std::printf("[test] ... UNION ... ORDER BY id LIMIT 5  (hoisted above SetOp)\n");
+    // A trailing ORDER BY / LIMIT that follows a set operation scopes to the
+    // whole result. The parser hangs it on the last branch; the binder must
+    // hoist the Sort and Limit ABOVE the SetOp (Limit -> Sort -> SetOp), NOT
+    // leave them wrapping just the right branch.
+    with_plan(cat,
+              "SELECT id FROM users UNION SELECT user_id FROM orders "
+              "ORDER BY id LIMIT 5",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Limit, "root is Limit (above the SetOp)");
+        check(root->has_limit && root->limit == 5, "limit == 5");
+
+        const LogicalNode* sort = only_child(root);
+        check(sort && sort->op == LogicalOp::Sort, "Limit's child is Sort");
+        check(sort && sort->sort_keys.size() == 1, "one sort key");
+        if (sort && sort->sort_keys.size() == 1) {
+            // The key resolves to the reconciled set-op output column #0, not to
+            // a hidden base column of the last branch.
+            const auto& e = sort->sort_keys[0].expr;
+            check(e && e->kind == ExprKind::ColumnRef && e->input_index == 0,
+                  "sort key is set-op output col #0");
+        }
+
+        const LogicalNode* setop = only_child(sort);
+        check(setop && setop->op == LogicalOp::SetOp,
+              "Sort's child is the SetOp (Sort/Limit are ABOVE it)");
+        check(setop && setop->set_op == SetOp::Union, "UNION");
+        check(setop && setop->child_count() == 2, "SetOp has two branches");
+        if (setop && setop->child_count() == 2) {
+            // Both branches are plain single-column Projects: the hidden
+            // sort-only column the last branch grew for `ORDER BY id` is dropped
+            // so the branch matches the reconciled arity.
+            check(setop->child(0)->op == LogicalOp::Project, "left branch Project");
+            check(setop->child(1)->op == LogicalOp::Project, "right branch Project");
+            check(setop->child(1)->output.size() == 1,
+                  "right branch has no hidden sort column");
+        }
+    });
+}
+
+void test_setop_no_order_by_unchanged(const InMemoryCatalog& cat) {
+    std::printf("[test] A UNION B  (no ORDER BY: SetOp root, no Sort/Limit)\n");
+    // Control: a set op with no trailing ORDER BY / LIMIT is untouched.
+    with_plan(cat, "SELECT id FROM users UNION SELECT user_id FROM orders",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::SetOp, "root is SetOp (nothing hoisted)");
+        check(root->set_op == SetOp::Union, "UNION");
+    });
+}
+
+void test_setop_trailing_order_by_only(const InMemoryCatalog& cat) {
+    std::printf("[test] A UNION B ORDER BY 1  (no LIMIT: only the Sort hoists)\n");
+    with_plan(cat,
+              "SELECT id FROM users UNION SELECT user_id FROM orders ORDER BY 1",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Sort, "root is Sort (above the SetOp)");
+        const LogicalNode* setop = only_child(root);
+        check(setop && setop->op == LogicalOp::SetOp, "Sort's child is the SetOp");
+        check(setop && setop->set_op == SetOp::Union, "UNION");
+    });
+}
+
 // -------------------------------------------------------------------------
 // DML: INSERT / UPDATE / DELETE.
 
@@ -1652,6 +1715,9 @@ int main() {
     test_union_all(cat);
     test_intersect_except(cat);
     test_union_chain(cat);
+    test_setop_trailing_order_by_limit_hoisted(cat);
+    test_setop_no_order_by_unchanged(cat);
+    test_setop_trailing_order_by_only(cat);
     test_insert_values(cat);
     test_insert_select(cat);
     test_update(cat);
