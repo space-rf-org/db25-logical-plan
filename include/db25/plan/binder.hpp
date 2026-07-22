@@ -211,6 +211,14 @@ private:
     // scalar subquery in a select item) does not clobber the enclosing frame.
     const AggregateFrame* agg_frame_ = nullptr;
 
+    // Maps each window-call SELECT item to the output slot the child Window node
+    // computed for it, so the Project references the RIGHT column. Resolving a
+    // window item by output name would collide - two un-aliased calls of the same
+    // function (SUM(a) OVER, SUM(b) OVER) both produce a column named "SUM", so a
+    // by-name lookup would point both at the first one. bind_select saves and
+    // restores this so a nested block does not clobber the enclosing map.
+    std::vector<std::pair<const db25::ast::ASTNode*, std::uint32_t>> window_slots_;
+
     friend struct BinderExprTestAccess;
 };
 
