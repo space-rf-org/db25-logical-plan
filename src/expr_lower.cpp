@@ -806,6 +806,30 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
             return e;
         }
 
+        // ----- COLLATE annotation -----
+        // <value> COLLATE <name> is lowered as a ScalarFunction "COLLATE" whose
+        // first child is the annotated value and whose second child is a string
+        // literal naming the collation (from the parse node's schema_name). Like
+        // ARRAY, this reuses ScalarFunction so no new ExprKind is needed; the
+        // node's type is the operand's type (the annotation does not change it).
+        case NodeType::CollateClause: {
+            auto e = make_expr(ExprKind::ScalarFunction, n);
+            e->type = type;
+            e->nullability = nullability;
+            e->func_name = "COLLATE";
+            auto operand = lower_expr(first_child(n), input, error);
+            if (!operand) return nullptr;
+            e->children.push_back(std::move(operand));
+            if (!n->schema_name.empty()) {
+                auto coll = make_expr(ExprKind::Literal, n);
+                coll->type = ast::DataType::Text;
+                coll->nullability = 1;
+                coll->value.value = std::string{n->schema_name};
+                e->children.push_back(std::move(coll));
+            }
+            return e;
+        }
+
         // ----- ARRAY[elem, ...] constructor -----
         // Lowered as a ScalarFunction named "ARRAY" over its lowered elements,
         // the same shape ROW(...) already takes; the array-ness is carried by the

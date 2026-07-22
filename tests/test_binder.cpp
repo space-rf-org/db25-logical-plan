@@ -273,6 +273,49 @@ void test_array_constructor(const InMemoryCatalog& cat) {
     });
 }
 
+// <value> COLLATE <name> must lower end to end (it used to drop the column and
+// fail to analyze). It is a ScalarFunction "COLLATE" whose first child is the
+// value and whose second child is a string literal naming the collation; the
+// node keeps the operand's type.
+void test_collate(const InMemoryCatalog& cat) {
+    std::printf("[test] COLLATE annotation lowering\n");
+
+    with_plan(cat, "SELECT name COLLATE \"C\" FROM users", [](const LogicalNode* root) {
+        const LogicalNode* proj =
+            (root->op == LogicalOp::Project) ? root : only_child(root);
+        check(proj && proj->op == LogicalOp::Project && !proj->exprs.empty(),
+              "COLLATE: has Project item");
+        if (!proj || proj->exprs.empty()) return;
+        const auto& e = proj->exprs[0];
+        check(e && e->kind == ExprKind::ScalarFunction, "COLLATE: is a ScalarFunction");
+        check(e && e->func_name == "COLLATE", "COLLATE: func_name is COLLATE");
+        // name is VarChar in this catalog; the annotation preserves the type.
+        check(e && e->type == DataType::VarChar, "COLLATE: keeps operand type (VarChar)");
+        check(e && e->children.size() == 2, "COLLATE: value + collation-name children");
+        if (e && e->children.size() == 2) {
+            check(e->children[0]->kind == ExprKind::ColumnRef, "COLLATE: child0 is the column");
+            const auto* c = std::get_if<std::string>(&e->children[1]->value.value);
+            check(c && *c == "C", "COLLATE: child1 names the collation");
+        }
+    });
+
+    // COLLATE in a predicate binds tighter than '=' and does not lose the column.
+    with_plan(cat, "SELECT id FROM users WHERE name COLLATE \"C\" = 'a'",
+              [](const LogicalNode* root) {
+        const LogicalNode* proj =
+            (root->op == LogicalOp::Project) ? root : only_child(root);
+        const LogicalNode* filter = proj ? only_child(proj) : nullptr;
+        check(filter && filter->op == LogicalOp::Filter && filter->predicate,
+              "COLLATE in WHERE: Filter with predicate");
+        if (filter && filter->predicate &&
+            filter->predicate->children.size() == 2) {
+            check(filter->predicate->children[0]->kind == ExprKind::ScalarFunction &&
+                      filter->predicate->children[0]->func_name == "COLLATE",
+                  "COLLATE in WHERE: lhs is the COLLATE annotation");
+        }
+    });
+}
+
 void test_scan_filter_project_limit(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT id, name FROM users WHERE id = 1 LIMIT 10\n");
     with_plan(cat, "SELECT id, name FROM users WHERE id = 1 LIMIT 10",
@@ -1931,6 +1974,7 @@ int main() {
     test_string_escape_unquote(cat);
     test_cast_modifiers(cat);
     test_array_constructor(cat);
+    test_collate(cat);
     test_limit_offset(cat);
     test_inner_join(cat);
     test_self_join_alias_resolution(cat);
