@@ -1554,6 +1554,53 @@ void test_window_same_name_distinct_slots(const InMemoryCatalog& cat) {
     });
 }
 
+// A window function NESTED inside a larger expression must STILL be evaluated by
+// a Window node below the Project; the Project references the window's output
+// column and re-applies the wrapper (`... + 1`). Previously the window call was
+// re-lowered inline as a fresh WindowFunction in the Project with no Window node
+// - the window result was silently recomputed in the projection.
+void test_window_nested_in_expr(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT id, ROW_NUMBER() OVER (ORDER BY id) + 1 FROM users\n");
+    with_plan(cat, "SELECT id, ROW_NUMBER() OVER (ORDER BY id) + 1 FROM users",
+              [](const LogicalNode* root) {
+        // Project -> Window -> Scan (the Window is NOT skipped for a wrapped call).
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* window = only_child(root);
+        check(window && window->op == LogicalOp::Window, "child is Window");
+        check(window && window->window_functions.size() == 1, "1 window function");
+        if (window && window->window_functions.size() == 1) {
+            const auto& w = *window->window_functions[0];
+            check(w.kind == ExprKind::WindowFunction && w.func_name == "ROW_NUMBER",
+                  "window func is ROW_NUMBER");
+        }
+        // Window output = input columns (id, name) + the ROW_NUMBER result at #2.
+        check(window && window->output.size() == 3, "window output = 3 cols");
+        if (window && window->output.size() == 3) {
+            expect_col(window->output[2], "ROW_NUMBER", DataType::BigInt, false, "win[2]");
+        }
+        const LogicalNode* scan = only_child(window);
+        check(scan && scan->op == LogicalOp::Scan && scan->table_name == "users",
+              "leaf scan users");
+        // The projection keeps `ROW_NUMBER() OVER(...) + 1` as an Add whose left
+        // child is a ColumnRef into the Window output slot (#2) - NOT a re-lowered
+        // WindowFunction - and whose right child is the literal 1.
+        check(root->exprs.size() == 2, "project has 2 exprs");
+        if (root->exprs.size() == 2) {
+            expect_col_ref(root->exprs[0], 0, "proj expr[0] (id #0)");
+            const auto& p = *root->exprs[1];
+            check(p.kind == ExprKind::BinaryOp && p.bin_op == db25::ast::BinaryOp::Add,
+                  "proj expr[1] is an Add (the +1 wrapper is preserved)");
+            if (p.kind == ExprKind::BinaryOp && p.children.size() == 2) {
+                check(p.children[0]->kind == ExprKind::ColumnRef,
+                      "Add lhs is a ColumnRef into the window output (not a "
+                      "re-lowered WindowFunction)");
+                expect_col_ref(p.children[0], 2, "Add lhs references window slot #2");
+                check(p.children[1]->kind == ExprKind::Literal, "Add rhs is a literal");
+            }
+        }
+    });
+}
+
 // -------------------------------------------------------------------------
 // Subqueries in expressions: owned inline by an ExprKind::Subquery node (which
 // holds the bound inner plan), tagged by kind and correlation. No separate
@@ -1732,6 +1779,7 @@ int main() {
     test_window_row_number(cat);
     test_window_sum(cat);
     test_window_same_name_distinct_slots(cat);
+    test_window_nested_in_expr(cat);
 
     test_scalar_subquery(cat);
     test_scalar_subquery_correlated(cat);

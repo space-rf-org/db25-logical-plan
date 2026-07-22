@@ -190,6 +190,26 @@ void collect_aggregates(const ASTNode* n, std::vector<const ASTNode*>& out) {
     }
 }
 
+// Walk an expression subtree collecting window-function call nodes into `out`.
+// Like `collect_aggregates` for aggregates, this finds window calls nested inside
+// a larger expression (e.g. `ROW_NUMBER() OVER (...) + 1`), not just a select
+// item that IS a whole window call. On reaching a window call it records that
+// node and stops - it does NOT descend into the call's own arguments (SQL forbids
+// nesting a window function inside another) - and it does not descend into an
+// embedded Subquery (which owns its own window functions).
+void collect_windows(const ASTNode* n, std::vector<const ASTNode*>& out) {
+    if (n == nullptr || n->node_type == NodeType::Subquery) {
+        return;
+    }
+    if (is_window_call(n)) {
+        out.push_back(n);
+        return;
+    }
+    for (const ASTNode* c = first_child(n); c != nullptr; c = c->next_sibling) {
+        collect_windows(c, out);
+    }
+}
+
 // Parse a LIMIT / OFFSET operand. Only a non-negative integer literal yields a
 // value; anything else (parameter, expression) leaves `out` untouched and
 // returns false so the caller records "no static bound".
@@ -1008,12 +1028,16 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
     // function (its type / nullability read back from the analyzer) to the
     // input schema. The Project above then references those outputs.
     if (select_list != nullptr) {
+        // Collect every window call reachable in the select list - not only a
+        // select item that IS a whole window call, but also one nested inside a
+        // larger expression (`ROW_NUMBER() OVER (...) + 1`). Each distinct call
+        // gets its own Window output column; the Project above references it by
+        // node identity (via window_slots_), so two same-named calls do not
+        // collide on the "SUM" / "ROW_NUMBER" output name.
         std::vector<const ASTNode*> window_fns;
         for (const ASTNode* item = first_child(select_list); item != nullptr;
              item = item->next_sibling) {
-            if (is_window_call(item)) {
-                window_fns.push_back(item);
-            }
+            collect_windows(item, window_fns);
         }
         if (!window_fns.empty()) {
             auto window = make_node(LogicalOp::Window);

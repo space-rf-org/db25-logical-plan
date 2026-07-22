@@ -258,6 +258,18 @@ int Binder::aggregate_frame_slot(const ASTNode* n) const {
     return -1;
 }
 
+int Binder::window_output_slot(const ASTNode* n) const {
+    if (n == nullptr) {
+        return -1;
+    }
+    for (const auto& [node, slot] : window_slots_) {
+        if (node == n) {
+            return static_cast<int>(slot);
+        }
+    }
+    return -1;
+}
+
 ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& error) {
     if (n == nullptr) {
         error = "cannot lower a null expression";
@@ -458,6 +470,24 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
         // ----- Function call: window / aggregate / scalar -----
         case NodeType::FunctionCall:
         case NodeType::FunctionExpr: {
+            // A window call reached here nested inside a larger expression
+            // (`ROW_NUMBER() OVER (...) + 1`) was already computed by the child
+            // Window node; resolve it to that exact output column BY NODE IDENTITY
+            // instead of re-lowering it as a fresh WindowFunction (whose arguments
+            // the Window output no longer exposes). Checked before the by-name
+            // producer map below because a window output name is not unique - two
+            // same-named calls (SUM(a) OVER, SUM(b) OVER) both produce a "SUM"
+            // column, so by-name would point both at the first one.
+            if (const int wslot = window_output_slot(n);
+                wslot >= 0 && static_cast<std::size_t>(wslot) < input.size()) {
+                auto e = make_expr(ExprKind::ColumnRef, n);
+                e->type = type;
+                e->nullability = nullability;
+                e->input_index = static_cast<std::uint32_t>(wslot);
+                e->ref_table_id = input[static_cast<std::size_t>(wslot)].table_id;
+                e->ref_column_id = input[static_cast<std::size_t>(wslot)].column_id;
+                return e;
+            }
             // An aggregate / window call surfacing above its Aggregate / Window
             // node (e.g. in HAVING or ORDER BY) reads the already-computed output
             // column by name rather than re-lowering the call, whose base-column
