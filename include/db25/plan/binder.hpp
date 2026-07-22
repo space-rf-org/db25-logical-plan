@@ -149,6 +149,15 @@ private:
     // in scope. Returns -1 when no frame is active.
     [[nodiscard]] int aggregate_frame_slot(const db25::ast::ASTNode* n) const;
 
+    // If `n` is a window call the child Window node already computed (matched by
+    // node identity in `window_slots_`), return its output slot; otherwise -1.
+    // This is the window producer map applied inside expression lowering: a
+    // window call nested in a larger select-list expression (`ROW_NUMBER() OVER
+    // (...) + 1`) resolves to the already-computed column instead of being
+    // re-lowered as a fresh WindowFunction. Matching is by identity, not output
+    // name, so two same-named calls (SUM(a) OVER, SUM(b) OVER) stay distinct.
+    [[nodiscard]] int window_output_slot(const db25::ast::ASTNode* n) const;
+
     // Structural equality of two producer expressions (an aggregate call or a
     // group key) for Aggregate-frame matching and aggregate dedup. A column
     // reference compares by resolved (table_id, column_id) so a qualifier or
