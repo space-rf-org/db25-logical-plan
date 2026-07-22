@@ -25,6 +25,8 @@
 #include "db25/semantic/ast_helpers.hpp"  // first_child / find_child / split_column_ref
 
 #include <charconv>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -359,6 +361,52 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
             e->nullability = nullability;
             std::int64_t v = 0;
             const std::string_view t = n->primary_text;
+
+            // Hex (0x..) / binary (0b..) integer literals carry a radix prefix
+            // that base-10 std::from_chars cannot read: it would stop at the
+            // 'x'/'b' and yield 0. Detect the prefix (after an optional sign),
+            // parse the magnitude in the right base, and apply the sign. An
+            // ordinary decimal literal falls through to the base-10 path below.
+            {
+                std::string_view body = t;
+                bool neg = false;
+                if (!body.empty() && (body.front() == '+' || body.front() == '-')) {
+                    neg = body.front() == '-';
+                    body.remove_prefix(1);
+                }
+                if (body.size() > 2 && body[0] == '0' &&
+                    (body[1] == 'x' || body[1] == 'X' ||
+                     body[1] == 'b' || body[1] == 'B')) {
+                    const int base = (body[1] == 'x' || body[1] == 'X') ? 16 : 2;
+                    std::uint64_t mag = 0;
+                    const char* first = body.data() + 2;
+                    const char* last = body.data() + body.size();
+                    const auto [hptr, hec] = std::from_chars(first, last, mag, base);
+                    if (hec != std::errc{} || hptr != last) {
+                        error = "integer literal '" + std::string{t} +
+                                "' is not a valid number";
+                        return nullptr;
+                    }
+                    constexpr auto kMax = static_cast<std::uint64_t>(
+                        std::numeric_limits<std::int64_t>::max());
+                    if (!neg && mag <= kMax) {
+                        e->value.value = static_cast<std::int64_t>(mag);
+                    } else if (neg && mag <= kMax + 1) {
+                        // Two's-complement negate in unsigned so -(2^63) - the
+                        // one magnitude past INT64_MAX that is still a valid
+                        // negative - does not overflow on the way in.
+                        e->value.value = static_cast<std::int64_t>(~mag + 1ULL);
+                    } else {
+                        // Too large for int64: widen to double, mirroring the
+                        // oversized-decimal path below so the value survives.
+                        const double dv = static_cast<double>(mag);
+                        e->value.value = neg ? -dv : dv;
+                        e->type = ast::DataType::Double;
+                    }
+                    return e;
+                }
+            }
+
             const auto [ptr, ec] = std::from_chars(t.data(), t.data() + t.size(), v);
             if (ec == std::errc{} && ptr == t.data() + t.size()) {
                 e->value.value = v;

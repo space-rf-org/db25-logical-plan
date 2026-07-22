@@ -11,9 +11,11 @@
 #include "db25/semantic/analyzer.hpp"
 #include "db25/semantic/catalog.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <string_view>
+#include <variant>
 
 using db25::ast::DataType;
 using db25::ast::SetOp;
@@ -162,6 +164,58 @@ void test_scan_filter_project_limit(const InMemoryCatalog& cat) {
             expect_col_ref(project->exprs[0], 0, "proj expr[0]");
             expect_col_ref(project->exprs[1], 1, "proj expr[1]");
         }
+    });
+}
+
+// The WHERE predicate's right-hand-side literal of `SELECT id FROM users WHERE
+// <col> = <literal>`, or null if the shape is not the expected Filter/BinaryOp.
+const db25::plan::Expr* where_rhs_literal(const LogicalNode* root) {
+    // root is the Project (no LIMIT in these queries); its child is the Filter.
+    const LogicalNode* project =
+        (root && root->op == LogicalOp::Project) ? root : only_child(root);
+    if (!project || project->op != LogicalOp::Project) return nullptr;
+    const LogicalNode* filter = only_child(project);
+    if (!filter || filter->op != LogicalOp::Filter || !filter->predicate) return nullptr;
+    const auto& p = *filter->predicate;
+    if (p.kind != ExprKind::BinaryOp || p.children.size() != 2) return nullptr;
+    return p.children[1].get();
+}
+
+// Hex (0x..) / binary (0b..) integer literals and leading-dot floats must lower
+// to their actual numeric VALUE. Before the tokenizer/parser fix `0xFF` lexed as
+// `0` followed by an alias, so this silently bound the value 0 - a wrong-answer
+// bug, which is why the value (not just the node kind) is asserted here.
+void test_hex_binary_literals(const InMemoryCatalog& cat) {
+    std::printf("[test] hex / binary / leading-dot numeric literals\n");
+
+    with_plan(cat, "SELECT id FROM users WHERE id = 0xFF", [](const LogicalNode* root) {
+        const db25::plan::Expr* lit = where_rhs_literal(root);
+        check(lit && lit->kind == ExprKind::Literal, "0xFF: rhs is a literal");
+        const auto* v = lit ? std::get_if<std::int64_t>(&lit->value.value) : nullptr;
+        check(v != nullptr, "0xFF: literal holds an int64");
+        check(v && *v == 255, "0xFF lowers to 255");
+    });
+
+    with_plan(cat, "SELECT id FROM users WHERE id = 0xBEEF", [](const LogicalNode* root) {
+        // Regression: the hex digits contain 'E'/'e', which the naive float
+        // heuristic mistook for an exponent marker.
+        const db25::plan::Expr* lit = where_rhs_literal(root);
+        const auto* v = lit ? std::get_if<std::int64_t>(&lit->value.value) : nullptr;
+        check(v && *v == 0xBEEF, "0xBEEF lowers to 48879");
+    });
+
+    with_plan(cat, "SELECT id FROM users WHERE id = 0b1010", [](const LogicalNode* root) {
+        const db25::plan::Expr* lit = where_rhs_literal(root);
+        const auto* v = lit ? std::get_if<std::int64_t>(&lit->value.value) : nullptr;
+        check(v && *v == 10, "0b1010 lowers to 10");
+    });
+
+    with_plan(cat, "SELECT id FROM orders WHERE total = .5", [](const LogicalNode* root) {
+        const db25::plan::Expr* lit = where_rhs_literal(root);
+        check(lit && lit->kind == ExprKind::Literal, ".5: rhs is a literal");
+        const auto* v = lit ? std::get_if<double>(&lit->value.value) : nullptr;
+        check(v != nullptr, ".5: literal holds a double");
+        check(v && *v == 0.5, ".5 lowers to 0.5");
     });
 }
 
@@ -1717,6 +1771,7 @@ int main() {
     const InMemoryCatalog cat = make_catalog();
 
     test_scan_filter_project_limit(cat);
+    test_hex_binary_literals(cat);
     test_limit_offset(cat);
     test_inner_join(cat);
     test_self_join_alias_resolution(cat);
