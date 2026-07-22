@@ -321,6 +321,13 @@ LogicalNodePtr Binder::bind_relation(const ASTNode* relation, std::string& error
         inner->alias = std::string{alias_of(relation)};
         return inner;
     }
+    // A parenthesized join group `( a JOIN b ... )` in table-reference position:
+    // the parser represents it as a nested FromClause. Build its join subtree the
+    // same way a top-level FROM does, preserving the group's own join
+    // associativity, and return it as this relation's input.
+    if (relation->node_type == NodeType::FromClause) {
+        return bind_from(relation, error);
+    }
     error = "unsupported FROM relation kind (TODO)";
     return nullptr;
 }
