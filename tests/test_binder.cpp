@@ -186,6 +186,56 @@ void test_string_escape_unquote(const InMemoryCatalog& cat) {
     check_literal("SELECT 'a''''b' FROM users", "a''b", "a''''b");
 }
 
+// A CAST's type modifier - DECIMAL(precision, scale) or VARCHAR(length) - must
+// survive into the plan. The parser captures the modifier text but the binder
+// used to drop it, silently widening DECIMAL(10,2) to a bare DECIMAL. The Cast
+// Expr now carries precision/scale (numeric) or length (char/varchar).
+void test_cast_modifiers(const InMemoryCatalog& cat) {
+    std::printf("[test] CAST type modifiers (precision/scale/length)\n");
+
+    auto cast_of = [&](const LogicalNode* root) -> const db25::plan::Expr* {
+        const LogicalNode* proj =
+            (root->op == LogicalOp::Project) ? root : only_child(root);
+        if (!proj || proj->op != LogicalOp::Project || proj->exprs.empty()) {
+            return nullptr;
+        }
+        return proj->exprs[0].get();
+    };
+
+    with_plan(cat, "SELECT CAST(id AS DECIMAL(10,2)) FROM users",
+              [&](const LogicalNode* root) {
+        const db25::plan::Expr* e = cast_of(root);
+        check(e && e->kind == ExprKind::Cast, "DECIMAL(10,2): is a Cast");
+        check(e && e->target_type == DataType::Decimal, "DECIMAL(10,2): target Decimal");
+        check(e && e->type_precision == 10, "DECIMAL(10,2): precision == 10");
+        check(e && e->type_scale == 2, "DECIMAL(10,2): scale == 2");
+    });
+
+    with_plan(cat, "SELECT CAST(id AS DECIMAL(8)) FROM users",
+              [&](const LogicalNode* root) {
+        const db25::plan::Expr* e = cast_of(root);
+        check(e && e->type_precision == 8, "DECIMAL(8): precision == 8");
+        check(e && e->type_scale == 0, "DECIMAL(8): scale defaults to 0");
+    });
+
+    with_plan(cat, "SELECT CAST(name AS VARCHAR(5)) FROM users",
+              [&](const LogicalNode* root) {
+        const db25::plan::Expr* e = cast_of(root);
+        check(e && e->target_type == DataType::VarChar, "VARCHAR(5): target VarChar");
+        check(e && e->type_length == 5, "VARCHAR(5): length == 5");
+    });
+
+    // A bare type carries no modifier - fields stay 0 so sized vs unsized differ.
+    with_plan(cat, "SELECT CAST(id AS BIGINT) FROM users",
+              [&](const LogicalNode* root) {
+        const db25::plan::Expr* e = cast_of(root);
+        check(e && e->kind == ExprKind::Cast, "BIGINT: is a Cast");
+        check(e && e->type_precision == 0 && e->type_scale == 0 &&
+                  e->type_length == 0,
+              "BIGINT: no modifier, all zero");
+    });
+}
+
 void test_scan_filter_project_limit(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT id, name FROM users WHERE id = 1 LIMIT 10\n");
     with_plan(cat, "SELECT id, name FROM users WHERE id = 1 LIMIT 10",
@@ -1842,6 +1892,7 @@ int main() {
     test_hex_binary_literals(cat);
     test_delimited_identifiers(cat);
     test_string_escape_unquote(cat);
+    test_cast_modifiers(cat);
     test_limit_offset(cat);
     test_inner_join(cat);
     test_self_join_alias_resolution(cat);

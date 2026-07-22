@@ -144,6 +144,14 @@ struct Expr {
 
     // --- Cast ---
     DataType target_type = DataType::Unknown;  // == `type`, kept explicit
+    // Type modifiers from CAST(x AS T(...)). 0 means unspecified, so a bare
+    // DECIMAL / VARCHAR is faithfully distinguished from a sized one. Kept on the
+    // Expr so the plan is lossless w.r.t. the SQL type (an executor enforces the
+    // rounding / truncation these imply). Numeric types use precision (+ scale);
+    // CHAR / VARCHAR use length.
+    std::uint16_t type_precision = 0;  // DECIMAL(precision, scale)
+    std::uint16_t type_scale = 0;      // DECIMAL(precision, scale)
+    std::uint32_t type_length = 0;     // CHAR(length) / VARCHAR(length)
 
     // --- NOT-flavor bits (Like / IsNull / InList / Subquery) ---
     std::uint16_t expr_flags = 0;
