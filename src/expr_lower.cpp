@@ -476,6 +476,12 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
             e->nullability = nullability;
             e->func_name = uname;
             e->distinct = n->has_flag(ast::NodeFlags::Distinct);
+            // EXTRACT(field FROM ts) / DATE_PART(field, ts): the leading field is
+            // a date-part keyword (YEAR, MONTH, ...) the parser emits as an
+            // Identifier. Lower it as a string literal, not a column reference -
+            // otherwise it resolves to no input slot and bind fails.
+            const bool datepart_head = (uname == "EXTRACT" || uname == "DATE_PART");
+            bool first_arg = true;
             for (const ASTNode* arg = first_child(n); arg != nullptr; arg = arg->next_sibling) {
                 if (arg->node_type == NodeType::WindowSpec) {
                     continue;  // the OVER clause, lowered below (not an argument)
@@ -483,6 +489,18 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
                 if (arg->node_type == NodeType::Star) {
                     continue;  // COUNT(*): the star contributes no value expression
                 }
+                if (datepart_head && first_arg &&
+                    (arg->node_type == NodeType::Identifier ||
+                     arg->node_type == NodeType::ColumnRef)) {
+                    first_arg = false;
+                    auto kw = make_expr(ExprKind::Literal, arg);
+                    kw->type = ast::DataType::Text;
+                    kw->nullability = 1;
+                    kw->value.value = to_upper(arg->primary_text);
+                    e->children.push_back(std::move(kw));
+                    continue;
+                }
+                first_arg = false;
                 auto a = lower_expr(arg, input, error);
                 if (!a) return nullptr;
                 e->children.push_back(std::move(a));

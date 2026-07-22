@@ -411,6 +411,41 @@ void test_integer_literal_overflow_promotes_double(const InMemoryCatalog& cat) {
           "literal value is a double, not NULL");
 }
 
+// -------------------------------------------------------------------------
+// EXTRACT(field FROM ts): the date-part field must lower to a string literal,
+// not a column reference (which would resolve to no input slot and fail bind).
+// -------------------------------------------------------------------------
+void test_extract_datepart_lowered_as_literal(const InMemoryCatalog& cat) {
+    std::printf("[test] EXTRACT(YEAR FROM id)\n");
+    Analyzer az(cat);
+    Analyzed a;
+    analyze_into(a, cat, az, "SELECT EXTRACT(YEAR FROM id) FROM orders");
+    if (!a.ok) return;
+
+    const ASTNode* item = first_select_item(a.stmt);
+    check(item != nullptr, "found EXTRACT select item");
+    const Schema input = schema_of(cat, "orders");  // id@0, user_id@1, total@2
+
+    Binder binder(az, cat);
+    std::string err;
+    ExprPtr e = BinderExprTestAccess::lower(binder, item, input, err);
+    check(e != nullptr, std::string{"lowered EXTRACT: "} + err);
+    if (!e || e->children.empty()) return;
+
+    check(e->kind == ExprKind::ScalarFunction, "EXTRACT is a ScalarFunction");
+    check(e->func_name == "EXTRACT", "func name EXTRACT");
+    const Expr& field = *e->children[0];
+    check(field.kind == ExprKind::Literal,
+          "datepart field is a Literal, not a column ref");
+    check(std::holds_alternative<std::string>(field.value.value) &&
+              std::get<std::string>(field.value.value) == "YEAR",
+          "datepart field literal == 'YEAR'");
+    if (e->children.size() >= 2) {
+        check(e->children[1]->kind == ExprKind::ColumnRef,
+              "temporal operand is a ColumnRef");
+    }
+}
+
 int main() {
     const InMemoryCatalog cat = make_catalog();
 
@@ -420,6 +455,7 @@ int main() {
     test_join_concatenated_index(cat);
     test_correlated_exists(cat);
     test_integer_literal_overflow_promotes_double(cat);
+    test_extract_datepart_lowered_as_literal(cat);
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) {
