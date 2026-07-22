@@ -236,6 +236,43 @@ void test_cast_modifiers(const InMemoryCatalog& cat) {
     });
 }
 
+// ARRAY[elem, ...] must lower instead of hard-failing at the binder. It is
+// represented as a ScalarFunction named "ARRAY" (the same shape ROW(...) takes)
+// whose type is DataType::Array and whose children are the lowered elements.
+void test_array_constructor(const InMemoryCatalog& cat) {
+    std::printf("[test] ARRAY[...] constructor lowering\n");
+
+    auto item0 = [&](const LogicalNode* root) -> const db25::plan::Expr* {
+        const LogicalNode* proj =
+            (root->op == LogicalOp::Project) ? root : only_child(root);
+        if (!proj || proj->op != LogicalOp::Project || proj->exprs.empty()) {
+            return nullptr;
+        }
+        return proj->exprs[0].get();
+    };
+
+    with_plan(cat, "SELECT ARRAY[1, 2, 3] FROM users", [&](const LogicalNode* root) {
+        const db25::plan::Expr* e = item0(root);
+        check(e && e->kind == ExprKind::ScalarFunction, "ARRAY: is a ScalarFunction");
+        check(e && e->func_name == "ARRAY", "ARRAY: func_name is ARRAY");
+        check(e && e->type == DataType::Array, "ARRAY: typed Array");
+        check(e && e->children.size() == 3, "ARRAY: 3 elements");
+        if (e && e->children.size() == 3) {
+            check(e->children[0]->kind == ExprKind::Literal, "ARRAY: elem 0 is a literal");
+        }
+    });
+
+    // Elements can be column references (they resolve against the scan).
+    with_plan(cat, "SELECT ARRAY[id, id] FROM users", [&](const LogicalNode* root) {
+        const db25::plan::Expr* e = item0(root);
+        check(e && e->kind == ExprKind::ScalarFunction && e->func_name == "ARRAY",
+              "ARRAY[id,id]: ScalarFunction ARRAY");
+        check(e && e->children.size() == 2 &&
+                  e->children[0]->kind == ExprKind::ColumnRef,
+              "ARRAY[id,id]: elements are column refs");
+    });
+}
+
 void test_scan_filter_project_limit(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT id, name FROM users WHERE id = 1 LIMIT 10\n");
     with_plan(cat, "SELECT id, name FROM users WHERE id = 1 LIMIT 10",
@@ -1893,6 +1930,7 @@ int main() {
     test_delimited_identifiers(cat);
     test_string_escape_unquote(cat);
     test_cast_modifiers(cat);
+    test_array_constructor(cat);
     test_limit_offset(cat);
     test_inner_join(cat);
     test_self_join_alias_resolution(cat);
