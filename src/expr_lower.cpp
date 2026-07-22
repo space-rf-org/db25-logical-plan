@@ -154,12 +154,27 @@ bool map_unary_op(std::string_view text, UnaryOp& out) {
     return false;
 }
 
-// Strip one pair of surrounding single quotes from a string-literal's text.
-std::string_view unquote(std::string_view t) {
-    if (t.size() >= 2 && t.front() == '\'' && t.back() == '\'') {
-        return t.substr(1, t.size() - 2);
+// Materialize a string-literal's value: strip the surrounding single quotes and
+// collapse each doubled '' escape to a single '. SQL's only in-string escape for
+// the single-quote delimiter is to double it, so `'it''s'` is the value `it's`.
+// Without the collapse the value keeps a spurious quote (`it''s`) and every
+// comparison against it is silently wrong - a real concern for everyday data
+// like `'O''Brien'`. DateTime / Interval literals share this path; they carry no
+// doubled quotes, so the collapse is a no-op for them.
+std::string unquote(std::string_view t) {
+    std::string_view inner = t;
+    if (inner.size() >= 2 && inner.front() == '\'' && inner.back() == '\'') {
+        inner = inner.substr(1, inner.size() - 2);
     }
-    return t;
+    std::string out;
+    out.reserve(inner.size());
+    for (std::size_t i = 0; i < inner.size(); ++i) {
+        out.push_back(inner[i]);
+        if (inner[i] == '\'' && i + 1 < inner.size() && inner[i + 1] == '\'') {
+            ++i;  // skip the second quote of a '' pair (already emitted one)
+        }
+    }
+    return out;
 }
 
 // The inner query block (SelectStmt or set-operation) of a subquery node.
@@ -456,7 +471,7 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
             auto e = make_expr(ExprKind::Literal, n);
             e->type = type;
             e->nullability = nullability;
-            e->value.value = std::string{unquote(n->primary_text)};
+            e->value.value = unquote(n->primary_text);
             return e;
         }
         case NodeType::NullLiteral: {

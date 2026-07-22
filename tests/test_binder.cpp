@@ -156,6 +156,36 @@ void test_delimited_identifiers(const InMemoryCatalog& cat) {
     });
 }
 
+// A single-quoted string literal must lower to its actual value, with each
+// doubled '' collapsed to one '. `'it''s'` is the value `it's`, not `it''s` -
+// the latter is a wrong-answer bug for any string containing an apostrophe.
+void test_string_escape_unquote(const InMemoryCatalog& cat) {
+    std::printf("[test] string literal '' escape collapses to one quote\n");
+
+    auto check_literal = [&](const char* sql, const std::string& expected,
+                             const std::string& ctx) {
+        with_plan(cat, sql, [&](const LogicalNode* root) {
+            const LogicalNode* proj =
+                (root->op == LogicalOp::Project) ? root : only_child(root);
+            check(proj && proj->op == LogicalOp::Project, ctx + ": has Project");
+            if (!proj || proj->exprs.empty()) return;
+            const auto& e = proj->exprs[0];
+            check(e && e->kind == ExprKind::Literal, ctx + ": item is a literal");
+            const auto* s = e ? std::get_if<std::string>(&e->value.value) : nullptr;
+            check(s != nullptr, ctx + ": literal holds a string");
+            check(s && *s == expected,
+                  ctx + ": value '" + (s ? *s : std::string{"<none>"}) +
+                      "' == '" + expected + "'");
+        });
+    };
+
+    check_literal("SELECT 'it''s' FROM users", "it's", "it''s");
+    check_literal("SELECT 'O''Brien' FROM users", "O'Brien", "O''Brien");
+    check_literal("SELECT 'plain' FROM users", "plain", "plain");
+    // Two adjacent escapes collapse independently.
+    check_literal("SELECT 'a''''b' FROM users", "a''b", "a''''b");
+}
+
 void test_scan_filter_project_limit(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT id, name FROM users WHERE id = 1 LIMIT 10\n");
     with_plan(cat, "SELECT id, name FROM users WHERE id = 1 LIMIT 10",
@@ -1811,6 +1841,7 @@ int main() {
     test_scan_filter_project_limit(cat);
     test_hex_binary_literals(cat);
     test_delimited_identifiers(cat);
+    test_string_escape_unquote(cat);
     test_limit_offset(cat);
     test_inner_join(cat);
     test_self_join_alias_resolution(cat);
