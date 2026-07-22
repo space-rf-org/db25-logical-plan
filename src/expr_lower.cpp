@@ -189,9 +189,8 @@ const ASTNode* find_subquery_child(const ASTNode* n) {
 }  // namespace
 
 // Structural equality of two producer expressions (see the header). A column
-// reference compares by resolved (table_id, column_id) so a qualifier / alias
-// difference still matches the same base column; every other node matches on
-// node_type + operator text with structurally-equal children in order. This
+// reference compares by resolved (table_id, column_id); every other node matches
+// on node_type + operator text with structurally-equal children in order. This
 // tells `SUM(x)` and `SUM(y)` apart (they differ in their column child), which
 // by-name matching cannot. The `a == b` fast path covers the common case where a
 // select item IS the collected producer node.
@@ -205,8 +204,22 @@ bool Binder::same_producer_expr(const ASTNode* a, const ASTNode* b) {
     if (a->node_type == NodeType::ColumnRef || a->node_type == NodeType::Identifier) {
         const std::uint32_t at = a->context.analysis.table_id;
         const std::uint32_t ac = a->context.analysis.column_id;
-        return at != 0 && ac != 0 && at == b->context.analysis.table_id &&
-               ac == b->context.analysis.column_id;
+        if (!(at != 0 && ac != 0 && at == b->context.analysis.table_id &&
+              ac == b->context.analysis.column_id)) {
+            return false;
+        }
+        // Same base column. In a self-join the two occurrences share
+        // (table_id, column_id) but carry different qualifiers (e1.x vs e2.x);
+        // when BOTH are qualified and the qualifiers differ they are DISTINCT
+        // producers, so `GROUP BY e1.x, e2.x` keeps two keys and the projection
+        // maps e2.x to its own slot. An empty qualifier matches either (a
+        // qualified vs unqualified reference to the same column is one producer).
+        const std::string_view qa = split_column_ref(a->primary_text).qualifier;
+        const std::string_view qb = split_column_ref(b->primary_text).qualifier;
+        if (!qa.empty() && !qb.empty() && qa != qb) {
+            return false;
+        }
+        return true;
     }
     // A DISTINCT / ALL modifier lives in semantic_flags, not in primary_text or
     // children, so `COUNT(DISTINCT x)` and `COUNT(x)` share the same text and

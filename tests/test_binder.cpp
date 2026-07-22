@@ -359,6 +359,31 @@ void test_group_by_same_name_aggregates(const InMemoryCatalog& cat) {
     });
 }
 
+// Self-join GROUP BY on the same base column: e1.dept and e2.dept share
+// (table_id, column_id) but are distinct group keys. The projection must map
+// each select item to its OWN key slot via the qualifier - previously both
+// resolved to the first key (Project #0,#0 instead of #0,#1).
+void test_self_join_group_key_distinct_slots(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT e1.dept, e2.dept FROM emp e1 JOIN emp e2 ... GROUP BY e1.dept, e2.dept\n");
+    with_plan(cat,
+              "SELECT e1.dept, e2.dept FROM emp e1 JOIN emp e2 ON e1.id = e2.id "
+              "GROUP BY e1.dept, e2.dept",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->op == LogicalOp::Aggregate, "child is Aggregate");
+        check(agg && agg->group_keys.size() == 2, "two distinct group keys");
+        check(root->exprs.size() == 2, "two projected columns");
+        if (root->exprs.size() == 2) {
+            check(root->exprs[0]->kind == ExprKind::ColumnRef &&
+                      root->exprs[1]->kind == ExprKind::ColumnRef,
+                  "both project columns reference the aggregate output");
+            check(root->exprs[0]->input_index != root->exprs[1]->input_index,
+                  "e1.dept / e2.dept map to DISTINCT key slots");
+        }
+    });
+}
+
 // COUNT(DISTINCT x) and COUNT(x) share their name AND argument - the DISTINCT
 // modifier lives only in semantic_flags - so they must still be kept as two
 // separate aggregate columns and not deduped into one.
@@ -1540,6 +1565,7 @@ int main() {
     test_group_by(cat);
     test_group_by_select_reordered(cat);
     test_group_by_same_name_aggregates(cat);
+    test_self_join_group_key_distinct_slots(cat);
     test_group_by_distinct_vs_plain(cat);
     test_implicit_aggregate_count(cat);
     test_implicit_aggregate_nested(cat);
