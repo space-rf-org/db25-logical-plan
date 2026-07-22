@@ -1417,6 +1417,33 @@ void test_window_sum(const InMemoryCatalog& cat) {
     });
 }
 
+// Two un-aliased window calls of the SAME function must resolve to DISTINCT
+// output columns. Both produce an output column named "SUM", so a by-name lookup
+// pointed the projection at the first one for both (SUM(sal) OVER, SUM(id) OVER
+// would both read SUM(sal)); the projection must map each call to the slot the
+// Window node computed for it, by node identity.
+void test_window_same_name_distinct_slots(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT SUM(sal) OVER w, SUM(id) OVER w FROM emp\n");
+    with_plan(cat,
+              "SELECT SUM(sal) OVER (PARTITION BY dept), "
+              "SUM(id) OVER (PARTITION BY dept) FROM emp",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* window = only_child(root);
+        check(window && window->op == LogicalOp::Window, "child is Window");
+        check(window && window->window_functions.size() == 2,
+              "two window functions computed");
+        check(root->exprs.size() == 2, "two projected columns");
+        if (root->exprs.size() == 2) {
+            check(root->exprs[0]->kind == ExprKind::ColumnRef &&
+                      root->exprs[1]->kind == ExprKind::ColumnRef,
+                  "both projected columns reference the window output");
+            check(root->exprs[0]->input_index != root->exprs[1]->input_index,
+                  "the two same-named window calls resolve to DISTINCT slots");
+        }
+    });
+}
+
 // -------------------------------------------------------------------------
 // Subqueries in expressions: owned inline by an ExprKind::Subquery node (which
 // holds the bound inner plan), tagged by kind and correlation. No separate
@@ -1589,6 +1616,7 @@ int main() {
     test_window_rank(cat);
     test_window_row_number(cat);
     test_window_sum(cat);
+    test_window_same_name_distinct_slots(cat);
 
     test_scalar_subquery(cat);
     test_scalar_subquery_correlated(cat);

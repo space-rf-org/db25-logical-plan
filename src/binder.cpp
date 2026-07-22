@@ -685,9 +685,14 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
     struct FrameGuard {
         Binder* b;
         const AggregateFrame* prev;
-        ~FrameGuard() { b->agg_frame_ = prev; }
-    } frame_guard{this, agg_frame_};
+        std::vector<std::pair<const ASTNode*, std::uint32_t>> prev_windows;
+        ~FrameGuard() {
+            b->agg_frame_ = prev;
+            b->window_slots_ = std::move(prev_windows);
+        }
+    } frame_guard{this, agg_frame_, std::move(window_slots_)};
     agg_frame_ = nullptr;
+    window_slots_.clear();
 
     // --- FROM -> Scan / Join subtree (or a synthetic single row) ---
     LogicalNodePtr current;
@@ -872,11 +877,17 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
             // their arguments and PARTITION BY / ORDER BY references live.
             const Schema& win_input = current->output;
             window->output = current->output;  // input columns pass through
+            const auto base_width = static_cast<std::uint32_t>(window->output.size());
             for (const ASTNode* fn : window_fns) {
                 auto e = lower_expr(fn, win_input, error);
                 if (!e) {
                     return nullptr;
                 }
+                // Record this call's exact output slot so the Project references
+                // the right column - not the first same-named window output.
+                window_slots_.emplace_back(
+                    fn, base_width + static_cast<std::uint32_t>(
+                                        window->window_functions.size()));
                 window->window_functions.push_back(std::move(e));
                 ColumnSchema col;
                 col.name = item_output_name(fn);
@@ -1316,6 +1327,14 @@ ExprPtr Binder::lower_projection_item(const ASTNode* item, const Schema& input,
     // a call name is not unique (SUM(x) / SUM(y) share "SUM") - they resolve
     // structurally through the Aggregate frame inside lower_expr below.
     if (is_window_call(item)) {
+        // Match this exact call to the slot the Window node computed for it (by
+        // node identity), so two un-aliased same-named window calls resolve to
+        // their own columns instead of both hitting the first "SUM".
+        for (const auto& [node, slot] : window_slots_) {
+            if (node == item) {
+                return make_column_ref(slot, input[slot]);
+            }
+        }
         const int slot = slot_by_name(input, item_output_name(item));
         if (slot >= 0) {
             return make_column_ref(static_cast<std::uint32_t>(slot), input[slot]);
