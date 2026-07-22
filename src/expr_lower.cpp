@@ -806,6 +806,25 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
             return e;
         }
 
+        // ----- ARRAY[elem, ...] constructor -----
+        // Lowered as a ScalarFunction named "ARRAY" over its lowered elements,
+        // the same shape ROW(...) already takes; the array-ness is carried by the
+        // node's type (DataType::Array, from the analyzer) and the "ARRAY" name,
+        // so no new ExprKind is needed and every ExprKind consumer stays valid.
+        case NodeType::ArrayConstructor: {
+            auto e = make_expr(ExprKind::ScalarFunction, n);
+            e->type = type;
+            e->nullability = nullability;
+            e->func_name = "ARRAY";
+            for (const ASTNode* el = first_child(n); el != nullptr;
+                 el = el->next_sibling) {
+                auto c = lower_expr(el, input, error);
+                if (!c) return nullptr;
+                e->children.push_back(std::move(c));
+            }
+            return e;
+        }
+
         default:
             error = std::string{"expression form '"} + ast::node_type_to_string(n->node_type) +
                     "' is not yet lowerable";
