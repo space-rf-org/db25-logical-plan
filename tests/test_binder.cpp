@@ -1008,6 +1008,28 @@ void test_left_join_using_keeps_left_copy(const InMemoryCatalog& cat) {
 // A NATURAL join whose common column is ambiguous on one side (here `id` occurs
 // in both users and emp on the left) must be REJECTED, not silently tie only the
 // first slot and leave the duplicate unconstrained (which returns wrong rows).
+// A parenthesized join group in FROM, `( a JOIN b ) JOIN c`, binds to a nested
+// join: the group is the left input of the outer join (previously the parser
+// dropped the whole FROM clause and this failed to bind).
+void test_parenthesized_join_group(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT u.id FROM (users u JOIN orders o ON ...) JOIN emp e ON ...\n");
+    with_plan(cat,
+              "SELECT u.id FROM (users u JOIN orders o ON o.user_id = u.id) "
+              "JOIN emp e ON e.id = u.id",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* outer = only_child(root);
+        check(outer && outer->op == LogicalOp::Join, "child is the outer Join");
+        if (outer && outer->child_count() == 2) {
+            // Left input is the parenthesized group: Join(users, orders).
+            check(outer->child(0)->op == LogicalOp::Join,
+                  "group binds to a nested Join (the outer join's left input)");
+            check(outer->child(1)->op == LogicalOp::Scan,
+                  "outer join's right input is Scan emp");
+        }
+    });
+}
+
 void test_natural_join_ambiguous_rejected(const InMemoryCatalog& cat) {
     std::printf("[test] users u CROSS JOIN emp e NATURAL JOIN orders o (ambiguous id, rejected)\n");
     db25::parser::Parser parser;
@@ -1617,6 +1639,7 @@ int main() {
     test_natural_left_join(cat);
     test_natural_join_no_common_is_cross(cat);
     test_natural_join_ambiguous_rejected(cat);
+    test_parenthesized_join_group(cat);
     test_right_join_using_coalesces(cat);
     test_full_join_using_coalesces(cat);
     test_natural_right_join_coalesces(cat);
