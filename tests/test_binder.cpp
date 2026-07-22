@@ -118,6 +118,44 @@ void expect_subquery(const db25::plan::Expr* e, SubqueryKind kind, bool correlat
 
 // -------------------------------------------------------------------------
 
+// Double-quoted (delimited) identifiers must resolve as ordinary columns end
+// to end: the tokenizer delivers them as Identifier tokens with the bare inner
+// text, so `"id"` binds to the same column as `id`. Previously `"id"` lexed as
+// a string literal and could never be a column reference.
+void test_delimited_identifiers(const InMemoryCatalog& cat) {
+    std::printf("[test] delimited (double-quoted) identifiers\n");
+
+    with_plan(cat, "SELECT \"id\", \"name\" FROM users", [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        check(root->output.size() == 2, "project has 2 cols");
+        if (root->output.size() == 2) {
+            expect_col(root->output[0], "id", DataType::Integer, false, "proj[0]");
+            expect_col(root->output[1], "name", DataType::VarChar, true, "proj[1]");
+        }
+        // Both items lower to positional column refs into the users scan.
+        check(root->exprs.size() == 2, "project has 2 exprs");
+        if (root->exprs.size() == 2) {
+            expect_col_ref(root->exprs[0], 0, "proj expr[0]");
+            expect_col_ref(root->exprs[1], 1, "proj expr[1]");
+        }
+    });
+
+    // A delimited identifier is usable in the WHERE clause too.
+    with_plan(cat, "SELECT \"id\" FROM users WHERE \"id\" = 1", [](const LogicalNode* root) {
+        const LogicalNode* filter = only_child(root);
+        check(filter && filter->op == LogicalOp::Filter, "child is Filter");
+        check(filter && filter->predicate &&
+                  filter->predicate->kind == ExprKind::BinaryOp,
+              "WHERE predicate is a BinaryOp");
+        if (filter && filter->predicate &&
+            filter->predicate->children.size() == 2) {
+            check(filter->predicate->children[0]->kind == ExprKind::ColumnRef &&
+                      filter->predicate->children[0]->input_index == 0,
+                  "lhs is column ref #0 (id)");
+        }
+    });
+}
+
 void test_scan_filter_project_limit(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT id, name FROM users WHERE id = 1 LIMIT 10\n");
     with_plan(cat, "SELECT id, name FROM users WHERE id = 1 LIMIT 10",
@@ -1772,6 +1810,7 @@ int main() {
 
     test_scan_filter_project_limit(cat);
     test_hex_binary_literals(cat);
+    test_delimited_identifiers(cat);
     test_limit_offset(cat);
     test_inner_join(cat);
     test_self_join_alias_resolution(cat);
