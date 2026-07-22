@@ -177,6 +177,31 @@ std::string unquote(std::string_view t) {
     return out;
 }
 
+// Parse a CAST type modifier - the text the parser stores between the target
+// type's parentheses, e.g. "10,2" for DECIMAL(10,2) or "5" for VARCHAR(5) - into
+// `first` and an optional `second` after a comma. Returns false when there is no
+// modifier or the leading value does not parse, leaving both outputs at 0.
+bool parse_type_modifier(std::string_view mod, std::uint32_t& first,
+                         std::uint32_t& second) {
+    first = 0;
+    second = 0;
+    if (mod.empty()) return false;
+    const char* const end = mod.data() + mod.size();
+    const auto [p1, ec1] = std::from_chars(mod.data(), end, first);
+    if (ec1 != std::errc{}) {
+        first = 0;
+        return false;
+    }
+    if (p1 < end && *p1 == ',') {
+        const auto [p2, ec2] = std::from_chars(p1 + 1, end, second);
+        (void)p2;
+        if (ec2 != std::errc{}) {
+            second = 0;
+        }
+    }
+    return true;
+}
+
 // The inner query block (SelectStmt or set-operation) of a subquery node.
 const ASTNode* subquery_body(const ASTNode* node) {
     if (const ASTNode* sel = find_child(node, NodeType::SelectStmt)) {
@@ -653,6 +678,25 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
             e->type = type;
             e->nullability = nullability;
             e->target_type = type;  // == the CAST's result type
+
+            // Carry the type modifier of CAST(x AS T(p[,s])) so the plan keeps
+            // the sized type instead of silently widening to a bare one. The
+            // parser stores the text between the type's parentheses on the type
+            // node, which is the operand's sibling.
+            const ASTNode* type_node = operand ? operand->next_sibling : nullptr;
+            if (type_node != nullptr && !type_node->schema_name.empty()) {
+                std::uint32_t a = 0;
+                std::uint32_t b = 0;
+                if (parse_type_modifier(type_node->schema_name, a, b)) {
+                    if (type == DataType::Char || type == DataType::VarChar) {
+                        e->type_length = a;
+                    } else {
+                        e->type_precision = static_cast<std::uint16_t>(a);
+                        e->type_scale = static_cast<std::uint16_t>(b);
+                    }
+                }
+            }
+
             auto o = lower_expr(operand, input, error);
             if (!o) return nullptr;
             e->children.push_back(std::move(o));
