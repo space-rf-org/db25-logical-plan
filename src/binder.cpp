@@ -319,6 +319,11 @@ LogicalNodePtr Binder::bind_table_ref(const ASTNode* table_ref, std::string& err
             }
             const std::string_view a = alias_of(table_ref);
             body->alias = a.empty() ? std::string{name} : std::string{a};
+            // Stamp the reference name onto the output columns so `t.col` picks
+            // this instance (and two references to one CTE stay distinguishable
+            // in a self-join). See the derived-table path for the rationale.
+            if (!body->alias.empty())
+                for (auto& c : body->output) c.alias = body->alias;
             return body;
         }
     }
@@ -357,6 +362,14 @@ LogicalNodePtr Binder::bind_relation(const ASTNode* relation, std::string& error
             return nullptr;
         }
         inner->alias = std::string{alias_of(relation)};
+        // Stamp the correlation name onto every output column so a qualified
+        // reference (`p.id`) can pick THIS relation's copy. Without it, two
+        // derived tables over the same body share (table_id, column_id) with no
+        // distinguishing alias, so find_slot_by_id() resolves both `p.id` and
+        // `q.id` to the first match and a self-join predicate `p.id = q.id`
+        // collapses to `#0 = #0` (a cross product). Mirrors scan_schema().
+        if (!inner->alias.empty())
+            for (auto& c : inner->output) c.alias = inner->alias;
         return inner;
     }
     // A parenthesized join group `( a JOIN b ... )` in table-reference position:
