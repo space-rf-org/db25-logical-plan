@@ -147,6 +147,10 @@ struct Expr {
     std::string func_name;             // canonical (upper-cased) name
     bool distinct = false;             // Aggregate DISTINCT
     WindowSpecIR window;               // WindowFunction only
+    // Aggregate FILTER (WHERE p): when present, only input rows for which this
+    // predicate is TRUE contribute to the aggregate. Null on an unfiltered
+    // aggregate and on non-aggregate kinds.
+    ExprPtr filter;                    // Aggregate FILTER predicate (owned), or null
 
     // --- Cast ---
     DataType target_type = DataType::Unknown;  // == `type`, kept explicit

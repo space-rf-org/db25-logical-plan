@@ -514,6 +514,45 @@ void test_ilike_lowering(const InMemoryCatalog& cat) {
     }
 }
 
+// -------------------------------------------------------------------------
+// (k) COUNT(*) FILTER (WHERE total > 100)  -- FILTER lowers into Expr::filter
+// -------------------------------------------------------------------------
+void test_aggregate_filter_lowering(const InMemoryCatalog& cat) {
+    std::printf("[test] (k) COUNT(*) FILTER (WHERE total > 100)\n");
+    Analyzer az(cat);
+    Analyzed a;
+    analyze_into(a, cat, az, "SELECT COUNT(*) FILTER (WHERE total > 100) FROM orders");
+    if (!a.ok) return;
+
+    const ASTNode* item = first_select_item(a.stmt);
+    check(item != nullptr && item->node_type == NodeType::FunctionCall,
+          "select item is the aggregate call");
+    const Schema input = schema_of(cat, "orders");  // id@0, user_id@1, total@2
+
+    Binder binder(az, cat);
+    std::string err;
+    ExprPtr e = BinderExprTestAccess::lower(binder, item, input, err);
+    check(e != nullptr, std::string{"lowered aggregate: "} + err);
+    if (!e) return;
+
+    check(e->kind == ExprKind::Aggregate, "root is Aggregate");
+    check(e->func_name == "COUNT", "func name COUNT");
+    check(e->filter != nullptr, "FILTER predicate lowered into Expr::filter");
+    if (e->filter) {
+        check(e->filter->kind == ExprKind::BinaryOp, "filter predicate is a BinaryOp");
+        check(e->filter->bin_op == db25::ast::BinaryOp::GreaterThan, "filter op is >");
+    }
+
+    // Contrast: an unfiltered aggregate has a null filter.
+    Analyzed a2;
+    analyze_into(a2, cat, az, "SELECT COUNT(*) FROM orders");
+    if (a2.ok) {
+        const ASTNode* i2 = first_select_item(a2.stmt);
+        ExprPtr e2 = BinderExprTestAccess::lower(binder, i2, input, err);
+        if (e2) check(e2->filter == nullptr, "unfiltered aggregate has no filter");
+    }
+}
+
 int main() {
     const InMemoryCatalog cat = make_catalog();
 
@@ -526,6 +565,7 @@ int main() {
     test_extract_datepart_lowered_as_literal(cat);
     test_boolean_test_lowering(cat);
     test_ilike_lowering(cat);
+    test_aggregate_filter_lowering(cat);
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) {
