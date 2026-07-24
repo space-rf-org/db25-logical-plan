@@ -722,13 +722,18 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
             return e;
         }
 
-        // ----- LIKE -----
+        // ----- LIKE / ILIKE -----
         case NodeType::LikeExpr: {
             auto e = make_expr(ExprKind::Like, n);
             e->type = type;
             e->nullability = nullability;
             if (is_negated(n)) {
                 e->expr_flags |= ExprFlagNegated;
+            }
+            // ILIKE is a case-insensitive Like; the parser records it in the
+            // node's primary_text ("ILIKE" / "NOT ILIKE").
+            if (to_upper(n->primary_text).find("ILIKE") != std::string::npos) {
+                e->expr_flags |= ExprFlagCaseInsensitive;
             }
             for (const ASTNode* c = first_child(n); c != nullptr; c = c->next_sibling) {
                 auto lc = lower_expr(c, input, error);

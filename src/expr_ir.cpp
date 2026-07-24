@@ -146,7 +146,10 @@ void render(const Expr& e, std::string& out) {
             out += "(";
             if (e.children.size() >= 2) {
                 render(*e.children[0], out);
-                out += e.negated() ? " NOT LIKE " : " LIKE ";
+                const char* op = e.case_insensitive()
+                                     ? (e.negated() ? " NOT ILIKE " : " ILIKE ")
+                                     : (e.negated() ? " NOT LIKE " : " LIKE ");
+                out += op;
                 render(*e.children[1], out);
             }
             out += ")" + type_suffix(e.type);

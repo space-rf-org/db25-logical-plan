@@ -74,6 +74,7 @@ enum class ExprKind : std::uint8_t {
 // NOT EXISTS). A single "negated" bit suffices for the shapes we admit today.
 enum ExprFlags : std::uint16_t {
     ExprFlagNegated = 0x0001,  // NOT LIKE / IS NOT NULL / NOT IN / NOT EXISTS
+    ExprFlagCaseInsensitive = 0x0002,  // ILIKE (case-insensitive Like)
 };
 
 // The target of a BooleanTest (IS [NOT] TRUE / FALSE / UNKNOWN). The IS NOT
@@ -176,6 +177,11 @@ struct Expr {
 
     [[nodiscard]] bool negated() const noexcept {
         return (expr_flags & ExprFlagNegated) != 0;
+    }
+
+    // Case-insensitive Like (ILIKE). Only meaningful on ExprKind::Like.
+    [[nodiscard]] bool case_insensitive() const noexcept {
+        return (expr_flags & ExprFlagCaseInsensitive) != 0;
     }
 
     // ----- Checked accessors -----
