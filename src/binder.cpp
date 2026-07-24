@@ -1377,6 +1377,47 @@ LogicalNodePtr Binder::bind_insert(const ASTNode* insert_stmt, std::string& erro
         }
         node->add_child(std::move(src));
     }
+
+    // ON CONFLICT: record the conflict target and the action so the plan
+    // faithfully represents the upsert instead of dropping it (previously the
+    // clause was parsed and silently discarded, lowering an upsert as a plain
+    // INSERT). DO UPDATE's SET assignments lower against the target table's
+    // schema and reuse `assignments`.
+    if (const ASTNode* oc = find_child(insert_stmt, NodeType::OnConflictClause)) {
+        for (const ASTNode* c = first_child(oc); c != nullptr; c = c->next_sibling) {
+            if (c->node_type == NodeType::Identifier) {
+                node->conflict_columns.push_back(
+                    std::string{split_column_ref(c->primary_text).column});
+            }
+        }
+        const TableInfo* target = catalog_.find_table(node->table_name);
+        if ((oc->semantic_flags & 0x02) != 0) {  // DO UPDATE SET ...
+            node->conflict_action = ConflictAction::DoUpdate;
+            Schema tschema;
+            if (target != nullptr) {
+                tschema = scan_schema(*target, target->table_id, node->table_name);
+            }
+            if (const ASTNode* set_clause = find_child(oc, NodeType::SetClause)) {
+                for (const ASTNode* asgn = first_child(set_clause); asgn != nullptr;
+                     asgn = asgn->next_sibling) {
+                    Assignment assignment;
+                    const std::string_view col = split_column_ref(asgn->primary_text).column;
+                    if (target != nullptr) {
+                        if (const auto* ci = target->find_column(col)) {
+                            assignment.target_column_id = ci->column_id;
+                        }
+                    }
+                    assignment.value = lower_expr(first_child(asgn), tschema, error);
+                    if (!assignment.value) {
+                        return nullptr;
+                    }
+                    node->assignments.push_back(std::move(assignment));
+                }
+            }
+        } else {  // DO NOTHING (0x01)
+            node->conflict_action = ConflictAction::DoNothing;
+        }
+    }
     return wrap_returning(std::move(node), insert_stmt, error);
 }
 

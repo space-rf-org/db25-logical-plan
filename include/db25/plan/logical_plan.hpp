@@ -117,6 +117,13 @@ enum class SubqueryKind : std::uint8_t {
     Exists,  // [NOT] EXISTS (SELECT ...)
 };
 
+// INSERT ... ON CONFLICT action carried on an Insert node.
+enum class ConflictAction : std::uint8_t {
+    None,       // plain INSERT, no ON CONFLICT clause
+    DoNothing,  // ON CONFLICT [target] DO NOTHING
+    DoUpdate,   // ON CONFLICT [target] DO UPDATE SET ...
+};
+
 // A node in the logical plan tree. Payload fields are grouped by the operator
 // that uses them; a node only populates the fields relevant to its `op`.
 struct LogicalNode {
@@ -192,6 +199,16 @@ struct LogicalNode {
     // assignments (each a target column id plus a lowered value expression).
     std::vector<std::string> target_columns;
     std::vector<Assignment> assignments;
+
+    // --- ON CONFLICT payload (INSERT ... ON CONFLICT ...) ---
+    // `conflict_action` is None for a plain INSERT. `conflict_columns` names the
+    // conflict target (the columns listed after ON CONFLICT). For DO UPDATE the
+    // SET assignments reuse `assignments` above, lowered against the target
+    // table's schema (a plain INSERT leaves `assignments` empty). Previously the
+    // whole ON CONFLICT clause was parsed and then silently discarded at bind,
+    // so an upsert lowered indistinguishably from a plain INSERT.
+    ConflictAction conflict_action = ConflictAction::None;
+    std::vector<std::string> conflict_columns;
 
     explicit LogicalNode(LogicalOp o) : op(o) {}
 
