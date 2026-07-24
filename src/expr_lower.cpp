@@ -752,6 +752,27 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
             return e;
         }
 
+        // ----- IS [NOT] TRUE / FALSE / UNKNOWN -----
+        // A three-valued boolean test that collapses the operand's 3VL truth
+        // value to a plain 2VL boolean (never NULL). The target and the NOT
+        // flavor are both encoded in the parser's primary_text ("IS [NOT] T").
+        case NodeType::BooleanTestExpr: {
+            auto e = make_expr(ExprKind::BooleanTest, n);
+            e->type = type;
+            e->nullability = nullability;
+            if (is_negated(n)) {
+                e->expr_flags |= ExprFlagNegated;
+            }
+            const std::string t = to_upper(n->primary_text);
+            e->bool_test = t.find("FALSE") != std::string::npos   ? BoolTest::False
+                         : t.find("UNKNOWN") != std::string::npos ? BoolTest::Unknown
+                                                                  : BoolTest::True;
+            auto o = lower_expr(first_child(n), input, error);
+            if (!o) return nullptr;
+            e->children.push_back(std::move(o));
+            return e;
+        }
+
         // ----- IN (list) / IN (subquery) -----
         case NodeType::InExpr: {
             const ASTNode* value = first_child(n);
