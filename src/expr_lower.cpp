@@ -604,6 +604,14 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
                 if (arg->node_type == NodeType::WindowSpec) {
                     continue;  // the OVER clause, lowered below (not an argument)
                 }
+                if (arg->node_type == NodeType::WhereClause) {
+                    // Aggregate FILTER (WHERE p): lower the predicate into the
+                    // call's filter slot, not as an argument.
+                    auto f = lower_expr(first_child(arg), input, error);
+                    if (!f) return nullptr;
+                    e->filter = std::move(f);
+                    continue;
+                }
                 if (arg->node_type == NodeType::Star) {
                     continue;  // COUNT(*): the star contributes no value expression
                 }

@@ -113,6 +113,11 @@ void render(const Expr& e, std::string& out) {
                 render(*e.children[i], out);
             }
             out += ")";
+            if (e.kind == ExprKind::Aggregate && e.filter) {
+                out += " FILTER (WHERE ";
+                render(*e.filter, out);
+                out += ")";
+            }
             if (e.kind == ExprKind::WindowFunction) {
                 out += " OVER(...)";
             }
