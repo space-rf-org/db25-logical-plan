@@ -12,6 +12,7 @@
 #include "db25/semantic/catalog.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <cstdio>
 #include <string>
 #include <string_view>
@@ -1382,6 +1383,63 @@ void test_qualified_star_over_join_rejected(const InMemoryCatalog& cat) {
 // -------------------------------------------------------------------------
 // Derived tables / subqueries in FROM.
 
+// A CTE reference binds as a derived table: `WITH t AS (query) ... FROM t`
+// resolves `t` to a fresh copy of the CTE body (previously the binder had no CTE
+// handling and reported `unresolved table 't'`).
+void test_cte(const InMemoryCatalog& cat) {
+    std::printf("[test] common table expressions (WITH)\n");
+
+    // Single reference: FROM t lowers to the CTE body's plan, aliased 't'.
+    with_plan(cat, "WITH t AS (SELECT id, name FROM users) SELECT name FROM t",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "single: root is Project");
+        const LogicalNode* body = only_child(root);
+        check(body && body->op == LogicalOp::Project, "single: CTE body is a Project");
+        check(body && body->alias == "t", "single: CTE reference aliased 't'");
+        const LogicalNode* scan = only_child(body);
+        check(scan && scan->op == LogicalOp::Scan && scan->table_name == "users",
+              "single: CTE body scans users");
+        check(root->output.size() == 1, "single: one output col");
+        if (root->output.size() == 1)
+            expect_col(root->output[0], "name", DataType::VarChar, true, "cte-single");
+    });
+
+    // Two CTEs joined: both names resolve; the plan carries a Join.
+    with_plan(cat,
+              "WITH a AS (SELECT id FROM users), b AS (SELECT user_id FROM orders) "
+              "SELECT a.id FROM a JOIN b ON a.id = b.user_id",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "multi: root is Project");
+        bool has_join = false;
+        std::function<void(const LogicalNode*)> walk = [&](const LogicalNode* n) {
+            if (n == nullptr) return;
+            if (n->op == LogicalOp::Join) has_join = true;
+            for (std::size_t i = 0; i < n->child_count(); ++i) walk(n->child(i));
+        };
+        walk(root);
+        check(has_join, "multi: two CTEs joined -> plan has a Join");
+    });
+
+    // A later CTE references an earlier one (b reads from a).
+    with_plan(cat,
+              "WITH a AS (SELECT id FROM users), b AS (SELECT id FROM a) SELECT id FROM b",
+              [](const LogicalNode* root) {
+        check(root != nullptr && root->op == LogicalOp::Project,
+              "chained: b-over-a binds to a Project");
+    });
+
+    // A CTE shadows a same-named base table: FROM users resolves to the CTE, so
+    // the output is the CTE's single column, not the users table's two.
+    with_plan(cat, "WITH users AS (SELECT user_id FROM orders) SELECT user_id FROM users",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "shadow: root is Project");
+        const LogicalNode* body = only_child(root);
+        const LogicalNode* scan = body ? only_child(body) : nullptr;
+        check(scan && scan->op == LogicalOp::Scan && scan->table_name == "orders",
+              "shadow: CTE named 'users' shadows the base table (scans orders)");
+    });
+}
+
 void test_derived_table(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT x FROM (SELECT id AS x FROM users) t\n");
     with_plan(cat, "SELECT x FROM (SELECT id AS x FROM users) t",
@@ -2016,6 +2074,7 @@ int main() {
     test_select_star_over_using(cat);
     test_qualified_star_over_join_rejected(cat);
     test_derived_table(cat);
+    test_cte(cat);
     test_union(cat);
     test_union_all(cat);
     test_intersect_except(cat);

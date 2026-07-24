@@ -228,6 +228,16 @@ private:
     // restores this so a nested block does not clobber the enclosing map.
     std::vector<std::pair<const db25::ast::ASTNode*, std::uint32_t>> window_slots_;
 
+    // Common table expressions visible at the current point of binding, as
+    // (name -> body SelectStmt), innermost last. A FROM reference to one of these
+    // names binds a fresh copy of the body as a derived table instead of
+    // resolving a base table (bind_table_ref checks this before the catalog, so a
+    // CTE shadows a same-named table). bind_select registers this block's WITH
+    // clause on entry and truncates back to the saved size on exit, giving each
+    // query block lexical visibility of its own and all enclosing CTEs. The
+    // back-to-front lookup means an inner redefinition shadows an outer one.
+    std::vector<std::pair<std::string, const db25::ast::ASTNode*>> ctes_;
+
     friend struct BinderExprTestAccess;
 };
 
