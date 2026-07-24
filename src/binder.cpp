@@ -305,6 +305,24 @@ Schema Binder::scan_schema(const TableInfo& table, std::uint32_t table_id,
 
 LogicalNodePtr Binder::bind_table_ref(const ASTNode* table_ref, std::string& error) {
     const std::string_view name = table_ref->primary_text;
+
+    // A CTE reference resolves before the catalog (so `WITH x AS (...)` shadows a
+    // base table `x`). Bind a FRESH copy of the CTE body - each reference is an
+    // independent derived-table subplan - and label it with the reference's alias
+    // (or the CTE name when unaliased) so qualified `name.col` refs resolve.
+    // Search innermost-first so an inner WITH shadows an enclosing one.
+    for (auto it = ctes_.rbegin(); it != ctes_.rend(); ++it) {
+        if (it->first == name) {
+            auto body = bind_query(it->second, error);
+            if (!body) {
+                return nullptr;
+            }
+            const std::string_view a = alias_of(table_ref);
+            body->alias = a.empty() ? std::string{name} : std::string{a};
+            return body;
+        }
+    }
+
     const TableInfo* table = catalog_.find_table(name);
     if (table == nullptr) {
         error = "unresolved table '" + std::string{name} + "'";
@@ -858,6 +876,29 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
     } frame_guard{this, agg_frame_, std::move(window_slots_)};
     agg_frame_ = nullptr;
     window_slots_.clear();
+
+    // --- WITH: register this block's CTEs so a FROM reference can resolve them.
+    // The bodies are bound lazily, once per reference, in bind_table_ref (so two
+    // references to the same CTE get independent subplans). Registration is
+    // scoped: restore the previous set on every exit so a nested block's CTEs do
+    // not leak outward while enclosing CTEs stay visible inward.
+    struct CteGuard {
+        std::vector<std::pair<std::string, const ASTNode*>>* v;
+        std::size_t mark;
+        ~CteGuard() { v->resize(mark); }
+    } cte_guard{&ctes_, ctes_.size()};
+    if (const ASTNode* cte_clause = find_child(select_stmt, NodeType::CTEClause)) {
+        for (const ASTNode* def = first_child(cte_clause); def != nullptr;
+             def = def->next_sibling) {
+            if (def->node_type != NodeType::CTEDefinition) {
+                continue;
+            }
+            const ASTNode* body = find_child(def, NodeType::SelectStmt);
+            if (body != nullptr) {
+                ctes_.emplace_back(std::string{def->primary_text}, body);
+            }
+        }
+    }
 
     // --- FROM -> Scan / Join subtree (or a synthetic single row) ---
     LogicalNodePtr current;
