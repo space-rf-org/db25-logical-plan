@@ -173,10 +173,12 @@ void dump_rec(const LogicalNode* n, int depth, std::string& out) {
         case LogicalOp::SetOp:
             out.append(" (");
             switch (n->set_op) {
-                case ast::SetOp::Union:     out.append("UNION"); break;
-                case ast::SetOp::UnionAll:  out.append("UNION ALL"); break;
-                case ast::SetOp::Intersect: out.append("INTERSECT"); break;
-                case ast::SetOp::Except:    out.append("EXCEPT"); break;
+                case ast::SetOp::Union:        out.append("UNION"); break;
+                case ast::SetOp::UnionAll:     out.append("UNION ALL"); break;
+                case ast::SetOp::Intersect:    out.append("INTERSECT"); break;
+                case ast::SetOp::IntersectAll: out.append("INTERSECT ALL"); break;
+                case ast::SetOp::Except:       out.append("EXCEPT"); break;
+                case ast::SetOp::ExceptAll:    out.append("EXCEPT ALL"); break;
             }
             out.push_back(')');
             break;
