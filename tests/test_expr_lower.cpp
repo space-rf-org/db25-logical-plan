@@ -478,6 +478,42 @@ void test_boolean_test_lowering(const InMemoryCatalog& cat) {
     check(e->children[0]->kind == ExprKind::BinaryOp, "operand is the (id > 0) predicate");
 }
 
+// -------------------------------------------------------------------------
+// (j) WHERE name ILIKE 'a%'  -- ILIKE lowers to a case-insensitive Like
+// -------------------------------------------------------------------------
+void test_ilike_lowering(const InMemoryCatalog& cat) {
+    std::printf("[test] (j) WHERE name ILIKE 'a%%'\n");
+    Analyzer az(cat);
+    Analyzed a;
+    analyze_into(a, cat, az, "SELECT id FROM users WHERE name ILIKE 'a%'");
+    if (!a.ok) return;
+
+    const ASTNode* pred = where_predicate(a.stmt);
+    check(pred != nullptr && pred->node_type == NodeType::LikeExpr,
+          "WHERE predicate is a LikeExpr");
+    const Schema input = schema_of(cat, "users");  // id@0, name@1
+
+    Binder binder(az, cat);
+    std::string err;
+    ExprPtr e = BinderExprTestAccess::lower(binder, pred, input, err);
+    check(e != nullptr, std::string{"lowered ILIKE: "} + err);
+    if (!e) return;
+
+    check(e->kind == ExprKind::Like, "root is Like");
+    check(e->case_insensitive(), "ILIKE sets the case-insensitive flag");
+    check(!e->negated(), "plain ILIKE is not negated");
+    check(e->type == DataType::Boolean, "ILIKE type Boolean");
+
+    // Contrast: a plain LIKE must NOT set the case-insensitive flag.
+    Analyzed a2;
+    analyze_into(a2, cat, az, "SELECT id FROM users WHERE name LIKE 'a%'");
+    if (a2.ok) {
+        const ASTNode* p2 = where_predicate(a2.stmt);
+        ExprPtr e2 = BinderExprTestAccess::lower(binder, p2, input, err);
+        if (e2) check(!e2->case_insensitive(), "plain LIKE is case-sensitive");
+    }
+}
+
 int main() {
     const InMemoryCatalog cat = make_catalog();
 
@@ -489,6 +525,7 @@ int main() {
     test_integer_literal_overflow_promotes_double(cat);
     test_extract_datepart_lowered_as_literal(cat);
     test_boolean_test_lowering(cat);
+    test_ilike_lowering(cat);
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) {
