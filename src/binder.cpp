@@ -83,8 +83,8 @@ ast::SetOp setop_kind(const ASTNode* n) {
     const bool all = n->has_flag(ast::NodeFlags::All);
     switch (n->node_type) {
         case NodeType::UnionStmt:     return all ? ast::SetOp::UnionAll : ast::SetOp::Union;
-        case NodeType::IntersectStmt: return ast::SetOp::Intersect;
-        case NodeType::ExceptStmt:    return ast::SetOp::Except;
+        case NodeType::IntersectStmt: return all ? ast::SetOp::IntersectAll : ast::SetOp::Intersect;
+        case NodeType::ExceptStmt:    return all ? ast::SetOp::ExceptAll : ast::SetOp::Except;
         default:                      return ast::SetOp::Union;
     }
 }
