@@ -240,6 +240,14 @@ void dump_rec(const LogicalNode* n, int depth, std::string& out) {
             out.push_back(')');
             break;
         case LogicalOp::Insert:
+            out.push_back(' ');
+            out.append(n->table_name);
+            if (n->conflict_action == ConflictAction::DoNothing) {
+                out.append(" ON CONFLICT DO NOTHING");
+            } else if (n->conflict_action == ConflictAction::DoUpdate) {
+                out.append(" ON CONFLICT DO UPDATE");
+            }
+            break;
         case LogicalOp::Delete:
         case LogicalOp::Returning:
             out.push_back(' ');

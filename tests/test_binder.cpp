@@ -1482,6 +1482,39 @@ void test_derived_self_join(const InMemoryCatalog& cat) {
               [&](const LogicalNode* root) { check_distinct_join_pred(root, "cte"); });
 }
 
+// INSERT ... ON CONFLICT must be represented on the Insert node, not silently
+// dropped (previously the clause parsed and the binder ignored it, so an upsert
+// lowered identically to a plain INSERT).
+void test_on_conflict(const InMemoryCatalog& cat) {
+    std::printf("[test] INSERT ... ON CONFLICT\n");
+
+    with_plan(cat, "INSERT INTO users (id, name) VALUES (10, 'x') ON CONFLICT (id) DO NOTHING",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Insert, "do-nothing: root is Insert");
+        check(root->conflict_action == db25::plan::ConflictAction::DoNothing,
+              "do-nothing: action recorded");
+        check(root->conflict_columns.size() == 1 &&
+              (root->conflict_columns.empty() || root->conflict_columns[0] == "id"),
+              "do-nothing: conflict target is (id)");
+    });
+
+    with_plan(cat,
+              "INSERT INTO users (id, name) VALUES (10, 'x') "
+              "ON CONFLICT (id) DO UPDATE SET name = 'y'",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Insert, "do-update: root is Insert");
+        check(root->conflict_action == db25::plan::ConflictAction::DoUpdate,
+              "do-update: action recorded");
+        check(root->assignments.size() == 1, "do-update: one SET assignment lowered");
+    });
+
+    with_plan(cat, "INSERT INTO users (id, name) VALUES (10, 'x')",
+              [](const LogicalNode* root) {
+        check(root->conflict_action == db25::plan::ConflictAction::None,
+              "plain INSERT: no conflict action");
+    });
+}
+
 void test_derived_table(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT x FROM (SELECT id AS x FROM users) t\n");
     with_plan(cat, "SELECT x FROM (SELECT id AS x FROM users) t",
@@ -2126,6 +2159,7 @@ int main() {
     test_setop_no_order_by_unchanged(cat);
     test_setop_trailing_order_by_only(cat);
     test_insert_values(cat);
+    test_on_conflict(cat);
     test_insert_select(cat);
     test_update(cat);
     test_update_no_where(cat);
