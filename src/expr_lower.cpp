@@ -751,6 +751,19 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
             return e;
         }
 
+        // ----- Row / tuple constructor: ROW(...) or (a, b, ...) -----
+        case NodeType::RowConstructor: {
+            auto e = make_expr(ExprKind::Row, n);
+            e->type = type;
+            e->nullability = nullability;
+            for (const ASTNode* c = first_child(n); c != nullptr; c = c->next_sibling) {
+                auto lc = lower_expr(c, input, error);
+                if (!lc) return nullptr;
+                e->children.push_back(std::move(lc));
+            }
+            return e;
+        }
+
         // ----- IS [NOT] NULL -----
         case NodeType::IsNullExpr: {
             auto e = make_expr(ExprKind::IsNull, n);

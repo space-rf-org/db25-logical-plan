@@ -553,6 +553,36 @@ void test_aggregate_filter_lowering(const InMemoryCatalog& cat) {
     }
 }
 
+// -------------------------------------------------------------------------
+// (l) WHERE (id, total) = (1, 100)  -- row constructors lower to ExprKind::Row
+// -------------------------------------------------------------------------
+void test_row_constructor_lowering(const InMemoryCatalog& cat) {
+    std::printf("[test] (l) WHERE (id, total) = (1, 100)\n");
+    Analyzer az(cat);
+    Analyzed a;
+    analyze_into(a, cat, az, "SELECT id FROM orders WHERE (id, total) = (1, 100)");
+    if (!a.ok) return;
+
+    const ASTNode* pred = where_predicate(a.stmt);
+    check(pred != nullptr && pred->node_type == NodeType::BinaryExpr,
+          "WHERE predicate is the '=' comparison");
+    const Schema input = schema_of(cat, "orders");  // id@0, user_id@1, total@2
+
+    Binder binder(az, cat);
+    std::string err;
+    ExprPtr e = BinderExprTestAccess::lower(binder, pred, input, err);
+    check(e != nullptr, std::string{"lowered row comparison: "} + err);
+    if (!e || e->children.size() != 2) return;
+
+    check(e->kind == ExprKind::BinaryOp, "root is BinaryOp");
+    check(e->children[0]->kind == ExprKind::Row, "lhs is a Row constructor");
+    check(e->children[1]->kind == ExprKind::Row, "rhs is a Row constructor");
+    check(e->children[0]->children.size() == 2, "lhs row has 2 elements");
+    check(e->children[1]->children.size() == 2, "rhs row has 2 elements");
+    check(e->children[0]->children[0]->kind == ExprKind::ColumnRef,
+          "lhs row element 0 is a column ref (id)");
+}
+
 int main() {
     const InMemoryCatalog cat = make_catalog();
 
@@ -566,6 +596,7 @@ int main() {
     test_boolean_test_lowering(cat);
     test_ilike_lowering(cat);
     test_aggregate_filter_lowering(cat);
+    test_row_constructor_lowering(cat);
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) {
