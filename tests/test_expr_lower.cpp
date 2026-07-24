@@ -29,6 +29,7 @@ using db25::ast::ASTNode;
 using db25::ast::DataType;
 using db25::ast::NodeType;
 using db25::plan::Binder;
+using db25::plan::BoolTest;
 using db25::plan::ColumnSchema;
 using db25::plan::Expr;
 using db25::plan::ExprKind;
@@ -446,6 +447,37 @@ void test_extract_datepart_lowered_as_literal(const InMemoryCatalog& cat) {
     }
 }
 
+// -------------------------------------------------------------------------
+// (i) WHERE (id > 0) IS NOT TRUE  -- boolean test lowers to ExprKind::BooleanTest
+// -------------------------------------------------------------------------
+void test_boolean_test_lowering(const InMemoryCatalog& cat) {
+    std::printf("[test] (i) WHERE (id > 0) IS NOT TRUE\n");
+    Analyzer az(cat);
+    Analyzed a;
+    analyze_into(a, cat, az, "SELECT id FROM users WHERE (id > 0) IS NOT TRUE");
+    if (!a.ok) return;
+
+    const ASTNode* pred = where_predicate(a.stmt);
+    check(pred != nullptr && pred->node_type == NodeType::BooleanTestExpr,
+          "WHERE predicate is a BooleanTestExpr");
+    const Schema input = schema_of(cat, "users");  // id@0, name@1
+
+    Binder binder(az, cat);
+    std::string err;
+    ExprPtr e = BinderExprTestAccess::lower(binder, pred, input, err);
+    check(e != nullptr, std::string{"lowered boolean test: "} + err);
+    if (!e) return;
+
+    check(e->kind == ExprKind::BooleanTest, "root is BooleanTest");
+    check(e->bool_test == BoolTest::True, "target is TRUE");
+    check(e->negated(), "IS NOT -> negated");
+    check(e->type == DataType::Boolean, "boolean test type Boolean");
+    check(e->nullability == 1, "boolean test never NULL");
+    check(e->children.size() == 1, "boolean test has one operand");
+    if (e->children.empty()) return;
+    check(e->children[0]->kind == ExprKind::BinaryOp, "operand is the (id > 0) predicate");
+}
+
 int main() {
     const InMemoryCatalog cat = make_catalog();
 
@@ -456,6 +488,7 @@ int main() {
     test_correlated_exists(cat);
     test_integer_literal_overflow_promotes_double(cat);
     test_extract_datepart_lowered_as_literal(cat);
+    test_boolean_test_lowering(cat);
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) {

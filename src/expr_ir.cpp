@@ -27,6 +27,7 @@ const char* expr_kind_to_string(ExprKind kind) noexcept {
         case ExprKind::Between:        return "Between";
         case ExprKind::Like:           return "Like";
         case ExprKind::IsNull:         return "IsNull";
+        case ExprKind::BooleanTest:    return "BooleanTest";
         case ExprKind::InList:         return "InList";
         case ExprKind::Subquery:       return "Subquery";
         case ExprKind::Parameter:      return "Parameter";
@@ -158,6 +159,19 @@ void render(const Expr& e, std::string& out) {
             }
             out += e.negated() ? " IS NOT NULL)" : " IS NULL)";
             out += type_suffix(e.type);
+            return;
+        }
+        case ExprKind::BooleanTest: {
+            out += "(";
+            if (!e.children.empty()) {
+                render(*e.children[0], out);
+            }
+            const char* target = e.bool_test == BoolTest::True    ? "TRUE"
+                               : e.bool_test == BoolTest::False   ? "FALSE"
+                                                                  : "UNKNOWN";
+            out += e.negated() ? " IS NOT " : " IS ";
+            out += target;
+            out += ")" + type_suffix(e.type);
             return;
         }
         case ExprKind::InList: {

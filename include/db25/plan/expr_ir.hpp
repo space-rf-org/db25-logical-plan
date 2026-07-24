@@ -61,6 +61,7 @@ enum class ExprKind : std::uint8_t {
     Between,         // {value, low, high}
     Like,            // {input, pattern[, escape]}
     IsNull,          // {operand}
+    BooleanTest,     // {operand}, bool_test (IS [NOT] TRUE/FALSE/UNKNOWN)
     InList,          // {value, elem0, elem1, ...}
     Subquery,        // owns sub_plan; subquery_kind + correlated
     Parameter,       // ? / $n, param_index
@@ -74,6 +75,10 @@ enum class ExprKind : std::uint8_t {
 enum ExprFlags : std::uint16_t {
     ExprFlagNegated = 0x0001,  // NOT LIKE / IS NOT NULL / NOT IN / NOT EXISTS
 };
+
+// The target of a BooleanTest (IS [NOT] TRUE / FALSE / UNKNOWN). The IS NOT
+// flavor is carried by ExprFlagNegated, orthogonal to this target.
+enum class BoolTest : std::uint8_t { True, False, Unknown };
 
 struct Expr;
 using ExprPtr = std::unique_ptr<Expr>;
@@ -155,6 +160,9 @@ struct Expr {
 
     // --- NOT-flavor bits (Like / IsNull / InList / Subquery) ---
     std::uint16_t expr_flags = 0;
+
+    // --- BooleanTest ---
+    BoolTest bool_test = BoolTest::True;  // which of IS TRUE/FALSE/UNKNOWN
 
     // --- Subquery ---
     SubqueryKind subquery_kind = SubqueryKind::Scalar;
