@@ -1440,6 +1440,48 @@ void test_cte(const InMemoryCatalog& cat) {
     });
 }
 
+// A self-join of two derived tables (or two references to one CTE) over the same
+// body must keep the two sides' columns distinguishable: the ON predicate has to
+// resolve `p.id` and `q.id` to DIFFERENT flat slots. Both instances share
+// (table_id, column_id), so the reference alias is the only discriminator; the
+// binder now stamps it onto each derived/CTE output column. Regression guard for
+// the predicate collapsing to `#0 = #0` (a cross product).
+void test_derived_self_join(const InMemoryCatalog& cat) {
+    std::printf("[test] self-join of two derived tables over the same body\n");
+
+    auto check_distinct_join_pred = [](const LogicalNode* root, const std::string& ctx) {
+        const LogicalNode* join = nullptr;
+        std::function<void(const LogicalNode*)> walk = [&](const LogicalNode* n) {
+            if (n == nullptr) return;
+            if (n->op == LogicalOp::Join && join == nullptr) join = n;
+            for (std::size_t i = 0; i < n->child_count(); ++i) walk(n->child(i));
+        };
+        walk(root);
+        check(join != nullptr, ctx + ": plan has a Join");
+        const db25::plan::Expr* p = join ? join->predicate.get() : nullptr;
+        check(p && p->kind == ExprKind::BinaryOp && p->children.size() == 2,
+              ctx + ": ON is a binary comparison");
+        if (p && p->kind == ExprKind::BinaryOp && p->children.size() == 2) {
+            const auto* l = p->children[0].get();
+            const auto* r = p->children[1].get();
+            check(l && r && l->kind == ExprKind::ColumnRef && r->kind == ExprKind::ColumnRef,
+                  ctx + ": both sides are column refs");
+            if (l && r && l->kind == ExprKind::ColumnRef && r->kind == ExprKind::ColumnRef)
+                check(l->input_index != r->input_index,
+                      ctx + ": the two sides resolve to DIFFERENT slots (not #0 = #0)");
+        }
+    };
+
+    with_plan(cat,
+              "SELECT p.id FROM (SELECT id FROM users) p JOIN (SELECT id FROM users) q "
+              "ON p.id = q.id",
+              [&](const LogicalNode* root) { check_distinct_join_pred(root, "derived"); });
+
+    with_plan(cat,
+              "WITH t AS (SELECT id FROM users) SELECT x.id FROM t x JOIN t y ON x.id = y.id",
+              [&](const LogicalNode* root) { check_distinct_join_pred(root, "cte"); });
+}
+
 void test_derived_table(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT x FROM (SELECT id AS x FROM users) t\n");
     with_plan(cat, "SELECT x FROM (SELECT id AS x FROM users) t",
@@ -2074,6 +2116,7 @@ int main() {
     test_select_star_over_using(cat);
     test_qualified_star_over_join_rejected(cat);
     test_derived_table(cat);
+    test_derived_self_join(cat);
     test_cte(cat);
     test_union(cat);
     test_union_all(cat);
