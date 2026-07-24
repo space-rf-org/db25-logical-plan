@@ -313,9 +313,21 @@ LogicalNodePtr Binder::bind_table_ref(const ASTNode* table_ref, std::string& err
     // Search innermost-first so an inner WITH shadows an enclosing one.
     for (auto it = ctes_.rbegin(); it != ctes_.rend(); ++it) {
         if (it->first == name) {
-            auto body = bind_query(it->second, error);
+            const ASTNode* def = it->second;
+            auto body = bind_query(find_child(def, NodeType::SelectStmt), error);
             if (!body) {
                 return nullptr;
+            }
+            // Optional column-list rename `WITH t(a, b)`: rename the subplan's
+            // output columns positionally so a later `t.a` / bare `a` resolves.
+            if (const ASTNode* col_list = find_child(def, NodeType::ColumnList)) {
+                std::size_t i = 0;
+                for (const ASTNode* cn = first_child(col_list);
+                     cn != nullptr && i < body->output.size();
+                     cn = cn->next_sibling, ++i) {
+                    body->output[i].name =
+                        std::string{split_column_ref(cn->primary_text).column};
+                }
             }
             const std::string_view a = alias_of(table_ref);
             body->alias = a.empty() ? std::string{name} : std::string{a};
@@ -906,9 +918,8 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
             if (def->node_type != NodeType::CTEDefinition) {
                 continue;
             }
-            const ASTNode* body = find_child(def, NodeType::SelectStmt);
-            if (body != nullptr) {
-                ctes_.emplace_back(std::string{def->primary_text}, body);
+            if (find_child(def, NodeType::SelectStmt) != nullptr) {
+                ctes_.emplace_back(std::string{def->primary_text}, def);
             }
         }
     }
@@ -1368,14 +1379,24 @@ LogicalNodePtr Binder::bind_insert(const ASTNode* insert_stmt, std::string& erro
             }
         }
         if (source == nullptr) {
-            error = "INSERT has neither VALUES nor a query source";
-            return nullptr;
+            // INSERT ... DEFAULT VALUES: a single all-defaults row. Represent it
+            // as a one-empty-row Values source (the same synthetic single row a
+            // FROM-less SELECT uses) rather than erroring as it did before.
+            if (find_child(insert_stmt, NodeType::DefaultClause) != nullptr) {
+                auto vnode = make_node(LogicalOp::Values);
+                vnode->value_rows.emplace_back();  // one empty row
+                node->add_child(std::move(vnode));
+            } else {
+                error = "INSERT has neither VALUES nor a query source";
+                return nullptr;
+            }
+        } else {
+            auto src = bind_query(source, error);
+            if (!src) {
+                return nullptr;
+            }
+            node->add_child(std::move(src));
         }
-        auto src = bind_query(source, error);
-        if (!src) {
-            return nullptr;
-        }
-        node->add_child(std::move(src));
     }
 
     // ON CONFLICT: record the conflict target and the action so the plan
@@ -1433,6 +1454,16 @@ LogicalNodePtr Binder::bind_update(const ASTNode* update_stmt, std::string& erro
     if (!child) {
         return nullptr;
     }
+    // UPDATE ... FROM extra_relations: cross-join the extra relations under the
+    // target so the WHERE predicate and SET values (lowered against child->output
+    // below) can reference them. The WHERE supplies the join condition.
+    if (const ASTNode* from = find_child(update_stmt, NodeType::FromClause)) {
+        auto extra = bind_from(from, error);
+        if (!extra) {
+            return nullptr;
+        }
+        child = make_join_node(std::move(child), std::move(extra), ast::JoinType::Cross);
+    }
     if (const ASTNode* where = find_child(update_stmt, NodeType::WhereClause)) {
         const ASTNode* pred_ast = first_child(where);
         auto filter = make_node(LogicalOp::Filter);
@@ -1482,6 +1513,16 @@ LogicalNodePtr Binder::bind_delete(const ASTNode* delete_stmt, std::string& erro
     auto child = bind_table_ref(table_ref, error);
     if (!child) {
         return nullptr;
+    }
+    // DELETE ... USING extra_relations: cross-join the USING relations under the
+    // target so the WHERE predicate can join against them (bind_from builds a
+    // cross-join chain over the clause's TableRef children).
+    if (const ASTNode* using_clause = find_child(delete_stmt, NodeType::UsingClause)) {
+        auto extra = bind_from(using_clause, error);
+        if (!extra) {
+            return nullptr;
+        }
+        child = make_join_node(std::move(child), std::move(extra), ast::JoinType::Cross);
     }
     if (const ASTNode* where = find_child(delete_stmt, NodeType::WhereClause)) {
         const ASTNode* pred_ast = first_child(where);

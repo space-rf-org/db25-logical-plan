@@ -1438,6 +1438,15 @@ void test_cte(const InMemoryCatalog& cat) {
         check(scan && scan->op == LogicalOp::Scan && scan->table_name == "orders",
               "shadow: CTE named 'users' shadows the base table (scans orders)");
     });
+
+    // Column-list rename `WITH t(a, b)`: the renamed names resolve; `a` selects
+    // the CTE body's first column (users.id).
+    with_plan(cat, "WITH t(a, b) AS (SELECT id, name FROM users) SELECT a FROM t",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "col-list: root is Project");
+        check(root->output.size() == 1 && root->output[0].name == "a",
+              "col-list: renamed column 'a' resolves");
+    });
 }
 
 // A self-join of two derived tables (or two references to one CTE) over the same
@@ -1512,6 +1521,45 @@ void test_on_conflict(const InMemoryCatalog& cat) {
               [](const LogicalNode* root) {
         check(root->conflict_action == db25::plan::ConflictAction::None,
               "plain INSERT: no conflict action");
+    });
+}
+
+// Multi-relation DML and DEFAULT VALUES: each used to fail (UPDATE...FROM /
+// DELETE...USING at analyze with 'unresolved column'; DEFAULT VALUES at bind).
+void test_dml_extensions(const InMemoryCatalog& cat) {
+    std::printf("[test] UPDATE...FROM / DELETE...USING / DEFAULT VALUES\n");
+
+    auto has_join = [](const LogicalNode* root) {
+        bool found = false;
+        std::function<void(const LogicalNode*)> walk = [&](const LogicalNode* n) {
+            if (n == nullptr) return;
+            if (n->op == LogicalOp::Join) found = true;
+            for (std::size_t i = 0; i < n->child_count(); ++i) walk(n->child(i));
+        };
+        walk(root);
+        return found;
+    };
+
+    // UPDATE ... FROM: the extra relation resolves and the plan carries a join.
+    with_plan(cat,
+              "UPDATE users SET id = o.user_id FROM orders o WHERE users.id = o.user_id",
+              [&](const LogicalNode* root) {
+        check(root->op == LogicalOp::Update, "update-from: root is Update");
+        check(has_join(root), "update-from: extra relation joined under target");
+    });
+
+    // DELETE ... USING: same.
+    with_plan(cat, "DELETE FROM users USING orders o WHERE users.id = o.user_id",
+              [&](const LogicalNode* root) {
+        check(root->op == LogicalOp::Delete, "delete-using: root is Delete");
+        check(has_join(root), "delete-using: USING relation joined under target");
+    });
+
+    // INSERT ... DEFAULT VALUES: a one-empty-row Values source, no error.
+    with_plan(cat, "INSERT INTO users DEFAULT VALUES", [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Insert, "default-values: root is Insert");
+        const LogicalNode* src = only_child(root);
+        check(src && src->op == LogicalOp::Values, "default-values: Values source");
     });
 }
 
@@ -2160,6 +2208,7 @@ int main() {
     test_setop_trailing_order_by_only(cat);
     test_insert_values(cat);
     test_on_conflict(cat);
+    test_dml_extensions(cat);
     test_insert_select(cat);
     test_update(cat);
     test_update_no_where(cat);
