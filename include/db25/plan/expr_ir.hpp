@@ -62,6 +62,7 @@ enum class ExprKind : std::uint8_t {
     Like,            // {input, pattern[, escape]}
     IsNull,          // {operand}
     BooleanTest,     // {operand}, bool_test (IS [NOT] TRUE/FALSE/UNKNOWN)
+    Row,             // {elem0, elem1, ...}  row/tuple constructor ROW(...) / (a,b)
     InList,          // {value, elem0, elem1, ...}
     Subquery,        // owns sub_plan; subquery_kind + correlated
     Parameter,       // ? / $n, param_index
