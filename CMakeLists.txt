@@ -50,6 +50,9 @@ add_library(db25logicalplan STATIC
     src/expr_lower.cpp
     src/optimizer.cpp
     ${ANALYZER_DIR}/src/analyzer.cpp
+    # analyzer.cpp calls evaluate_check() (constant CHECK folding for INSERT
+    # rows), which lives in this second TU - compile it in too.
+    ${ANALYZER_DIR}/src/check_eval.cpp
 )
 
 target_include_directories(db25logicalplan PUBLIC

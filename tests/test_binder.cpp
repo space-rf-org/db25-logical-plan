@@ -59,6 +59,12 @@ InMemoryCatalog make_catalog() {
         {"dept", DataType::VarChar, true},
         {"sal", DataType::Double, true},
     });
+    // All columns nullable: INSERT ... DEFAULT VALUES is well-formed here (no
+    // NOT-NULL-without-default column to violate).
+    cat.add_table("nn", {
+        {"a", DataType::Integer, true},
+        {"b", DataType::VarChar, true},
+    });
     return cat;
 }
 
@@ -1555,8 +1561,10 @@ void test_dml_extensions(const InMemoryCatalog& cat) {
         check(has_join(root), "delete-using: USING relation joined under target");
     });
 
-    // INSERT ... DEFAULT VALUES: a one-empty-row Values source, no error.
-    with_plan(cat, "INSERT INTO users DEFAULT VALUES", [](const LogicalNode* root) {
+    // INSERT ... DEFAULT VALUES: a one-empty-row Values source, no error. Uses
+    // `nn` (all columns nullable); DEFAULT VALUES into a table with a NOT NULL
+    // column that has no default is now correctly a NotNullViolation.
+    with_plan(cat, "INSERT INTO nn DEFAULT VALUES", [](const LogicalNode* root) {
         check(root->op == LogicalOp::Insert, "default-values: root is Insert");
         const LogicalNode* src = only_child(root);
         check(src && src->op == LogicalOp::Values, "default-values: Values source");
