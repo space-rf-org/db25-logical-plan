@@ -2154,10 +2154,58 @@ void test_exists_subquery(const InMemoryCatalog& cat) {
 
 }  // namespace
 
+void test_derived_table_column_alias(const InMemoryCatalog& cat) {
+    std::printf("[test] derived table with a column-alias list AS s(d, hi)\n");
+    // The alias list renames the derived output columns; `s.hi` names an aliased
+    // COMPUTED column (MAX), which resolves by name - so the plan must carry the
+    // alias as the derived column's output name.
+    with_plan(cat,
+              "SELECT s.hi FROM (SELECT dept, MAX(sal) FROM emp GROUP BY dept) AS s(d, hi)",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        check(root->output.size() == 1, "one output column");
+        if (!root->output.empty())
+            check(root->output[0].name == "hi", "output column named by alias 'hi'");
+        const LogicalNode* derived = only_child(root);
+        check(derived && derived->op == LogicalOp::Project, "derived table is a Project");
+        if (derived && derived->output.size() == 2) {
+            check(derived->output[0].name == "d", "derived col 0 renamed to 'd'");
+            check(derived->output[1].name == "hi", "derived col 1 renamed to 'hi'");
+        }
+    });
+}
+
+void test_values_derived_table(const InMemoryCatalog& cat) {
+    std::printf("[test] VALUES derived table AS v(id, label)\n");
+    with_plan(cat,
+              "SELECT v.label FROM (VALUES (1, 'eng'), (2, 'sales')) AS v(id, label) "
+              "WHERE v.id = 1",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        check(root->output.size() == 1 && root->output[0].name == "label",
+              "projects the aliased column 'label'");
+        const LogicalNode* filter = only_child(root);
+        check(filter && filter->op == LogicalOp::Filter, "child is Filter (WHERE v.id = 1)");
+        const LogicalNode* values = filter ? only_child(filter) : nullptr;
+        check(values && values->op == LogicalOp::Values, "leaf is a Values node");
+        if (values) {
+            check(values->value_rows.size() == 2, "two value rows");
+            check(values->output.size() == 2, "two output columns");
+            if (values->output.size() == 2) {
+                check(values->output[0].name == "id", "col 0 named by alias 'id'");
+                check(values->output[1].name == "label", "col 1 named by alias 'label'");
+                check(values->output[0].type == DataType::Integer, "col 0 typed Integer");
+            }
+        }
+    });
+}
+
 int main() {
     const InMemoryCatalog cat = make_catalog();
 
     test_scan_filter_project_limit(cat);
+    test_derived_table_column_alias(cat);
+    test_values_derived_table(cat);
     test_hex_binary_literals(cat);
     test_delimited_identifiers(cat);
     test_string_escape_unquote(cat);

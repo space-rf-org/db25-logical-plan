@@ -356,22 +356,76 @@ LogicalNodePtr Binder::bind_table_ref(const ASTNode* table_ref, std::string& err
     return scan;
 }
 
+LogicalNodePtr Binder::bind_values_relation(const ASTNode* values_stmt,
+                                            std::string& error) {
+    // A VALUES list used as a derived table (Subquery -> ValuesStmt -> ValuesClause
+    // -> one row per child). Lower each row's constant expressions into a Values
+    // node (the same node kind INSERT ... VALUES uses) and give it an output
+    // schema: one column per value position in the first row, typed from that row.
+    // Columns are anonymous here; a column-alias list names them in bind_relation.
+    const ASTNode* clause = find_child(values_stmt, NodeType::ValuesClause);
+    if (clause == nullptr || first_child(clause) == nullptr) {
+        error = "VALUES derived table has no rows";
+        return nullptr;
+    }
+    auto vnode = make_node(LogicalOp::Values);
+    const Schema no_input;  // VALUES expressions are constants
+    for (const ASTNode* row = first_child(clause); row != nullptr;
+         row = row->next_sibling) {
+        std::vector<ExprPtr> vals;
+        for (const ASTNode* v = first_child(row); v != nullptr; v = v->next_sibling) {
+            auto e = lower_expr(v, no_input, error);
+            if (!e) {
+                return nullptr;
+            }
+            vals.push_back(std::move(e));
+        }
+        vnode->value_rows.push_back(std::move(vals));
+    }
+    for (const ExprPtr& e : vnode->value_rows.front()) {
+        ColumnSchema c;
+        c.type = e->type;
+        c.nullable = true;
+        vnode->output.push_back(std::move(c));
+    }
+    return vnode;
+}
+
 LogicalNodePtr Binder::bind_relation(const ASTNode* relation, std::string& error) {
     if (relation->node_type == NodeType::TableRef) {
         return bind_table_ref(relation, error);
     }
     if (is_derived_node(relation->node_type)) {
-        // Derived table / subquery in FROM: bind the inner query block and use
-        // its plan as the Scan-equivalent input. Its output schema is the
-        // derived projection (analyzer-resolved); the alias labels the relation.
+        // Derived table / subquery in FROM: bind the inner query block (a SELECT /
+        // set operation, or a VALUES list) and use its plan as the Scan-equivalent
+        // input. Its output schema is the derived projection; the alias labels the
+        // relation.
         const ASTNode* body = subquery_body(relation);
-        if (body == nullptr) {
+        LogicalNodePtr inner;
+        if (body != nullptr) {
+            inner = bind_query(body, error);
+        } else if (const ASTNode* values = find_child(relation, NodeType::ValuesStmt)) {
+            inner = bind_values_relation(values, error);
+        } else {
             error = "derived table without a query body";
             return nullptr;
         }
-        auto inner = bind_query(body, error);
         if (!inner) {
             return nullptr;
+        }
+        // Optional column-alias list "(a, b)": rename the derived output columns
+        // positionally so `s.a` / bare `a` resolves. A computed column (an
+        // aggregate or expression) has synthetic (0, 0) ids, so it resolves BY
+        // NAME - the alias must therefore be its output name, not just the
+        // analyzer's binding name. Mirrors the CTE column-list rename.
+        if (const ASTNode* col_list = find_child(relation, NodeType::ColumnList)) {
+            std::size_t i = 0;
+            for (const ASTNode* cn = first_child(col_list);
+                 cn != nullptr && i < inner->output.size();
+                 cn = cn->next_sibling, ++i) {
+                inner->output[i].name =
+                    std::string{split_column_ref(cn->primary_text).column};
+            }
         }
         inner->alias = std::string{alias_of(relation)};
         // Stamp the correlation name onto every output column so a qualified
