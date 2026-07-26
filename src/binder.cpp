@@ -6,6 +6,7 @@
 
 #include "db25/ast/ast_node.hpp"
 #include "db25/ast/node_types.hpp"
+#include "db25/plan/identifier.hpp"       // iequals: case-insensitive name matching
 #include "db25/semantic/ast_helpers.hpp"  // first_child / find_child / alias_of / split_column_ref
 
 #include <charconv>
@@ -270,7 +271,7 @@ ExprPtr make_column_ref(std::uint32_t slot, const ColumnSchema& c) {
 // precomputed aggregate / window output). Returns -1 when absent.
 int slot_by_name(const Schema& s, std::string_view name) {
     for (std::size_t i = 0; i < s.size(); ++i) {
-        if (s[i].name == name) {
+        if (iequals(s[i].name, name)) {  // computed columns resolve by name, case-insensitively
             return static_cast<int>(i);
         }
     }
@@ -312,7 +313,7 @@ LogicalNodePtr Binder::bind_table_ref(const ASTNode* table_ref, std::string& err
     // (or the CTE name when unaliased) so qualified `name.col` refs resolve.
     // Search innermost-first so an inner WITH shadows an enclosing one.
     for (auto it = ctes_.rbegin(); it != ctes_.rend(); ++it) {
-        if (it->first == name) {
+        if (iequals(it->first, name)) {  // CTE names are identifiers: fold case
             const ASTNode* def = it->second;
             auto body = bind_query(find_child(def, NodeType::SelectStmt), error);
             if (!body) {
@@ -518,7 +519,7 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
         const auto count_by_name = [](const Schema& s, std::string_view name) {
             int n = 0;
             for (const auto& c : s) {
-                if (c.name == name) ++n;
+                if (iequals(c.name, name)) ++n;
             }
             return n;
         };
@@ -529,7 +530,7 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
             }
             bool already = false;
             for (const std::string_view m : merged) {
-                if (m == lc.name) { already = true; break; }
+                if (iequals(m, lc.name)) { already = true; break; }
             }
             if (already) {
                 continue;
@@ -548,7 +549,7 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
     }
     const auto is_merged = [&merged](std::string_view name) {
         for (const std::string_view m : merged) {
-            if (m == name) {
+            if (iequals(m, name)) {
                 return true;
             }
         }

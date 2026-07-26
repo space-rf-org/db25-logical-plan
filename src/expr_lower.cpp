@@ -19,6 +19,7 @@
 
 #include "db25/plan/binder.hpp"
 #include "db25/plan/expr_ir.hpp"
+#include "db25/plan/identifier.hpp"       // iequals: case-insensitive name matching
 
 #include "db25/ast/ast_node.hpp"
 #include "db25/ast/node_types.hpp"
@@ -96,7 +97,7 @@ int find_slot_by_id(const Schema& s, std::uint32_t tid, std::uint32_t cid,
 // projected exprs) without the operator-side bookkeeping that later steps add.
 int find_slot_by_name(const Schema& s, std::string_view name) {
     for (std::size_t i = 0; i < s.size(); ++i) {
-        if (s[i].name == name) {
+        if (iequals(s[i].name, name)) {  // computed columns resolve by name, case-insensitively
             return static_cast<int>(i);
         }
     }

@@ -267,6 +267,53 @@ void test_columnref_handbuilt_schema(const InMemoryCatalog& cat) {
 }
 
 // -------------------------------------------------------------------------
+// (c') computed-column ColumnRef resolves BY NAME, case-insensitively
+// -------------------------------------------------------------------------
+// A computed column (aggregate / expression output) carries synthetic zero ids,
+// so lower_expr resolves it by name via find_slot_by_name rather than by id.
+// That lookup folds ASCII case to match the analyzer's case-insensitive
+// identifier rule: a lower-case `hi` must bind to a computed column spelled
+// `Hi`, or a query that resolves in the analyzer would fail to bind here - a
+// silent cross-layer divergence. The refs are parsed WITHOUT analysis so they
+// keep their zero ids and take the by-name path (an analyzed base column would
+// resolve by (table_id, column_id) instead).
+void test_computed_column_name_case_insensitive(const InMemoryCatalog& cat) {
+    std::printf("[test] (c') computed ColumnRef resolves by name, case-insensitively\n");
+
+    db25::parser::Parser p;
+    auto res = p.parse("SELECT hi FROM orders");
+    check(res.has_value(), "parse 'SELECT hi ...'");
+    if (!res) return;
+    const ASTNode* ref = first_select_item(res.value());
+    check(ref != nullptr && ref->node_type == NodeType::ColumnRef,
+          "select item is ColumnRef 'hi' (unanalyzed, zero ids)");
+    if (ref == nullptr) return;
+
+    // Input exposes a COMPUTED column spelled 'Hi' (synthetic zero ids).
+    const Schema input = {ColumnSchema{"Hi", DataType::Double, true, 0, 0}};
+
+    Analyzer az(cat);
+    Binder binder(az, cat);
+    std::string err;
+    ExprPtr e = BinderExprTestAccess::lower(binder, ref, input, err);
+    check(e != nullptr, std::string{"lowered 'hi' by name: "} + err);
+    if (e) {
+        check(e->kind == ExprKind::ColumnRef, "is ColumnRef");
+        check(e->input_index == 0, "'hi' binds to computed 'Hi' at slot 0");
+    }
+
+    // Folding is not a wildcard: a genuinely different name still fails to bind.
+    db25::parser::Parser p2;
+    auto res2 = p2.parse("SELECT nope FROM orders");
+    check(res2.has_value(), "parse 'SELECT nope ...'");
+    if (!res2) return;
+    const ASTNode* ref2 = first_select_item(res2.value());
+    std::string err2;
+    ExprPtr e2 = BinderExprTestAccess::lower(binder, ref2, input, err2);
+    check(e2 == nullptr, "'nope' does not resolve to 'Hi'");
+}
+
+// -------------------------------------------------------------------------
 // (d) join ON: concatenated child0.output ++ child1.output indexing
 // -------------------------------------------------------------------------
 void test_join_concatenated_index(const InMemoryCatalog& cat) {
@@ -589,6 +636,7 @@ int main() {
     test_predicate_greater_than(cat);
     test_arith_over_aggregate(cat);
     test_columnref_handbuilt_schema(cat);
+    test_computed_column_name_case_insensitive(cat);
     test_join_concatenated_index(cat);
     test_correlated_exists(cat);
     test_integer_literal_overflow_promotes_double(cat);
