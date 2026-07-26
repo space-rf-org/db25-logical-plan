@@ -91,6 +91,10 @@ private:
                                  std::string& error);
     LogicalNodePtr bind_table_ref(const db25::ast::ASTNode* table_ref,
                                   std::string& error);
+    // A VALUES list used as a derived table: lower its rows into a Values node
+    // with a typed output schema (columns named by an alias list in bind_relation).
+    LogicalNodePtr bind_values_relation(const db25::ast::ASTNode* values_stmt,
+                                        std::string& error);
     LogicalNodePtr bind_join(LogicalNodePtr left,
                              const db25::ast::ASTNode* join_node,
                              std::string& error);
