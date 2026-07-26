@@ -232,6 +232,9 @@ void fold_expr(ExprPtr& e) {
     if (e->kind == ExprKind::Subquery && e->sub_plan) {
         fold_constants(e->sub_plan.get());
     }
+    if (e->filter) {  // aggregate FILTER predicate is an owned sub-expression too
+        fold_expr(e->filter);
+    }
 
     // With children folded, try to fold this node.
     if (e->kind == ExprKind::BinaryOp && e->children.size() == 2 &&
@@ -273,6 +276,9 @@ void simplify_expr(ExprPtr& e) {
     }
     if (e->kind == ExprKind::Subquery && e->sub_plan) {
         simplify_booleans(e->sub_plan.get());
+    }
+    if (e->filter) {  // aggregate FILTER predicate is an owned sub-expression too
+        simplify_expr(e->filter);
     }
 
     if (e->kind == ExprKind::BinaryOp && e->children.size() == 2 &&
@@ -374,6 +380,9 @@ void scan_refs(const Expr& e, std::uint32_t left_width, RefInfo& info) {
     for (const auto& c : e.children) {
         scan_refs(*c, left_width, info);
     }
+    if (e.filter) {  // aggregate FILTER predicate carries slot refs
+        scan_refs(*e.filter, left_width, info);
+    }
 }
 
 // Shift every positional column slot in `e` down by `delta` (used when a
@@ -385,6 +394,9 @@ void remap_slots(Expr& e, std::uint32_t delta) {
     }
     for (auto& c : e.children) {
         remap_slots(*c, delta);
+    }
+    if (e.filter) {  // aggregate FILTER predicate carries slot refs
+        remap_slots(*e.filter, delta);
     }
 }
 
@@ -491,6 +503,9 @@ void collect_slots(const Expr& e, std::vector<bool>& used, bool& has_subquery) {
         for (const auto& p : e.window.partition_by) collect_slots(*p, used, has_subquery);
         for (const auto& k : e.window.order_by) collect_slots(*k.expr, used, has_subquery);
     }
+    if (e.filter) {  // aggregate FILTER predicate reads input slots that must stay live
+        collect_slots(*e.filter, used, has_subquery);
+    }
 }
 
 // Rewrite each positional column slot in `e` through `remap` (old index -> new
@@ -507,6 +522,9 @@ void remap_expr_slots(Expr& e, const std::vector<int>& remap) {
     if (e.kind == ExprKind::WindowFunction) {
         for (auto& p : e.window.partition_by) remap_expr_slots(*p, remap);
         for (auto& k : e.window.order_by) remap_expr_slots(*k.expr, remap);
+    }
+    if (e.filter) {  // keep the FILTER predicate's slots consistent under pruning
+        remap_expr_slots(*e.filter, remap);
     }
 }
 
@@ -847,6 +865,9 @@ bool expr_has_outer_ref(const Expr& e) {
         for (const auto& p : e.window.partition_by) if (expr_has_outer_ref(*p)) return true;
         for (const auto& k : e.window.order_by) if (expr_has_outer_ref(*k.expr)) return true;
     }
+    // A correlation can live inside an aggregate FILTER predicate; missing it
+    // would misclassify the subquery as uncorrelated and decorrelate unsoundly.
+    if (e.filter && expr_has_outer_ref(*e.filter)) return true;
     return false;
 }
 
@@ -864,6 +885,7 @@ bool expr_has_subquery(const Expr& e) {
         for (const auto& p : e.window.partition_by) if (expr_has_subquery(*p)) return true;
         for (const auto& k : e.window.order_by) if (expr_has_subquery(*k.expr)) return true;
     }
+    if (e.filter && expr_has_subquery(*e.filter)) return true;
     return false;
 }
 
@@ -897,6 +919,7 @@ bool can_rewrite_correlation(const Expr& e) {
     for (const auto& c : e.children) {
         if (!can_rewrite_correlation(*c)) return false;
     }
+    if (e.filter && !can_rewrite_correlation(*e.filter)) return false;
     return true;
 }
 
@@ -917,6 +940,9 @@ void rewrite_correlation(Expr& e, std::uint32_t left_width) {
         default:
             for (auto& c : e.children) {
                 rewrite_correlation(*c, left_width);
+            }
+            if (e.filter) {
+                rewrite_correlation(*e.filter, left_width);
             }
             return;
     }

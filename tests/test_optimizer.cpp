@@ -452,6 +452,40 @@ void test_prune_under_aggregate(const InMemoryCatalog& cat) {
     });
 }
 
+// An aggregate FILTER predicate is an owned sub-expression that reads input
+// slots. Column pruning must count those slots as used (keep the column) and
+// remap the FILTER's references, or the surviving predicate points at a pruned /
+// out-of-range slot. `total` is referenced ONLY by the FILTER here, so if the
+// pruner ignores e.filter it drops `total` from the scan and corrupts the slot.
+void test_aggregate_filter_survives_pruning(const InMemoryCatalog& cat) {
+    std::printf("[test] COUNT(*) FILTER (WHERE total > 0): FILTER slot survives pruning\n");
+    with_optimized_plan(cat, "SELECT COUNT(*) FILTER (WHERE total > 0) FROM orders",
+                        [](const LogicalNode* root) {
+        // `total` is used only by the FILTER; the scan must retain exactly it.
+        const LogicalNode* scan = find_scan(root, "orders");
+        check(scan && scan->output.size() == 1, "orders scan pruned to just [total]");
+        if (scan && scan->output.size() == 1) {
+            check(scan->output[0].name == "total", "surviving column is total (the FILTER column)");
+        }
+        // The aggregate's FILTER predicate must still resolve, in-bounds, to total.
+        const LogicalNode* agg = find_op(root, LogicalOp::Aggregate);
+        check(agg != nullptr && !agg->aggregates.empty(), "plan has an Aggregate with a call");
+        if (agg == nullptr || agg->aggregates.empty() || agg->child_count() != 1) return;
+        const LogicalNode* input = agg->child(0);
+        const Expr* filt = agg->aggregates[0]->filter.get();
+        check(filt != nullptr, "aggregate carries a FILTER predicate");
+        if (filt == nullptr || filt->kind != ExprKind::BinaryOp || filt->children.size() != 2) return;
+        const Expr* col = filt->children[0].get();
+        check(col->kind == ExprKind::ColumnRef, "FILTER LHS is a ColumnRef");
+        check(input != nullptr && col->input_index < input->output.size(),
+              "FILTER ColumnRef slot is in-bounds of the pruned aggregate input");
+        if (input != nullptr && col->input_index < input->output.size()) {
+            check(input->output[col->input_index].name == "total",
+                  "FILTER ColumnRef resolves to total after remap");
+        }
+    });
+}
+
 // A join input drops the columns neither the join, a filter, nor the projection
 // needs (here orders.id).
 void test_prune_join_input(const InMemoryCatalog& cat) {
@@ -953,6 +987,7 @@ int main() {
     test_no_pushdown_outer_join(cat);
     test_prune_single_table(cat);
     test_prune_under_aggregate(cat);
+    test_aggregate_filter_survives_pruning(cat);
     test_prune_join_input(cat);
     test_no_prune_all_used(cat);
     test_prune_barrier_correlated_subquery(cat);
