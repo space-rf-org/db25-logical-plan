@@ -33,6 +33,44 @@ LogicalNodePtr make_node(LogicalOp op) {
     return std::make_unique<LogicalNode>(op);
 }
 
+// Reconcile a VALUES column's type across two rows, matching the analyzer's
+// coerce(UnionReconcile) rule (a multi-row VALUES is a UNION ALL of its rows, so
+// each column's type folds across every row). Kept in lock-step with the
+// analyzer's columns_from_values / promote_numeric; the cross-check test
+// test_values_column_types_match_analyzer fails if the two ever diverge.
+DataType reconcile_value_type(DataType a, DataType b) {
+    if (a == b) {
+        return a;
+    }
+    const auto is_wildcard = [](DataType t) {
+        return t == DataType::Null || t == DataType::Unknown || t == DataType::Any;
+    };
+    if (is_wildcard(a)) return b;
+    if (is_wildcard(b)) return a;
+    const auto numeric_rank = [](DataType t) -> int {
+        switch (t) {
+            case DataType::TinyInt: return 1;
+            case DataType::SmallInt: return 2;
+            case DataType::Integer: return 3;
+            case DataType::BigInt: return 4;
+            case DataType::Decimal: return 5;
+            case DataType::Real: return 6;
+            case DataType::Double: return 7;
+            default: return 0;  // not numeric
+        }
+    };
+    if (numeric_rank(a) > 0 && numeric_rank(b) > 0) {
+        return numeric_rank(a) >= numeric_rank(b) ? a : b;  // wider numeric wins
+    }
+    const auto is_string = [](DataType t) {
+        return t == DataType::Char || t == DataType::VarChar || t == DataType::Text;
+    };
+    if (is_string(a) && is_string(b)) {
+        return DataType::Text;  // char / varchar / text collapse to text
+    }
+    return DataType::Unknown;  // incompatible (the analyzer emits the diagnostic)
+}
+
 // Convert an analyzer ResolvedColumn to an IR ColumnSchema (field-for-field).
 ColumnSchema to_schema(const ResolvedColumn& c) {
     return ColumnSchema{c.name, c.type, c.nullable, c.table_id, c.column_id};
@@ -428,9 +466,27 @@ LogicalNodePtr Binder::bind_values_relation(const ASTNode* values_stmt,
         }
         vnode->value_rows.push_back(std::move(vals));
     }
-    for (const ExprPtr& e : vnode->value_rows.front()) {
+    // Type each output column by reconciling across ALL rows, not just the first
+    // (a multi-row VALUES is a UNION ALL of its rows). Typing from row 0 alone
+    // disagreed with the analyzer, which already reconciles these column types
+    // (columns_from_values): e.g. (VALUES (1),(2.5)) is Double not Integer, and
+    // (VALUES (NULL),(2)) is Integer not Null. reconcile_value_type mirrors the
+    // analyzer's UnionReconcile rule exactly (cross-checked by a test).
+    const auto& first_row = vnode->value_rows.front();
+    std::vector<DataType> col_types;
+    col_types.reserve(first_row.size());
+    for (const ExprPtr& e : first_row) {
+        col_types.push_back(e->type);
+    }
+    for (std::size_t r = 1; r < vnode->value_rows.size(); ++r) {
+        const auto& row = vnode->value_rows[r];
+        for (std::size_t i = 0; i < col_types.size() && i < row.size(); ++i) {
+            col_types[i] = reconcile_value_type(col_types[i], row[i]->type);
+        }
+    }
+    for (const DataType t : col_types) {
         ColumnSchema c;
-        c.type = e->type;
+        c.type = t;
         c.nullable = true;
         vnode->output.push_back(std::move(c));
     }
