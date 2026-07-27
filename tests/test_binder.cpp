@@ -1671,6 +1671,40 @@ void test_cte(const InMemoryCatalog& cat) {
     });
 }
 
+// A pathologically deep expression tree (a long a+a+...+a chain) must be
+// rejected gracefully, not overflow the stack in lower_expr. The analyzer bounds
+// its own recursion (kMaxExprDepth) and flags the expression; bind() must stay
+// defensive regardless, exactly like the recursive-CTE guard above. lower_expr
+// now carries a matching depth bound and fails with an error past it. This runs
+// under the ASan/UBSan CI job, which is what catches the old stack overflow.
+void test_deep_expression_no_overflow(const InMemoryCatalog& cat) {
+    std::printf("[test] deeply-nested expression rejected without stack overflow\n");
+    // ~4000 additive levels: comfortably past the 1000 bound, and past the depth
+    // that overflowed the stack before the guard (~2500).
+    std::string sql = "SELECT 1";
+    for (int i = 0; i < 4000; ++i) {
+        sql += " + 1";
+    }
+    sql += " FROM users";
+
+    db25::parser::Parser parser;
+    auto parsed = parser.parse(sql);
+    check(parsed.has_value(), "parse: deep additive chain");
+    if (!parsed) return;
+    Analyzer analyzer(cat);
+    analyzer.analyze(parsed.value());
+    Binder binder(analyzer, cat);
+    BindResult res = binder.bind(parsed.value());
+    check(!res.ok, "deep expression rejected by the binder, no stack overflow");
+
+    // Control: a normal-depth expression of the same shape still binds.
+    with_plan(cat, "SELECT 1 + 1 + 1 + 1 + 1 FROM users",
+              [](const LogicalNode* root) {
+        check(root != nullptr && root->op == LogicalOp::Project,
+              "shallow additive chain still binds");
+    });
+}
+
 // A self-join of two derived tables (or two references to one CTE) over the same
 // body must keep the two sides' columns distinguishable: the ON predicate has to
 // resolve `p.id` and `q.id` to DIFFERENT flat slots. Both instances share
@@ -2539,6 +2573,7 @@ int main() {
     test_derived_table(cat);
     test_derived_self_join(cat);
     test_cte(cat);
+    test_deep_expression_no_overflow(cat);
     test_union(cat);
     test_union_all(cat);
     test_intersect_except(cat);
