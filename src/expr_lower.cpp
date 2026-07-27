@@ -73,20 +73,39 @@ bool is_negated(const ASTNode* n) {
 // `qualifier` is given (a column reference's alias), prefer the matching slot
 // whose column carries that alias - this is what disambiguates a self-join,
 // where every occurrence of the table shares the same (table_id, column_id).
-// Falls back to the first (table_id, column_id) match otherwise, preserving the
-// single-occurrence behaviour.
+//
+// A qualified reference whose qualifier matches NONE of the candidate slots'
+// (non-empty) aliases does not name a relation in THIS schema: report not-found
+// (-1) so the caller falls through to the enclosing/outer inputs. Without this,
+// a correlated outer reference (`e.id`) whose base table also appears inside the
+// subquery (`... FROM emp e2 ...`) was silently bound to the inner scan's
+// same-(table_id,column_id) slot - no OuterRef was produced and the optimizer
+// mis-decorrelated the subquery. The first-match fallback is kept only for an
+// unqualified reference, or when the candidate slots carry no alias to compare
+// against (the single-occurrence case).
 int find_slot_by_id(const Schema& s, std::uint32_t tid, std::uint32_t cid,
                     std::string_view qualifier = {}) {
     int first = -1;
+    bool candidate_has_alias = false;
     for (std::size_t i = 0; i < s.size(); ++i) {
         if (s[i].table_id == tid && s[i].column_id == cid) {
             if (first < 0) {
                 first = static_cast<int>(i);
             }
-            if (!qualifier.empty() && s[i].alias == qualifier) {
-                return static_cast<int>(i);
+            if (!qualifier.empty()) {
+                if (iequals(s[i].alias, qualifier)) {
+                    return static_cast<int>(i);
+                }
+                if (!s[i].alias.empty()) {
+                    candidate_has_alias = true;
+                }
             }
         }
+    }
+    // Qualified, but the qualifier matched no candidate's alias while candidates
+    // did carry aliases: the reference belongs to another (outer) scope.
+    if (!qualifier.empty() && candidate_has_alias) {
+        return -1;
     }
     return first;
 }

@@ -2171,6 +2171,70 @@ void test_exists_subquery(const InMemoryCatalog& cat) {
     });
 }
 
+// Does the expression subtree contain a correlated OuterRef? (Does not cross a
+// nested Subquery boundary - that inner block has its own outer scope.)
+bool expr_has_outer_ref(const db25::plan::Expr* e) {
+    if (e == nullptr) {
+        return false;
+    }
+    if (e->kind == ExprKind::OuterRef) {
+        return true;
+    }
+    for (const auto& c : e->children) {
+        if (expr_has_outer_ref(c.get())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Does any expression in this plan node (or its children) hold an OuterRef?
+bool plan_has_outer_ref(const LogicalNode* n) {
+    if (n == nullptr) {
+        return false;
+    }
+    if (n->predicate && expr_has_outer_ref(n->predicate.get())) {
+        return true;
+    }
+    for (const auto& ex : n->exprs) {
+        if (expr_has_outer_ref(ex.get())) {
+            return true;
+        }
+    }
+    for (int i = 0; i < n->child_count(); ++i) {
+        if (plan_has_outer_ref(n->child(i))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A correlated subquery whose inner FROM reads the SAME base table as the
+// correlated outer column must still resolve the outer column as an OuterRef.
+// Regression: the qualified outer ref `e.dept` was silently bound to the inner
+// scan's same-(table_id,column_id) slot (`e2.dept`), producing the tautology
+// `e2.dept = e2.dept` with no OuterRef - which the optimizer then mis-
+// decorrelated. The qualifier `e` names no relation in the inner scan, so it
+// must fall through to the enclosing input.
+void test_self_correlated_subquery(const InMemoryCatalog& cat) {
+    std::printf("[test] correlated EXISTS whose inner FROM reuses the outer's base table\n");
+    with_plan(cat,
+              "SELECT e.id FROM emp e WHERE EXISTS "
+              "(SELECT 1 FROM emp e2 WHERE e2.dept = e.dept)",
+              [](const LogicalNode* root) {
+        const LogicalNode* filter = only_child(root);
+        check(filter && filter->op == LogicalOp::Filter, "child is Filter");
+        const db25::plan::Expr* sub = filter ? filter->predicate.get() : nullptr;
+        expect_subquery(sub, SubqueryKind::Exists, true,
+                        "self-correlated EXISTS predicate subquery");
+        // The outer column `e.dept` must survive as an OuterRef in the inner plan,
+        // not be swallowed into the inner `e2.dept` slot.
+        check(sub && sub->kind == ExprKind::Subquery && sub->sub_plan &&
+                  plan_has_outer_ref(sub->sub_plan.get()),
+              "inner plan carries an OuterRef (outer column not swallowed)");
+    });
+}
+
 }  // namespace
 
 void test_derived_table_column_alias(const InMemoryCatalog& cat) {
@@ -2303,6 +2367,7 @@ int main() {
     test_scalar_subquery_correlated(cat);
     test_in_subquery(cat);
     test_exists_subquery(cat);
+    test_self_correlated_subquery(cat);
     test_not_exists_negated(cat);
     test_scalar_subquery_over_aggregate(cat);
 
