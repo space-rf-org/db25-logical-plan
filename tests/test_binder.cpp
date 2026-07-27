@@ -1472,6 +1472,42 @@ void test_cte(const InMemoryCatalog& cat) {
         walk(root);
         check(has_setop, "setop-cte: the CTE body lowered to a SetOp");
     });
+
+    // A recursive or mutually-recursive CTE must be rejected gracefully, not
+    // crash: a reference to the CTE inside its own body would re-expand the body
+    // without bound and overflow the stack. Recursive CTEs are unsupported.
+    // (These bind directly - the analyzer flags the self-reference, and bind()
+    // must stay defensive regardless.)
+    {
+        db25::parser::Parser parser;
+        auto reject = [&](const char* sql, const char* what) {
+            auto parsed = parser.parse(sql);
+            check(parsed.has_value(), std::string{"parse: "} + sql);
+            if (!parsed) return;
+            Analyzer analyzer(cat);
+            analyzer.analyze(parsed.value());
+            Binder binder(analyzer, cat);
+            BindResult res = binder.bind(parsed.value());
+            check(!res.ok, what);  // rejected, and (the point) did not crash
+        };
+        reject("WITH RECURSIVE r AS (SELECT 1 UNION ALL SELECT * FROM r) SELECT * FROM r",
+               "recursive: direct self-reference rejected, no stack overflow");
+        reject("WITH RECURSIVE r(n) AS "
+               "(SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 10) SELECT n FROM r",
+               "recursive: recursive-term self-reference rejected");
+        reject("WITH a AS (SELECT id FROM b), b AS (SELECT id FROM a) SELECT id FROM a",
+               "recursive: mutual a<->b reference rejected");
+    }
+
+    // Guard: a CTE referenced twice in a self-join is TWO sequential (non-nested)
+    // expansions, not a cycle - it must still bind.
+    with_plan(cat,
+              "WITH t AS (SELECT id FROM users) "
+              "SELECT t1.id FROM t t1 JOIN t t2 ON t1.id = t2.id",
+              [](const LogicalNode* root) {
+        check(root != nullptr && root->op == LogicalOp::Project,
+              "cte-self-join: binds (two references are not a recursive cycle)");
+    });
 }
 
 // A self-join of two derived tables (or two references to one CTE) over the same
