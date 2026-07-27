@@ -1461,6 +1461,61 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
                 continue;
             }
 
+            // A QUALIFIED column reference (`u.id`) in ORDER BY is an INPUT-column
+            // reference, not an output-name match: it must resolve against the
+            // Project's INPUT frame, where the per-side hidden copies of a USING /
+            // NATURAL merged column carry their alias. Output columns carry no
+            // alias, so resolving a qualified ref against the narrow Project output
+            // would bind it to a same-(table_id,column_id) merged COALESCE column -
+            // the wrong (non-null) value under a RIGHT / FULL join, where `u.id`
+            // must order by the (nullable) left column. Reuse a projected output
+            // column that already IS this input column; otherwise append a hidden
+            // sort-only column resolved against the input frame.
+            if (proj_input != nullptr && !over_distinct &&
+                (key->node_type == NodeType::ColumnRef ||
+                 key->node_type == NodeType::Identifier) &&
+                !split_column_ref(key->primary_text).qualifier.empty()) {
+                std::string qerr;
+                agg_frame_ = &agg_frame;
+                auto in_ref = lower_expr(key, *proj_input, qerr);
+                agg_frame_ = nullptr;
+                if (in_ref) {
+                    int reuse = -1;
+                    if (in_ref->kind == ExprKind::ColumnRef && project != nullptr) {
+                        for (std::size_t k = 0; k < project->exprs.size(); ++k) {
+                            const auto& pe = project->exprs[k];
+                            if (pe && pe->kind == ExprKind::ColumnRef &&
+                                pe->input_index == in_ref->input_index) {
+                                reuse = static_cast<int>(k);
+                                break;
+                            }
+                        }
+                    }
+                    if (reuse >= 0) {
+                        sk.expr = make_column_ref(
+                            static_cast<std::uint32_t>(reuse),
+                            input_node->output[static_cast<std::size_t>(reuse)]);
+                    } else {
+                        ColumnSchema hcol;
+                        hcol.name = item_output_name(key);
+                        hcol.type = in_ref->type;
+                        hcol.nullable = in_ref->nullability != 1;
+                        hcol.table_id = in_ref->ref_table_id;
+                        hcol.column_id = in_ref->ref_column_id;
+                        project->output.push_back(hcol);
+                        project->exprs.push_back(std::move(in_ref));
+                        sk.expr = make_column_ref(
+                            static_cast<std::uint32_t>(project->output.size() - 1),
+                            project->output.back());
+                    }
+                    sort->sort_keys.push_back(std::move(sk));
+                    continue;
+                }
+                // If the qualified ref did not resolve against the input frame,
+                // fall through to the normal resolution below (which reports the
+                // error consistently).
+            }
+
             // Resolve against the input's current output (a selected column, an
             // output alias, or a prior hidden sort column already appended).
             std::string local_error;

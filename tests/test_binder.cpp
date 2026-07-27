@@ -2709,6 +2709,60 @@ void test_values_column_types_match_analyzer(const InMemoryCatalog& cat) {
     }
 }
 
+// A qualified ORDER BY reference to the null-supplying side of a RIGHT/FULL
+// USING/NATURAL join must order by THAT side's own (nullable) column, not the
+// merged COALESCE output. Regression: the ORDER BY key resolved against the
+// narrow SELECT Project output, where the merged column retains the left
+// (table_id,column_id) but carries no alias, so `u.id` bound to the merged slot
+// (a not-null value) even when the output column was renamed. The qualified key
+// now resolves against the input frame (with the per-side hidden copies).
+void test_order_by_qualified_null_side_right_join(const InMemoryCatalog& cat) {
+    std::printf("[test] ORDER BY u.id on a RIGHT USING join orders by the left copy\n");
+    // Bare `id` is projected (the merged COALESCE, slot 0). ORDER BY u.id must NOT
+    // reuse slot 0; it must order by a distinct, NULLABLE column (the left copy).
+    with_plan(cat, "SELECT id FROM users u RIGHT JOIN orders o USING (id) ORDER BY u.id",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Sort && !root->sort_keys.empty(),
+              "root is a Sort with a key");
+        const LogicalNode* proj = only_child(root);
+        if (!root->sort_keys.empty() && proj != nullptr) {
+            const auto& k = root->sort_keys[0].expr;
+            check(k && k->kind == ExprKind::ColumnRef, "sort key is a ColumnRef");
+            if (k && k->kind == ExprKind::ColumnRef) {
+                const std::size_t slot = k->input_index;
+                // The projected merged id is slot 0 and NOT NULL; the sort key must
+                // point at a different, nullable column (the hidden left copy).
+                check(slot != 0, "ORDER BY u.id does NOT reuse the merged id (slot 0)");
+                check(slot < proj->output.size() && proj->output[slot].nullable,
+                      "ORDER BY u.id orders by a nullable (left-side) column");
+            }
+        }
+    });
+
+    // Renaming the output must not change this (proves it is not an output-name
+    // match): still a distinct nullable sort column, not the renamed merged slot.
+    with_plan(cat, "SELECT id AS xyz FROM users u RIGHT JOIN orders o USING (id) ORDER BY u.id",
+              [](const LogicalNode* root) {
+        if (!root->sort_keys.empty()) {
+            const auto& k = root->sort_keys[0].expr;
+            check(k && k->kind == ExprKind::ColumnRef && k->input_index != 0,
+                  "renamed output: ORDER BY u.id still not the merged slot 0");
+        }
+    });
+
+    // Control: a plain qualified ORDER BY that IS the projected column reuses the
+    // output slot (no wasteful hidden column, no regression).
+    with_plan(cat, "SELECT o.total FROM orders o ORDER BY o.total",
+              [](const LogicalNode* root) {
+        const LogicalNode* proj = only_child(root);
+        check(!root->sort_keys.empty() && root->sort_keys[0].expr &&
+                  root->sort_keys[0].expr->input_index == 0,
+              "ORDER BY o.total reuses projected slot 0");
+        check(proj && proj->output.size() == 1,
+              "no extra hidden sort column appended");
+    });
+}
+
 int main() {
     const InMemoryCatalog cat = make_catalog();
 
@@ -2765,6 +2819,7 @@ int main() {
     test_right_full_using_qualified_sides(cat);
     test_using_natural_join_matrix(cat);
     test_values_column_types_match_analyzer(cat);
+    test_order_by_qualified_null_side_right_join(cat);
     test_join_using_multi(cat);
     test_select_star_over_using(cat);
     test_qualified_star_over_join_rejected(cat);
