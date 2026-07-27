@@ -253,6 +253,35 @@ std::string item_output_name(const ASTNode* item) {
     return std::string{item->primary_text};
 }
 
+// A GROUP BY key may name a SELECT-list output alias (a PostgreSQL extension the
+// analyzer accepts): `SELECT dept AS d ... GROUP BY d` groups by dept. If `key`
+// is an unqualified column reference that matches a projected item's output name,
+// return that item - its expression is the real grouping target. Only consulted
+// after the key fails to resolve as an input column, so input-column precedence
+// (the analyzer's rule) is preserved.
+const ASTNode* group_key_alias_target(const ASTNode* key, const ASTNode* select_list) {
+    if (key == nullptr || select_list == nullptr) {
+        return nullptr;
+    }
+    if (key->node_type != NodeType::ColumnRef && key->node_type != NodeType::Identifier) {
+        return nullptr;
+    }
+    const auto qref = split_column_ref(key->primary_text);
+    if (!qref.qualifier.empty()) {
+        return nullptr;  // a qualified `t.c` is a base column, never an alias
+    }
+    for (const ASTNode* item = first_child(select_list); item != nullptr;
+         item = item->next_sibling) {
+        if (item->node_type == NodeType::Star) {
+            continue;
+        }
+        if (iequals(item_output_name(item), qref.column)) {
+            return item;
+        }
+    }
+    return nullptr;
+}
+
 // Build an owned ColumnRef Expr that references slot `slot` of an input schema,
 // carrying the referenced column's type, nullability (parser 2-bit: 1 not-null /
 // 2 nullable) and provenance ids. The single place a positional projection leaf
@@ -1057,30 +1086,50 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
         //
         // Group keys: the GROUP BY expressions, or empty for implicit
         // aggregation. Keys are base-column references or expressions over the
-        // input, which lower directly. (GROUP BY by output ordinal `GROUP BY 1`
-        // or by select alias is rejected upstream by the analyzer, so it never
-        // reaches a clean bind and is not resolved here.) A bare-column key
-        // additionally carries its source (table_id, column_id) so an operator
-        // above resolves it by id rather than only structurally.
+        // input, which lower directly. `GROUP BY 1` (output ordinal) is rejected
+        // upstream. A GROUP BY key may, however, name a SELECT output ALIAS
+        // (`GROUP BY d` for `dept AS d`) - a PostgreSQL extension the analyzer
+        // accepts: it does not resolve against the input, so lower the aliased
+        // SELECT item's expression instead (see group_key_alias_target). A
+        // bare-column key additionally carries its source (table_id, column_id)
+        // so an operator above resolves it by id rather than only structurally.
         std::uint32_t slot = 0;
         for (const ASTNode* key = group_by != nullptr ? first_child(group_by) : nullptr;
              key != nullptr; key = key->next_sibling) {
+            const ASTNode* lowered_from = key;
             auto e = lower_expr(key, agg_input, error);
             if (!e) {
-                return nullptr;
+                // Not an input column/expression: try a SELECT output alias.
+                // (Reaching here means the key did not resolve against the input,
+                // so input-column precedence is already honoured.)
+                if (const ASTNode* alias_item = group_key_alias_target(key, select_list)) {
+                    error.clear();
+                    e = lower_expr(alias_item, agg_input, error);
+                    lowered_from = alias_item;
+                }
+                if (!e) {
+                    return nullptr;
+                }
             }
             ColumnSchema col;
             col.name = item_output_name(key);
             col.type = analyzer_.type_of(key);
             col.nullable = analyzer_.nullability_of(key) != 1;
-            if (key->node_type == NodeType::ColumnRef ||
-                key->node_type == NodeType::Identifier) {
-                col.table_id = key->context.analysis.table_id;
-                col.column_id = key->context.analysis.column_id;
+            if (lowered_from->node_type == NodeType::ColumnRef ||
+                lowered_from->node_type == NodeType::Identifier) {
+                col.table_id = lowered_from->context.analysis.table_id;
+                col.column_id = lowered_from->context.analysis.column_id;
             }
             agg->output.push_back(std::move(col));
             agg->group_keys.push_back(std::move(e));
+            // Register BOTH the key and (when distinct) the aliased item as
+            // producers of this slot, so a SELECT/HAVING/ORDER BY reference that
+            // matches either the alias key or the underlying expression routes
+            // here.
             agg_frame.producers.emplace_back(key, slot);
+            if (lowered_from != key) {
+                agg_frame.producers.emplace_back(lowered_from, slot);
+            }
             ++slot;
         }
         // Aggregate results: one column per DISTINCT aggregate call collected

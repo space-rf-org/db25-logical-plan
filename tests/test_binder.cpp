@@ -563,6 +563,44 @@ void test_group_by(const InMemoryCatalog& cat) {
     });
 }
 
+// A GROUP BY key may name a SELECT-list output alias (PostgreSQL extension the
+// analyzer accepts): the binder must group by the aliased expression, not fail
+// to resolve the alias as a base column. Regression: `... GROUP BY d` for
+// `dept AS d` bound-failed with "unresolved column reference 'd'".
+void test_group_by_output_alias(const InMemoryCatalog& cat) {
+    std::printf("[test] GROUP BY <select output alias>\n");
+
+    // Single-column alias: groups by dept (slot #1 of emp); the projection's
+    // `d` resolves to the group-key slot #0.
+    with_plan(cat, "SELECT dept AS d, COUNT(*) FROM emp GROUP BY d",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "alias: root is Project");
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->op == LogicalOp::Aggregate, "alias: child is Aggregate");
+        check(agg && agg->group_keys.size() == 1, "alias: 1 group key");
+        if (agg && agg->group_keys.size() == 1) {
+            expect_col_ref(agg->group_keys[0], 1, "alias: group key is dept (#1)");
+        }
+        check(root->exprs.size() == 2, "alias: project has 2 exprs");
+        if (root->exprs.size() == 2) {
+            expect_col_ref(root->exprs[0], 0, "alias: proj d -> group-key slot #0");
+        }
+        if (root->output.size() == 2) {
+            check(root->output[0].name == "d", "alias: output col named 'd'");
+        }
+    });
+
+    // Compound-expression alias: `GROUP BY s` groups by `sal + 1`.
+    with_plan(cat, "SELECT sal + 1 AS s FROM emp GROUP BY s",
+              [](const LogicalNode* root) {
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->op == LogicalOp::Aggregate, "expr-alias: child is Aggregate");
+        check(agg && agg->group_keys.size() == 1 &&
+                  agg->group_keys[0]->kind == ExprKind::BinaryOp,
+              "expr-alias: group key is the sal+1 expression");
+    });
+}
+
 // The Aggregate output is group_keys ++ aggregates, independent of SELECT order.
 // `SELECT COUNT(*), dept` puts the aggregate first in the select list but the
 // Aggregate output is still [dept (key), COUNT (agg)]; the Project reorders it
@@ -2336,6 +2374,7 @@ int main() {
     test_self_join_alias_resolution(cat);
     test_table_name_qualifier(cat);
     test_group_by(cat);
+    test_group_by_output_alias(cat);
     test_group_by_select_reordered(cat);
     test_group_by_same_name_aggregates(cat);
     test_self_join_group_key_distinct_slots(cat);
