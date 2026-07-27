@@ -420,6 +420,9 @@ void push_down_in_expr(ExprPtr& e) {
     for (auto& c : e->children) {
         push_down_in_expr(c);
     }
+    if (e->filter) {  // aggregate FILTER predicate may embed its own subquery
+        push_down_in_expr(e->filter);
+    }
     if (e->kind == ExprKind::WindowFunction) {
         for (auto& p : e->window.partition_by) push_down_in_expr(p);
         for (auto& k : e->window.order_by) push_down_in_expr(k.expr);
@@ -826,6 +829,9 @@ void prune_subplans_in_expr(ExprPtr& e) {
     }
     for (auto& c : e->children) {
         prune_subplans_in_expr(c);
+    }
+    if (e->filter) {  // aggregate FILTER predicate may embed its own subquery
+        prune_subplans_in_expr(e->filter);
     }
     if (e->kind == ExprKind::WindowFunction) {
         for (auto& p : e->window.partition_by) prune_subplans_in_expr(p);
@@ -1403,6 +1409,9 @@ void decorrelate_in_expr(ExprPtr& e) {
     }
     for (auto& c : e->children) {
         decorrelate_in_expr(c);
+    }
+    if (e->filter) {  // aggregate FILTER predicate may embed its own subquery
+        decorrelate_in_expr(e->filter);
     }
     if (e->kind == ExprKind::WindowFunction) {
         for (auto& p : e->window.partition_by) decorrelate_in_expr(p);

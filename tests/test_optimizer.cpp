@@ -965,6 +965,46 @@ void test_optimize_idempotent(const InMemoryCatalog& cat) {
     }
 }
 
+// Follow the child(0) spine to the bottom node.
+const LogicalNode* deepest_node(const LogicalNode* n) {
+    while (n != nullptr && n->child_count() >= 1) {
+        n = n->child(0);
+    }
+    return n;
+}
+
+// A subquery embedded in an aggregate FILTER (WHERE ...) predicate must be
+// reached by the sub-plan-recursion walkers (pushdown / prune / decorrelate),
+// which previously omitted the e->filter branch that the other walkers handle.
+// Here column pruning must reach into the FILTER subquery: its inner scan reads
+// only the columns the subquery references (id for the filter, dept for the
+// projection), not the base table's third column (sal).
+void test_prune_reaches_filter_subquery(const InMemoryCatalog& cat) {
+    std::printf("[test] column pruning reaches a subquery inside an aggregate FILTER\n");
+    with_optimized_plan(cat,
+        "SELECT SUM(sal) FILTER (WHERE dept IN (SELECT dept FROM emp WHERE id > 5)) "
+        "FROM emp",
+        [](const LogicalNode* root) {
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->op == LogicalOp::Aggregate, "child is Aggregate");
+        const Expr* sum = (agg && !agg->aggregates.empty()) ? agg->aggregates[0].get()
+                                                            : nullptr;
+        check(sum != nullptr, "aggregate call present");
+        const Expr* filt = sum ? sum->filter.get() : nullptr;
+        check(filt && filt->kind == ExprKind::Subquery && filt->sub_plan,
+              "FILTER predicate is a Subquery with an inner sub-plan");
+        if (filt && filt->sub_plan) {
+            const LogicalNode* scan = deepest_node(filt->sub_plan.get());
+            check(scan && scan->op == LogicalOp::Scan,
+                  "inner FILTER sub-plan bottoms at a Scan");
+            // Falsifiable: pre-fix the prune walker skipped e->filter and the
+            // inner scan kept all 3 base columns.
+            check(scan && scan->output.size() == 2,
+                  "inner FILTER-subquery scan pruned to 2 columns (id, dept)");
+        }
+    });
+}
+
 }  // namespace
 
 int main() {
@@ -1012,6 +1052,7 @@ int main() {
     test_prune_semijoin_inputs(cat);
     test_pushdown_through_semijoin();
     test_optimize_idempotent(cat);
+    test_prune_reaches_filter_subquery(cat);
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) {
