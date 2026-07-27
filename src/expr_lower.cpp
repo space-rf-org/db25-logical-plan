@@ -142,6 +142,10 @@ bool map_binary_op(std::string_view text, BinaryOp& out) {
     if (u == "IS NOT") { out = BinaryOp::IsNot; return true; }
     if (u == "IN") { out = BinaryOp::In; return true; }
     if (u == "NOT IN") { out = BinaryOp::NotIn; return true; }
+    // Null-safe comparison (analyzer types it Boolean, never NULL). The parser
+    // emits these exact uppercase operator texts.
+    if (u == "IS DISTINCT FROM") { out = BinaryOp::IsDistinctFrom; return true; }
+    if (u == "IS NOT DISTINCT FROM") { out = BinaryOp::IsNotDistinctFrom; return true; }
     return false;
 }
 

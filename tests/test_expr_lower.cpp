@@ -181,6 +181,42 @@ void test_predicate_greater_than(const InMemoryCatalog& cat) {
           "literal value == 100");
 }
 
+// IS [NOT] DISTINCT FROM lowers to a BinaryOp with the right op, Boolean type,
+// and NOT-NULL (the null-safe comparison never yields NULL), and dumps with the
+// correct operator text.
+void test_is_distinct_from_lowering(const InMemoryCatalog& cat) {
+    std::printf("[test] WHERE user_id IS [NOT] DISTINCT FROM total\n");
+    struct Case { const char* sql; db25::ast::BinaryOp op; const char* text; };
+    const Case cases[] = {
+        {"SELECT total FROM orders o WHERE user_id IS DISTINCT FROM total",
+         db25::ast::BinaryOp::IsDistinctFrom, "IS DISTINCT FROM"},
+        {"SELECT total FROM orders o WHERE user_id IS NOT DISTINCT FROM total",
+         db25::ast::BinaryOp::IsNotDistinctFrom, "IS NOT DISTINCT FROM"},
+    };
+    for (const auto& c : cases) {
+        Analyzer az(cat);
+        Analyzed a;
+        analyze_into(a, cat, az, c.sql);
+        if (!a.ok) continue;
+        const ASTNode* pred = where_predicate(a.stmt);
+        check(pred != nullptr, "found WHERE predicate");
+        const Schema input = schema_of(cat, "orders");  // id@0, user_id@1, total@2
+        Binder binder(az, cat);
+        std::string err;
+        ExprPtr e = BinderExprTestAccess::lower(binder, pred, input, err);
+        check(e != nullptr, std::string{"lowered predicate: "} + err);
+        if (!e) continue;
+        check(e->kind == ExprKind::BinaryOp, "root is BinaryOp");
+        check(e->bin_op == c.op, std::string{"op is "} + c.text);
+        check(e->type == DataType::Boolean, "type Boolean");
+        check(e->nullability == 1, "null-safe comparison is NOT NULL");
+        check(e->children.size() == 2, "two operands");
+        // The dump names the operator (not the parser's "Unknown" fallback).
+        check(dump_expr(*e).find(c.text) != std::string::npos,
+              std::string{"dump contains "} + c.text);
+    }
+}
+
 // -------------------------------------------------------------------------
 // (b) SUM(sal) + 1  (arithmetic over an aggregate)
 // -------------------------------------------------------------------------
@@ -634,6 +670,7 @@ int main() {
     const InMemoryCatalog cat = make_catalog();
 
     test_predicate_greater_than(cat);
+    test_is_distinct_from_lowering(cat);
     test_arith_over_aggregate(cat);
     test_columnref_handbuilt_schema(cat);
     test_computed_column_name_case_insensitive(cat);
