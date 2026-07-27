@@ -2587,6 +2587,78 @@ void test_values_derived_table(const InMemoryCatalog& cat) {
     });
 }
 
+// GUARDRAIL MATRIX: USING / NATURAL join column merging. This neighborhood was
+// touched by three separate audit passes (bare-ref coalescing, the INNER/LEFT
+// hidden right-copy, the RIGHT/FULL per-side hidden copies), each closing one
+// adjacent cell. This table pins the WHOLE matrix - every join type x merge
+// syntax x reference form - so a future change that regresses any single cell
+// (a dropped copy, a wrong slot, a wrong null flag) fails loudly here.
+void test_using_natural_join_matrix(const InMemoryCatalog& cat) {
+    std::printf("[test] USING/NATURAL join matrix (join type x merge syntax x ref form)\n");
+    // users(id,name) and orders(id,user_id,total) share only `id`, so USING(id)
+    // and NATURAL merge the same single column. Per-side nullability of a
+    // qualified key ref follows which side is null-supplied by the join.
+    struct JT { const char* kw; bool u_nullable; bool o_nullable; };
+    const JT jts[] = {
+        {"INNER JOIN", false, false},
+        {"LEFT JOIN",  false, true},   // right null-supplied
+        {"RIGHT JOIN", true,  false},  // left null-supplied
+        {"FULL JOIN",  true,  true},   // both
+    };
+    const auto count_visible = [](const LogicalNode* root, const char* nm) {
+        int v = 0;
+        for (const auto& c : root->output) if (c.name == nm && !c.hidden) ++v;
+        return v;
+    };
+    for (const JT& j : jts) {
+        for (int natural = 0; natural < 2; ++natural) {
+            const std::string join =
+                std::string("users u ") +
+                (natural ? std::string("NATURAL ") + j.kw : std::string(j.kw)) +
+                " orders o" + (natural ? "" : " USING (id)");
+            const std::string ctx = join;
+
+            // bare `id` -> exactly one visible merged column.
+            with_plan(cat, "SELECT id FROM " + join, [&](const LogicalNode* root) {
+                check(count_visible(root, "id") == 1, "matrix bare id once: " + ctx);
+            });
+            // SELECT * -> merged id shown once (hidden per-side copies excluded).
+            with_plan(cat, "SELECT * FROM " + join, [&](const LogicalNode* root) {
+                check(count_visible(root, "id") == 1, "matrix star id once: " + ctx);
+            });
+            // u.id / o.id -> DISTINCT slots with the correct per-side nullability.
+            const bool un = j.u_nullable, on = j.o_nullable;
+            with_plan(cat, "SELECT u.id, o.id FROM " + join,
+                      [&, un, on](const LogicalNode* root) {
+                if (root->exprs.size() == 2 && root->output.size() == 2) {
+                    check(root->exprs[0]->input_index != root->exprs[1]->input_index,
+                          "matrix u.id/o.id distinct slots: " + ctx);
+                    check(root->output[0].nullable == un, "matrix u.id nullability: " + ctx);
+                    check(root->output[1].nullable == on, "matrix o.id nullability: " + ctx);
+                } else {
+                    check(false, "matrix u.id/o.id shape: " + ctx);
+                }
+            });
+            // A qualified null-supplying-side ref in WHERE must still bind (the
+            // per-side copy is addressable). with_plan asserts bind success.
+            with_plan(cat, "SELECT u.id FROM " + join + " WHERE o.id = 5",
+                      [](const LogicalNode*) {});
+        }
+    }
+    // Multi-column merge: a users self-join on USING (id, name) merges BOTH
+    // columns; `SELECT *` shows each exactly once and qualified refs to both
+    // sides bind.
+    for (const char* kw : {"INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"}) {
+        const std::string join = std::string("users a ") + kw + " users b USING (id, name)";
+        with_plan(cat, "SELECT * FROM " + join, [&](const LogicalNode* root) {
+            check(count_visible(root, "id") == 1 && count_visible(root, "name") == 1,
+                  std::string("matrix multi-col id/name once: ") + kw);
+        });
+        with_plan(cat, "SELECT a.id, b.id, a.name, b.name FROM " + join,
+                  [](const LogicalNode*) {});  // qualified both sides binds
+    }
+}
+
 int main() {
     const InMemoryCatalog cat = make_catalog();
 
@@ -2641,6 +2713,7 @@ int main() {
     test_left_join_using_keeps_left_copy(cat);
     test_using_qualified_null_side(cat);
     test_right_full_using_qualified_sides(cat);
+    test_using_natural_join_matrix(cat);
     test_join_using_multi(cat);
     test_select_star_over_using(cat);
     test_qualified_star_over_join_rejected(cat);
