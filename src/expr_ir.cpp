@@ -43,6 +43,18 @@ std::string type_suffix(DataType t) {
     return std::string{":"} + ast::data_type_to_string(t);
 }
 
+// Render a binary operator for a plan dump. IS [NOT] DISTINCT FROM are DB25
+// null-safe comparisons whose enum values the parser's binary_op_to_string does
+// not name (it returns "Unknown"); spell them here so dumps read correctly, and
+// delegate every other operator to the canonical parser helper.
+const char* binop_text(ast::BinaryOp op) {
+    switch (op) {
+        case ast::BinaryOp::IsDistinctFrom:    return "IS DISTINCT FROM";
+        case ast::BinaryOp::IsNotDistinctFrom: return "IS NOT DISTINCT FROM";
+        default:                               return ast::binary_op_to_string(op);
+    }
+}
+
 std::string literal_text(const LiteralValue& v) {
     return std::visit(
         [](const auto& arg) -> std::string {
@@ -81,7 +93,7 @@ void render(const Expr& e, std::string& out) {
             out += "(";
             if (e.children.size() == 2) {
                 render(*e.children[0], out);
-                out += std::string{" "} + ast::binary_op_to_string(e.bin_op) + " ";
+                out += std::string{" "} + binop_text(e.bin_op) + " ";
                 render(*e.children[1], out);
             }
             out += ")" + type_suffix(e.type);
