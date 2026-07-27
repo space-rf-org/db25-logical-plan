@@ -798,64 +798,39 @@ LogicalNodePtr Binder::bind_setop(const ASTNode* setop, std::string& error) {
         return nullptr;
     }
 
-    // --- Hoist a trailing ORDER BY / LIMIT off the last branch ------------
-    // A trailing ORDER BY / LIMIT that follows a set operation scopes to the
-    // WHOLE result. SQL forbids a set-op branch from carrying its own ORDER BY
-    // (without parentheses), so any ORDER BY / LIMIT the grammar hangs on the
-    // last branch belongs to the set operation - but the parser attaches it to
-    // that last SelectStmt and bind_query bound it INSIDE the branch (a Sort
-    // and/or Limit at the top of `right`). Peel those off, build the SetOp over
-    // the branch core, and re-apply them ABOVE the SetOp (Sort directly above,
-    // Limit above the Sort). The ORDER BY keys are re-lowered against the
-    // reconciled set-op output so `ORDER BY <col>` binds to the set operation's
-    // output column (not to a same-named base column of the last branch).
-    //
-    // Conservative: only the last branch, and only when it is a plain
-    // SelectStmt whose bound form exposes a Sort / Limit at its very top. A
-    // parenthesized subquery with its own interior ORDER BY binds as a derived
-    // table and does not expose a top Sort / Limit here, so it is left alone.
-    bool hoist_sort = false;
-    bool hoist_limit = false;
-    bool sl_has_limit = false, sl_has_offset = false;
-    std::int64_t sl_limit = -1, sl_offset = 0;
-    if (right_q->node_type == NodeType::SelectStmt) {
-        // Peel the outermost Limit (Limit -> Sort -> core or Limit -> core).
-        if (right->op == LogicalOp::Limit && right->child_count() == 1) {
-            hoist_limit = true;
-            sl_has_limit = right->has_limit;
-            sl_limit = right->limit;
-            sl_has_offset = right->has_offset;
-            sl_offset = right->offset;
-            right = std::move(right->children[0]);
-        }
-        // Peel the outermost Sort (now the top node, if present).
-        if (right->op == LogicalOp::Sort && right->child_count() == 1) {
-            hoist_sort = true;
-            right = std::move(right->children[0]);
-            // The branch's own Sort may have appended hidden sort-only columns
-            // to the core Project; the set operation reconciles only the visible
-            // columns, so drop the hidden ones to keep the branch's arity in
-            // step with the set-op output. (Under DISTINCT no hidden columns are
-            // ever added, so `right` is a plain Project here whenever there are
-            // extra columns to drop.)
-            const std::size_t n = node->output.size();
-            if (right->op == LogicalOp::Project && right->output.size() > n) {
-                right->output.resize(n);
-                right->exprs.resize(n);
-            }
-        }
-    }
-
     node->add_child(std::move(left));
     node->add_child(std::move(right));
     LogicalNodePtr result = std::move(node);
+
+    // --- Trailing ORDER BY / LIMIT scope to the WHOLE set operation --------
+    // SQL forbids an unparenthesized set-op branch from carrying its own ORDER
+    // BY / LIMIT, so a trailing ORDER BY / LIMIT belongs to the set operation.
+    // The parser attaches those clauses as DIRECT CHILDREN of the set-op node
+    // (UnionStmt / IntersectStmt / ExceptStmt); read them from there and build a
+    // Sort (directly above the SetOp) and a Limit (above the Sort) over the
+    // reconciled set-op output. The ORDER BY keys are lowered against that output
+    // so `ORDER BY <col>` / `ORDER BY <n>` bind to the set operation's output
+    // column, not to a same-named base column of a branch. A branch's OWN
+    // parenthesized ORDER BY stays inside that branch (it binds as a derived
+    // table) and is not touched here.
+    bool sl_has_limit = false, sl_has_offset = false;
+    std::int64_t sl_limit = -1, sl_offset = 0;
+    if (const ASTNode* limit = find_child(setop, NodeType::LimitClause)) {
+        const ASTNode* limit_op = first_child(limit);
+        const ASTNode* offset_op = limit_op != nullptr ? limit_op->next_sibling : nullptr;
+        std::int64_t v = 0;
+        if (parse_int_literal(limit_op, v)) { sl_has_limit = true; sl_limit = v; }
+        if (parse_int_literal(offset_op, v)) { sl_has_offset = true; sl_offset = v; }
+    }
+    const bool hoist_sort = find_child(setop, NodeType::OrderByClause) != nullptr;
+    const bool hoist_limit = find_child(setop, NodeType::LimitClause) != nullptr;
 
     // Re-apply the ORDER BY as a Sort above the SetOp, keyed on the reconciled
     // set-op output. Mirrors the ordinal / column / ASC-DESC / NULLS handling in
     // bind_select, minus the hidden-column path (an ORDER BY over a set op must
     // reference an output column).
     if (hoist_sort) {
-        const ASTNode* order_by = find_child(right_q, NodeType::OrderByClause);
+        const ASTNode* order_by = find_child(setop, NodeType::OrderByClause);
         if (order_by == nullptr) {
             error = "internal: hoisted set-op ORDER BY lost its clause";
             return nullptr;
