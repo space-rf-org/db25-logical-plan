@@ -2659,6 +2659,56 @@ void test_using_natural_join_matrix(const InMemoryCatalog& cat) {
     }
 }
 
+// GUARDRAIL: the binder's Values-node output column types must equal the types
+// the analyzer assigns to the same columns (a multi-row VALUES is a UNION ALL of
+// rows; both layers reconcile across all rows). Typing the Values node from the
+// first row only made the two layers DISAGREE. Here `SELECT * FROM (VALUES...) t`
+// lowers the derived columns straight through, so the top Project's output types
+// come from the analyzer while the Values node's come from the binder's own
+// reconciliation - they must match position-for-position. This cross-check fails
+// if reconcile_value_type ever drifts from the analyzer's UnionReconcile rule.
+void test_values_column_types_match_analyzer(const InMemoryCatalog& cat) {
+    std::printf("[test] binder VALUES column types match the analyzer (no divergence)\n");
+    const char* sqls[] = {
+        "SELECT * FROM (VALUES (1),(2),(3)) t(a)",
+        "SELECT * FROM (VALUES (1),(2.5)) t(a)",
+        "SELECT * FROM (VALUES (2.5),(1)) t(a)",
+        "SELECT * FROM (VALUES (1),(2.0),(3)) t(a)",
+        "SELECT * FROM (VALUES (NULL),(1)) t(a)",
+        "SELECT * FROM (VALUES (1),(NULL)) t(a)",
+        "SELECT * FROM (VALUES (NULL, 1),(2, 2.5)) t(a,b)",
+        "SELECT * FROM (VALUES (1,'x'),(2,'y')) t(a,b)",
+        "SELECT * FROM (VALUES ('a'),('bb')) t(a)",
+    };
+    // Recursively find the (single) Values node in the bound plan.
+    struct F {
+        static const LogicalNode* find(const LogicalNode* n) {
+            if (!n) return nullptr;
+            if (n->op == LogicalOp::Values) return n;
+            for (std::size_t i = 0; i < n->child_count(); ++i)
+                if (const LogicalNode* v = find(n->child(i))) return v;
+            return nullptr;
+        }
+    };
+    for (const char* sql : sqls) {
+        with_plan(cat, sql, [&](const LogicalNode* root) {
+            const LogicalNode* values = F::find(root);
+            check(values != nullptr, std::string{"found Values node: "} + sql);
+            // `SELECT *` carries every derived column straight to the root Project,
+            // whose types are the analyzer's; compare them to the Values node's.
+            if (values && root->output.size() == values->output.size()) {
+                for (std::size_t i = 0; i < root->output.size(); ++i) {
+                    check(root->output[i].type == values->output[i].type,
+                          std::string{"col "} + std::to_string(i) +
+                              " type agrees analyzer<->binder: " + sql);
+                }
+            } else {
+                check(false, std::string{"arity match: "} + sql);
+            }
+        });
+    }
+}
+
 int main() {
     const InMemoryCatalog cat = make_catalog();
 
@@ -2714,6 +2764,7 @@ int main() {
     test_using_qualified_null_side(cat);
     test_right_full_using_qualified_sides(cat);
     test_using_natural_join_matrix(cat);
+    test_values_column_types_match_analyzer(cat);
     test_join_using_multi(cat);
     test_select_star_over_using(cat);
     test_qualified_star_over_join_rejected(cat);
