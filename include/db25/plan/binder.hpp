@@ -244,6 +244,15 @@ private:
     // shadows an outer one.
     std::vector<std::pair<std::string, const db25::ast::ASTNode*>> ctes_;
 
+    // CTE definitions whose body is currently being expanded (a stack). A CTE
+    // reference that appears inside its own body - directly (`WITH RECURSIVE r AS
+    // (... FROM r)`) or mutually (`WITH a AS (SELECT FROM b), b AS (SELECT FROM
+    // a)`) - would otherwise re-expand the body without end and overflow the
+    // stack. bind_table_ref refuses to re-enter a definition already on this
+    // stack (recursive CTEs are not supported; this matches the analyzer, which
+    // reports the self-reference as an unresolved table).
+    std::vector<const db25::ast::ASTNode*> cte_expanding_;
+
     friend struct BinderExprTestAccess;
 };
 

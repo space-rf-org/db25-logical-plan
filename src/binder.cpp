@@ -315,10 +315,23 @@ LogicalNodePtr Binder::bind_table_ref(const ASTNode* table_ref, std::string& err
     for (auto it = ctes_.rbegin(); it != ctes_.rend(); ++it) {
         if (iequals(it->first, name)) {  // CTE names are identifiers: fold case
             const ASTNode* def = it->second;
+            // Refuse to re-expand a CTE that is already being expanded higher up:
+            // a reference to it inside its own body (recursive or mutually
+            // recursive) would recurse without bound and overflow the stack.
+            // Recursive CTEs are unsupported; reject gracefully.
+            for (const ASTNode* active : cte_expanding_) {
+                if (active == def) {
+                    error = "recursive CTE '" + std::string{name} +
+                            "' is not supported";
+                    return nullptr;
+                }
+            }
             // The CTE body is a SELECT or a set operation (UNION/INTERSECT/EXCEPT);
             // subquery_body handles both. find_child(SelectStmt) alone missed a
             // set-op body, so `WITH t AS (SELECT .. UNION SELECT ..)` failed to bind.
+            cte_expanding_.push_back(def);
             auto body = bind_query(subquery_body(def), error);
+            cte_expanding_.pop_back();
             if (!body) {
                 return nullptr;
             }
