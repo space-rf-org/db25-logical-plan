@@ -114,13 +114,41 @@ int find_slot_by_id(const Schema& s, std::uint32_t tid, std::uint32_t cid,
 // by its output name. The real producer map (design section 3.3) keys on the
 // producing AST item; matching by name covers the unit-test cases (agg outputs,
 // projected exprs) without the operator-side bookkeeping that later steps add.
-int find_slot_by_name(const Schema& s, std::string_view name) {
+//
+// Qualifier-aware, exactly like find_slot_by_id: a qualified reference (`b.k`)
+// must resolve to THAT relation's column. Two derived tables in the same join
+// frame can expose identically-named computed columns - `(...) a(k) JOIN (...) b(k)`
+// or two VALUES rows with the same column-alias list - all carrying the same
+// synthetic (0,0) ids, so a pure by-name match binds every `b.k` to a's first
+// copy: the join ON collapses to `#0 = #0` (a tautology / cross product) and the
+// projection reads the wrong side. Prefer the candidate whose alias matches the
+// qualifier; if the qualifier matches no candidate's alias while candidates do
+// carry aliases, the reference belongs to another relation (return -1). The
+// first-match fallback is kept only for an unqualified reference, or when no
+// candidate carries an alias to compare against.
+int find_slot_by_name(const Schema& s, std::string_view name,
+                      std::string_view qualifier = {}) {
+    int first = -1;
+    bool candidate_has_alias = false;
     for (std::size_t i = 0; i < s.size(); ++i) {
         if (iequals(s[i].name, name)) {  // computed columns resolve by name, case-insensitively
-            return static_cast<int>(i);
+            if (first < 0) {
+                first = static_cast<int>(i);
+            }
+            if (!qualifier.empty()) {
+                if (iequals(s[i].alias, qualifier)) {
+                    return static_cast<int>(i);
+                }
+                if (!s[i].alias.empty()) {
+                    candidate_has_alias = true;
+                }
+            }
         }
     }
-    return -1;
+    if (!qualifier.empty() && candidate_has_alias) {
+        return -1;
+    }
+    return first;
 }
 
 // The standard SQL aggregate names the binder separates from scalar functions
@@ -404,9 +432,10 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
                         "' resolves to no input or enclosing slot";
                 return nullptr;
             }
-            // Computed column (synthetic/zero ids): producer-map (by-name) fallback.
+            // Computed column (synthetic/zero ids): producer-map (by-name) fallback,
+            // disambiguated by the reference's qualifier when present (`b.k`).
             const std::string_view name = split_column_ref(n->primary_text).column;
-            const int slot = find_slot_by_name(input, name);
+            const int slot = find_slot_by_name(input, name, qual);
             if (slot >= 0) {
                 auto e = make_expr(ExprKind::ColumnRef, n);
                 e->type = type;

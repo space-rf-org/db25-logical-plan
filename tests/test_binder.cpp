@@ -509,6 +509,61 @@ void test_self_join_alias_resolution(const InMemoryCatalog& cat) {
     });
 }
 
+// Two derived tables exposing identically-named COMPUTED columns (synthetic zero
+// ids) must be disambiguated by the qualifier, exactly like the self-join above.
+// Regression: the by-name computed-column path ignored the qualifier, so every
+// `v2.*` bound to v1's first same-named copy -- the join ON collapsed to
+// `#0 = #0` (a tautology / cross product) and `SELECT v2.dept` read v1.dept.
+void test_derived_table_join_qualifier_resolution(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT v2.dept FROM (VALUES ...) v1(id,dept) JOIN (VALUES ...) v2(id,dept) ON v1.id = v2.id\n");
+    with_plan(cat,
+              "SELECT v2.dept FROM (VALUES (1, 'a')) v1(id, dept) "
+              "JOIN (VALUES (2, 'c')) v2(id, dept) ON v1.id = v2.id",
+              [](const LogicalNode* root) {
+        // Frame = v1[id#0,dept#1] ++ v2[id#2,dept#3].
+        check(root->op == LogicalOp::Project && root->exprs.size() == 1, "root Project of 1");
+        if (root->exprs.size() == 1) {
+            check(root->exprs[0]->kind == ExprKind::ColumnRef &&
+                      root->exprs[0]->input_index == 3,
+                  "v2.dept -> #3 (v2's copy, not v1's #1)");
+        }
+        const LogicalNode* join = only_child(root);
+        check(join && join->predicate && join->predicate->children.size() == 2,
+              "join has an ON predicate");
+        if (join && join->predicate && join->predicate->children.size() == 2) {
+            check(join->predicate->children[0]->input_index == 0 &&
+                      join->predicate->children[1]->input_index == 2,
+                  "ON v1.id (#0) = v2.id (#2), not #0 = #0");
+        }
+    });
+}
+
+// The same class through expression-aliased derived tables (SELECT id+K AS k):
+// `b.k` must resolve to b's computed column, not a's.
+void test_derived_expr_alias_join_qualifier_resolution(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT b.k FROM (SELECT id+1 AS k FROM users) a JOIN (SELECT id+10 AS k FROM orders) b ON a.k = b.k\n");
+    with_plan(cat,
+              "SELECT b.k FROM (SELECT id + 1 AS k FROM users) a "
+              "JOIN (SELECT id + 10 AS k FROM orders) b ON a.k = b.k",
+              [](const LogicalNode* root) {
+        // Frame = a[k#0] ++ b[k#1].
+        check(root->op == LogicalOp::Project && root->exprs.size() == 1, "root Project of 1");
+        if (root->exprs.size() == 1) {
+            check(root->exprs[0]->kind == ExprKind::ColumnRef &&
+                      root->exprs[0]->input_index == 1,
+                  "b.k -> #1 (b's copy, not a's #0)");
+        }
+        const LogicalNode* join = only_child(root);
+        check(join && join->predicate && join->predicate->children.size() == 2,
+              "join has an ON predicate");
+        if (join && join->predicate && join->predicate->children.size() == 2) {
+            check(join->predicate->children[0]->input_index == 0 &&
+                      join->predicate->children[1]->input_index == 1,
+                  "ON a.k (#0) = b.k (#1), not #0 = #0");
+        }
+    });
+}
+
 // A table-name qualifier (no explicit alias) still resolves against the single
 // occurrence - the fix must not regress the common unaliased case.
 void test_table_name_qualifier(const InMemoryCatalog& cat) {
@@ -2440,6 +2495,8 @@ int main() {
     test_limit_offset(cat);
     test_inner_join(cat);
     test_self_join_alias_resolution(cat);
+    test_derived_table_join_qualifier_resolution(cat);
+    test_derived_expr_alias_join_qualifier_resolution(cat);
     test_table_name_qualifier(cat);
     test_group_by(cat);
     test_group_by_output_alias(cat);

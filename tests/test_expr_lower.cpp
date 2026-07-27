@@ -350,6 +350,61 @@ void test_computed_column_name_case_insensitive(const InMemoryCatalog& cat) {
 }
 
 // -------------------------------------------------------------------------
+// (c'') QUALIFIED computed-column ColumnRef disambiguates by the qualifier
+// -------------------------------------------------------------------------
+// When two relations in a join frame expose an identically-named COMPUTED
+// column (same synthetic zero ids) - e.g. `(...) a(k) JOIN (...) b(k)` - a
+// qualified reference `b.k` must resolve to b's copy, not a's first copy. A
+// pure by-name match ignored the qualifier and always returned the first, which
+// collapsed a join ON `a.k = b.k` to `#0 = #0` (a tautology / cross product) and
+// read the wrong side. find_slot_by_name is now qualifier-aware, mirroring
+// find_slot_by_id.
+void test_qualified_computed_column_disambiguates(const InMemoryCatalog& cat) {
+    std::printf("[test] (c'') qualified computed ColumnRef disambiguates by qualifier\n");
+
+    // Two computed columns both named 'k' (synthetic zero ids), aliased a / b.
+    const Schema input = {
+        ColumnSchema{"k", DataType::Integer, true, 0, 0, "a"},
+        ColumnSchema{"k", DataType::Integer, true, 0, 0, "b"},
+    };
+    Analyzer az(cat);
+    Binder binder(az, cat);
+
+    // The lowered Expr keeps only an integer input_index (no borrowed text is
+    // read after lowering), so one parser reused across calls is fine even though
+    // each parse resets the previous arena.
+    db25::parser::Parser p;
+    const auto lower_ref = [&](const char* sql, std::string& err) -> ExprPtr {
+        auto res = p.parse(sql);
+        if (!res) return nullptr;
+        const ASTNode* ref = first_select_item(res.value());
+        if (ref == nullptr) return nullptr;
+        return BinderExprTestAccess::lower(binder, ref, input, err);
+    };
+
+    std::string e_err, a_err;
+    ExprPtr eb = lower_ref("SELECT b.k FROM t", e_err);
+    check(eb != nullptr, std::string{"lowered 'b.k': "} + e_err);
+    if (eb) check(eb->input_index == 1, "'b.k' binds to b's copy at slot 1 (not a's slot 0)");
+
+    ExprPtr ea = lower_ref("SELECT a.k FROM t", a_err);
+    check(ea != nullptr, std::string{"lowered 'a.k': "} + a_err);
+    if (ea) check(ea->input_index == 0, "'a.k' binds to a's copy at slot 0");
+
+    // A qualifier that matches NO candidate alias must not silently take the
+    // first: it belongs to another relation, so lowering fails here.
+    std::string c_err;
+    ExprPtr ec = lower_ref("SELECT c.k FROM t", c_err);
+    check(ec == nullptr, "'c.k' (no matching alias) does not bind to a's or b's k");
+
+    // An UNQUALIFIED bare 'k' keeps the first-match fallback (unchanged).
+    std::string bare_err;
+    ExprPtr ek = lower_ref("SELECT k FROM t", bare_err);
+    check(ek != nullptr, std::string{"lowered bare 'k': "} + bare_err);
+    if (ek) check(ek->input_index == 0, "bare 'k' keeps first-match fallback (slot 0)");
+}
+
+// -------------------------------------------------------------------------
 // (d) join ON: concatenated child0.output ++ child1.output indexing
 // -------------------------------------------------------------------------
 void test_join_concatenated_index(const InMemoryCatalog& cat) {
@@ -674,6 +729,7 @@ int main() {
     test_arith_over_aggregate(cat);
     test_columnref_handbuilt_schema(cat);
     test_computed_column_name_case_insensitive(cat);
+    test_qualified_computed_column_disambiguates(cat);
     test_join_concatenated_index(cat);
     test_correlated_exists(cat);
     test_integer_literal_overflow_promotes_double(cat);
