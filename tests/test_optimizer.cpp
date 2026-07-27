@@ -544,16 +544,25 @@ void test_window_passthrough_not_corrupted(const InMemoryCatalog& cat) {
     });
 }
 
-// Regression: a USING join compacts its right frame, so slot arithmetic would
-// mis-index; the pass must barrier it and prune nothing (keeping o.total correct).
-void test_using_join_not_corrupted(const InMemoryCatalog& cat) {
-    std::printf("[test] SELECT u.id, o.total FROM users u JOIN orders o USING (id)  (barrier)\n");
+// A USING join now emits the FULL left++right frame (the merged column's right
+// copy is kept hidden rather than dropped), so it is a proper concat and column
+// pruning applies correctly: unreferenced columns are pruned and the referenced
+// ones keep their slots. `SELECT u.id, o.total` needs users.id and orders.id (for
+// the equi-predicate) + orders.total, so users.name and orders.user_id prune away
+// and the result stays correct (and idempotent).
+void test_using_join_pruned_correctly(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT u.id, o.total FROM users u JOIN orders o USING (id)  (prune)\n");
     with_optimized_plan(cat,
                         "SELECT u.id, o.total FROM users u JOIN orders o USING (id)",
                         [](const LogicalNode* root) {
+        // Project(u.id -> #0, o.total -> the total slot) over a Join over 2 scans.
+        check(root->op == LogicalOp::Project && root->output.size() == 2,
+              "project of [id, total]");
+        const LogicalNode* users = find_scan(root, "users");
         const LogicalNode* orders = find_scan(root, "orders");
-        check(orders && orders->output.size() == 3,
-              "orders scan kept intact under a USING join (no mis-indexed prune)");
+        // users keeps only id (name unused); orders keeps id (predicate) + total.
+        check(users && users->output.size() == 1, "users scan pruned to [id]");
+        check(orders && orders->output.size() == 2, "orders scan pruned to [id, total]");
     });
 }
 
@@ -1032,7 +1041,7 @@ int main() {
     test_no_prune_all_used(cat);
     test_prune_barrier_correlated_subquery(cat);
     test_window_passthrough_not_corrupted(cat);
-    test_using_join_not_corrupted(cat);
+    test_using_join_pruned_correctly(cat);
     test_distinct_keeps_all_columns(cat);
     test_decorrelate_exists(cat);
     test_decorrelate_exists_in_conjunction(cat);
