@@ -1118,15 +1118,17 @@ void test_join_using(const InMemoryCatalog& cat) {
         // Project -> Join -> [Scan users, Scan orders]
         const LogicalNode* join = only_child(root);
         check(join && join->op == LogicalOp::Join, "child is Join");
-        // USING(id) merges the two id columns: 2 (users) + 3 (orders) - 1 = 4.
-        check(join && join->output.size() == 4, "USING merges id -> 4 cols");
-        if (join && join->output.size() == 4) {
-            // Exactly one "id" column survives.
-            int id_count = 0;
+        // USING(id): the frame is the full concat - 2 (users) + 3 (orders) = 5.
+        // The merged `id` is the left copy (visible); the right `id` copy is kept
+        // HIDDEN (excluded from `*`) so a qualified `orders.id` still resolves.
+        check(join && join->output.size() == 5, "USING keeps full frame -> 5 cols");
+        if (join && join->output.size() == 5) {
+            int visible_id = 0, hidden_id = 0;
             for (const auto& c : join->output) {
-                if (c.name == "id") ++id_count;
+                if (c.name == "id") (c.hidden ? ++hidden_id : ++visible_id);
             }
-            check(id_count == 1, "single merged id column");
+            check(visible_id == 1, "exactly one visible (merged) id column");
+            check(hidden_id == 1, "the right id copy is kept hidden");
         }
         // The USING equality must be materialized as the join predicate over the
         // pre-merge (left ++ right) frame: users.id (slot 0) = orders.id
@@ -1159,14 +1161,16 @@ void test_natural_join(const InMemoryCatalog& cat) {
               [](const LogicalNode* root) {
         const LogicalNode* join = only_child(root);
         check(join && join->op == LogicalOp::Join, "child is Join");
-        // Common column id merges: 2 (users) + 3 (orders) - 1 = 4.
-        check(join && join->output.size() == 4, "NATURAL merges id -> 4 cols");
-        if (join && join->output.size() == 4) {
-            int id_count = 0;
+        // Common column id: full frame 2 (users) + 3 (orders) = 5, the right id
+        // copy kept hidden (one visible merged id, one hidden right copy).
+        check(join && join->output.size() == 5, "NATURAL keeps full frame -> 5 cols");
+        if (join && join->output.size() == 5) {
+            int visible_id = 0, hidden_id = 0;
             for (const auto& c : join->output) {
-                if (c.name == "id") ++id_count;
+                if (c.name == "id") (c.hidden ? ++hidden_id : ++visible_id);
             }
-            check(id_count == 1, "single merged id column");
+            check(visible_id == 1, "exactly one visible (merged) id column");
+            check(hidden_id == 1, "the right id copy is kept hidden");
         }
         // Equi-predicate over the pre-merge frame: users.id (#0) = orders.id (#2).
         check(join && join->predicate != nullptr, "NATURAL carries an equi-predicate");
@@ -1213,7 +1217,7 @@ void test_natural_left_join(const InMemoryCatalog& cat) {
         const LogicalNode* join = only_child(root);
         check(join && join->op == LogicalOp::Join, "child is Join");
         check(join && join->join_type == db25::ast::JoinType::Left, "NATURAL LEFT -> Left");
-        check(join && join->output.size() == 4, "merged frame -> 4 cols");
+        check(join && join->output.size() == 5, "full frame (hidden right id) -> 5 cols");
         check(join && join->predicate != nullptr, "carries the equi-predicate");
     });
 }
@@ -1289,8 +1293,9 @@ void test_natural_right_join_coalesces(const InMemoryCatalog& cat) {
     });
 }
 
-// INNER / LEFT keep the compact left-copy output (no COALESCE Project): the left
-// side is never null-supplied there, so the left copy already IS the merged value.
+// INNER / LEFT keep the merged value in the left copy (no COALESCE Project): the
+// left side is never null-supplied there, so the left copy already IS the merged
+// value. The right copy is retained but HIDDEN (for qualified `right.c`).
 void test_left_join_using_keeps_left_copy(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT id FROM users u LEFT JOIN orders o USING (id)\n");
     with_plan(cat, "SELECT id FROM users u LEFT JOIN orders o USING (id)",
@@ -1298,7 +1303,64 @@ void test_left_join_using_keeps_left_copy(const InMemoryCatalog& cat) {
         const LogicalNode* join = only_child(root);
         check(join && join->op == LogicalOp::Join, "LEFT USING: child is Join (no merge Project)");
         check(join && join->join_type == db25::ast::JoinType::Left, "LEFT preserved");
-        check(join && join->output.size() == 4, "LEFT USING: compact merged frame -> 4 cols");
+        // Full frame (users 2 + orders 3 = 5) with the right id copy hidden.
+        check(join && join->output.size() == 5, "LEFT USING: full frame -> 5 cols");
+        int hidden_id = 0, visible_id = 0;
+        for (const auto& c : join->output) {
+            if (c.name == "id") (c.hidden ? ++hidden_id : ++visible_id);
+        }
+        check(visible_id == 1 && hidden_id == 1,
+              "one visible merged id + one hidden right id");
+    });
+}
+
+// A QUALIFIED reference to a USING/NATURAL merged column's null-supplying side
+// must resolve to THAT side's own column (NULL for an unmatched outer-join row),
+// not to the left/merged copy. Regression: the right copy was dropped, so `o.id`
+// on a LEFT join read the left value, and `WHERE o.id = ...` on an INNER join
+// failed to bind entirely.
+void test_using_qualified_null_side(const InMemoryCatalog& cat) {
+    std::printf("[test] qualified null-supplying-side ref of a USING merged column\n");
+
+    // LEFT JOIN: `o.id` resolves to the RIGHT (orders) id copy - a distinct slot
+    // from `u.id`, and nullable (NULL for a left row with no right match).
+    with_plan(cat, "SELECT u.id, o.id FROM users u LEFT JOIN orders o USING (id)",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project && root->exprs.size() == 2,
+              "left-null-side: project of 2");
+        if (root->exprs.size() == 2) {
+            check(root->exprs[0]->kind == ExprKind::ColumnRef &&
+                      root->exprs[1]->kind == ExprKind::ColumnRef &&
+                      root->exprs[0]->input_index != root->exprs[1]->input_index,
+                  "u.id and o.id resolve to DIFFERENT slots (right copy not dropped)");
+        }
+        if (root->output.size() == 2) {
+            check(!root->output[0].nullable, "u.id is NOT NULL (left preserved)");
+            check(root->output[1].nullable, "o.id is nullable (null-supplying side)");
+        }
+    });
+
+    // INNER JOIN: `WHERE o.id = 5` must BIND (the right id copy is present).
+    {
+        db25::parser::Parser parser;
+        auto parsed = parser.parse(
+            "SELECT u.id FROM users u JOIN orders o USING (id) WHERE o.id = 5");
+        check(parsed.has_value(), "parse inner where-o.id");
+        if (parsed) {
+            Analyzer analyzer(cat);
+            analyzer.analyze(parsed.value());
+            Binder binder(analyzer, cat);
+            BindResult res = binder.bind(parsed.value());
+            check(res.ok, "inner USING: WHERE on the right merged copy binds");
+        }
+    }
+
+    // `SELECT *` still shows the merged column exactly once (hidden copy excluded).
+    with_plan(cat, "SELECT * FROM users u JOIN orders o USING (id)",
+              [](const LogicalNode* root) {
+        int id_count = 0;
+        for (const auto& c : root->output) if (c.name == "id") ++id_count;
+        check(id_count == 1, "star: merged id shown exactly once");
     });
 }
 
@@ -1349,9 +1411,15 @@ void test_join_using_multi(const InMemoryCatalog& cat) {
               [](const LogicalNode* root) {
         const LogicalNode* join = only_child(root);
         check(join && join->op == LogicalOp::Join, "child is Join");
-        // Both columns merge, so the right frame contributes nothing:
-        // output = left (id, name) = 2 cols.
-        check(join && join->output.size() == 2, "both cols merge -> 2 cols");
+        // Both columns merge: the full frame is left (id, name) ++ right (id,
+        // name) = 4, with BOTH right copies hidden (each merged column shows the
+        // left copy; the right copies stay for qualified `u2.id` / `u2.name`).
+        check(join && join->output.size() == 4, "both cols merge -> 4 cols (2 hidden)");
+        {
+            int hidden = 0;
+            for (const auto& c : join->output) if (c.hidden) ++hidden;
+            check(hidden == 2, "both right copies kept hidden");
+        }
         // Two USING columns AND-chain into a conjunction of two equalities over
         // the pre-merge frame: (u1.id=u2.id) AND (u1.name=u2.name), with the
         // right side at left_width (2) + its own slot.
@@ -2407,6 +2475,7 @@ int main() {
     test_full_join_using_coalesces(cat);
     test_natural_right_join_coalesces(cat);
     test_left_join_using_keeps_left_copy(cat);
+    test_using_qualified_null_side(cat);
     test_join_using_multi(cat);
     test_select_star_over_using(cat);
     test_qualified_star_over_join_rejected(cat);

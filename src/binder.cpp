@@ -626,11 +626,22 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
         out.push_back(std::move(c));
     }
     for (const auto& col : right->output) {
-        if (!coalesce_merged && is_merged(col.name)) {
-            continue;  // INNER / LEFT: merged into the left copy
-        }
         ColumnSchema c = col;
         c.nullable = c.nullable || null_right;
+        if (!coalesce_merged && is_merged(col.name)) {
+            // INNER / LEFT: the merged column's value is the left copy (kept
+            // above and shown by `SELECT *`). Keep the right copy too, but
+            // HIDDEN: a qualified `right.c` must resolve to the RIGHT column
+            // (NULL for a LEFT-join row with no right match) rather than to the
+            // left/merged copy - which previously returned the wrong value, or,
+            // for an INNER join with `WHERE right.c = ...`, failed to bind
+            // because the right copy had been dropped entirely. It keeps its own
+            // (table_id, column_id, alias) so the qualified reference finds it,
+            // and is excluded from `*`. (RIGHT / FULL keep both copies via the
+            // COALESCE Project below; the symmetric left-side hidden copy there
+            // is a separate, rarer case not handled here.)
+            c.hidden = true;
+        }
         out.push_back(std::move(c));
     }
     join->output = std::move(out);
@@ -1254,7 +1265,14 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
 
     auto project = make_node(LogicalOp::Project);
     if (bare_star) {
-        project->output = current->output;
+        // `*` projects the child's visible columns - excluding any HIDDEN column
+        // (the right-hand copy of a USING/NATURAL merged column, kept only for
+        // qualified `right.c` resolution).
+        for (const auto& c : current->output) {
+            if (!c.hidden) {
+                project->output.push_back(c);
+            }
+        }
     } else if (const auto* proj = analyzer_.projection_of(select_stmt)) {
         project->output.reserve(proj->size());
         for (const auto& c : *proj) {
@@ -1780,6 +1798,9 @@ bool Binder::lower_projection(const ASTNode* select_list, const LogicalNode* chi
                 return false;
             }
             for (std::size_t s = 0; s < input.size(); ++s) {
+                if (input[s].hidden) {
+                    continue;  // a hidden merged-right copy is not part of `*`
+                }
                 out.push_back(make_column_ref(static_cast<std::uint32_t>(s), input[s]));
             }
             continue;

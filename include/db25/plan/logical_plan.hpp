@@ -85,6 +85,12 @@ struct ColumnSchema {
     // the SAME base table share (table_id, column_id), so the alias is what
     // disambiguates a self-join's column references. Empty for computed columns.
     std::string alias;
+    // A column that exists in the frame for QUALIFIED resolution but is excluded
+    // from `SELECT *` expansion. Used for the right-hand copy of a USING/NATURAL
+    // merged column: `A JOIN B USING (id)` shows `id` once (the merged column),
+    // yet `B.id` must still resolve to B's own column (NULL on the null-supplying
+    // side), so B's copy is kept hidden rather than dropped.
+    bool hidden = false;
 };
 
 using Schema = std::vector<ColumnSchema>;
