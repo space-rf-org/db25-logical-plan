@@ -637,9 +637,10 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
             // for an INNER join with `WHERE right.c = ...`, failed to bind
             // because the right copy had been dropped entirely. It keeps its own
             // (table_id, column_id, alias) so the qualified reference finds it,
-            // and is excluded from `*`. (RIGHT / FULL keep both copies via the
-            // COALESCE Project below; the symmetric left-side hidden copy there
-            // is a separate, rarer case not handled here.)
+            // and is excluded from `*`. (RIGHT / FULL build a COALESCE Project
+            // below that keeps BOTH sides as hidden copies for the same reason -
+            // there the merged value is a distinct COALESCE column, not the left
+            // copy, so both individual copies must be retained.)
             c.hidden = true;
         }
         out.push_back(std::move(c));
@@ -688,10 +689,14 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
     }
 
     // RIGHT / FULL USING/NATURAL: the join above emits the full left ++ right
-    // frame; this Project collapses each merged pair to COALESCE(left.c, right.c)
-    // and drops the duplicate right copy, reproducing the compact merged schema.
-    // The merged column keeps the LEFT column's identity (table/column id, name)
-    // so downstream references resolve exactly as they do for INNER / LEFT.
+    // frame; this Project materializes each merged pair as a VISIBLE
+    // COALESCE(left.c, right.c) column plus a HIDDEN copy of each individual side.
+    // The visible column carries the left (table_id, column_id) + name (so an
+    // unqualified `c` and `*` resolve to the coalesced value) with its alias
+    // cleared; the hidden left/right copies keep their own identity and alias so a
+    // qualified `u.c` / `o.c` resolves to that side's column - NULL for a row with
+    // no match on the null-supplying side - rather than the coalesced value. This
+    // mirrors the INNER / LEFT hidden right-copy, extended to both sides.
     auto project = make_node(LogicalOp::Project);
     Schema pout;
     std::vector<ExprPtr> pexprs;
@@ -723,10 +728,39 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
         coa->children.push_back(make_column_ref(i, lc));
         coa->children.push_back(
             make_column_ref(left_width + static_cast<std::uint32_t>(ri), rc));
-        ColumnSchema mc = left->output[i];  // left identity
+        // Visible merged column: COALESCE(left.c, right.c). It keeps the LEFT
+        // column's (table_id, column_id) and name so an UNQUALIFIED `c` and
+        // `SELECT *` resolve to it, but its alias is CLEARED: a qualified `u.c`
+        // must NOT bind here (that would read the coalesced value), it must find
+        // the hidden left copy below. Emitted before the hidden copies so the
+        // unqualified first-match lands on it.
+        ColumnSchema mc = left->output[i];  // left identity + name
+        mc.alias.clear();
         mc.nullable = merged_nullable;
+        mc.hidden = false;
         pexprs.push_back(std::move(coa));
         pout.push_back(std::move(mc));
+
+        // Hidden LEFT copy: keeps the left identity AND left alias, so a qualified
+        // reference to the null-supplying left side (`u.c` under RIGHT / FULL)
+        // resolves to the left column itself - NULL for a row with no left match -
+        // instead of the coalesced value. Excluded from `*`.
+        ColumnSchema lh = join->output[i];  // null_left-adjusted, left alias
+        lh.hidden = true;
+        pexprs.push_back(make_column_ref(i, join->output[i]));
+        pout.push_back(std::move(lh));
+
+        // Hidden RIGHT copy: keeps the right identity AND right alias, so a
+        // qualified `o.c` resolves to the right column (NULL for a FULL row with
+        // no right match) rather than the merged column. Excluded from `*`. This
+        // is the symmetric completion of the INNER / LEFT hidden right-copy: under
+        // RIGHT / FULL BOTH individual copies are addressable, only the merged
+        // COALESCE is shown by `*`.
+        ColumnSchema rh = rc;  // null_right-adjusted, right alias
+        rh.hidden = true;
+        pexprs.push_back(
+            make_column_ref(left_width + static_cast<std::uint32_t>(ri), rc));
+        pout.push_back(std::move(rh));
     }
     for (std::uint32_t j = 0; j < static_cast<std::uint32_t>(right->output.size()); ++j) {
         const ColumnSchema& rc = join->output[left_width + j];

@@ -1290,17 +1290,29 @@ void expect_coalesce_merge(const LogicalNode* root, db25::ast::JoinType jt,
     const LogicalNode* merge = only_child(root);
     check(merge && merge->op == LogicalOp::Project, ctx + ": merge is a Project");
     if (!merge || merge->op != LogicalOp::Project) return;
-    // users(id,name) + orders(id,user_id,total), merged on id -> 4 output cols
-    // (id, name, user_id, total); exactly one id, and it is expr[0].
-    check(merge->output.size() == 4, ctx + ": merged frame -> 4 cols");
-    int id_count = 0;
-    for (const auto& c : merge->output) if (c.name == "id") ++id_count;
-    check(id_count == 1, ctx + ": single merged id column");
+    // users(id,name) + orders(id,user_id,total), merged on id. The merged id is a
+    // VISIBLE COALESCE column PLUS a HIDDEN copy of each side (so a qualified
+    // u.id / o.id resolves to that side's own column, NULL on the null-supplying
+    // side): id(coalesce), id(left,hidden), id(right,hidden), name, user_id,
+    // total = 6 cols. `SELECT *` still shows id once (the two copies are hidden).
+    check(merge->output.size() == 6,
+          ctx + ": merged frame -> 6 cols (COALESCE + 2 hidden per-side copies)");
+    int visible_id = 0, hidden_id = 0;
+    for (const auto& c : merge->output) {
+        if (c.name == "id") (c.hidden ? ++hidden_id : ++visible_id);
+    }
+    check(visible_id == 1 && hidden_id == 2,
+          ctx + ": one visible COALESCE id + two hidden per-side copies");
     // Both users.id and orders.id are NOT NULL, so COALESCE(id,id) is NOT NULL,
-    // even under RIGHT / FULL where each side is otherwise null-supplied.
+    // even under RIGHT / FULL where each side is otherwise null-supplied. It is
+    // the visible column at slot 0; the two hidden copies follow it.
     check(!merge->output.empty() && merge->output[0].name == "id" &&
-              !merge->output[0].nullable,
-          ctx + ": merged id is NOT NULL (both sides not-null)");
+              !merge->output[0].hidden && !merge->output[0].nullable,
+          ctx + ": merged id is the visible NOT-NULL column at slot 0");
+    check(merge->output.size() >= 3 && merge->output[1].name == "id" &&
+              merge->output[1].hidden && merge->output[2].name == "id" &&
+              merge->output[2].hidden,
+          ctx + ": slots 1,2 are the hidden per-side id copies");
     // expr[0] materializes COALESCE(left.id #0, right.id #2) over the full frame.
     check(!merge->exprs.empty() &&
               merge->exprs[0]->kind == ExprKind::ScalarFunction &&
@@ -1416,6 +1428,67 @@ void test_using_qualified_null_side(const InMemoryCatalog& cat) {
         int id_count = 0;
         for (const auto& c : root->output) if (c.name == "id") ++id_count;
         check(id_count == 1, "star: merged id shown exactly once");
+    });
+}
+
+// The symmetric RIGHT / FULL case: a USING/NATURAL merged column is a COALESCE,
+// and BOTH the left and right individual copies are kept HIDDEN so a qualified
+// u.id / o.id resolves to that side's own column (NULL on the null-supplying
+// side), while a bare `id` and `SELECT *` see the coalesced value. Regression:
+// both copies were collapsed into the single COALESCE column, so u.id and o.id
+// both read COALESCE(u.id, o.id) - the wrong (non-NULL) value for a non-matching
+// outer-join row.
+void test_right_full_using_qualified_sides(const InMemoryCatalog& cat) {
+    std::printf("[test] RIGHT/FULL USING: qualified u.id / o.id resolve to per-side copies\n");
+
+    // RIGHT: u.id is the null-supplying (left) side -> nullable; o.id is the
+    // present (right) side -> NOT NULL; the two are DISTINCT slots, and neither is
+    // the bare COALESCE.
+    with_plan(cat, "SELECT id, u.id, o.id FROM users u RIGHT JOIN orders o USING (id)",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project && root->exprs.size() == 3,
+              "right-sides: project of 3");
+        if (root->exprs.size() == 3) {
+            const auto i0 = root->exprs[0]->input_index;  // bare id -> COALESCE
+            const auto i1 = root->exprs[1]->input_index;  // u.id -> left copy
+            const auto i2 = root->exprs[2]->input_index;  // o.id -> right copy
+            check(root->exprs[0]->kind == ExprKind::ColumnRef &&
+                      root->exprs[1]->kind == ExprKind::ColumnRef &&
+                      root->exprs[2]->kind == ExprKind::ColumnRef,
+                  "all three lower to ColumnRefs");
+            check(i0 != i1 && i0 != i2 && i1 != i2,
+                  "bare id, u.id, o.id resolve to THREE distinct slots");
+        }
+        if (root->output.size() == 3) {
+            // Per-side nullability (the meaningful F4 correctness): u.id is the
+            // null-supplying left side -> nullable; o.id is the present right
+            // side -> NOT NULL. (output[0] is the bare merged id, whose outer
+            // nullability is the analyzer's call, not asserted here.)
+            check(root->output[1].nullable, "u.id nullable (left null-supplied under RIGHT)");
+            check(!root->output[2].nullable, "o.id NOT NULL (right side present)");
+        }
+    });
+
+    // FULL: both sides are null-supplying, so u.id and o.id are both nullable and
+    // still distinct slots.
+    with_plan(cat, "SELECT users.id, orders.id FROM users FULL JOIN orders USING (id)",
+              [](const LogicalNode* root) {
+        check(root->exprs.size() == 2, "full-sides: project of 2");
+        if (root->exprs.size() == 2 && root->output.size() == 2) {
+            check(root->exprs[0]->input_index != root->exprs[1]->input_index,
+                  "users.id and orders.id resolve to DIFFERENT slots");
+            check(root->output[0].nullable && root->output[1].nullable,
+                  "both sides nullable under FULL");
+        }
+    });
+
+    // `SELECT *` over a RIGHT USING join shows the merged id exactly once (both
+    // hidden copies excluded).
+    with_plan(cat, "SELECT * FROM users u RIGHT JOIN orders o USING (id)",
+              [](const LogicalNode* root) {
+        int id_count = 0;
+        for (const auto& c : root->output) if (c.name == "id") ++id_count;
+        check(id_count == 1, "right star: merged id shown exactly once");
     });
 }
 
@@ -2567,6 +2640,7 @@ int main() {
     test_natural_right_join_coalesces(cat);
     test_left_join_using_keeps_left_copy(cat);
     test_using_qualified_null_side(cat);
+    test_right_full_using_qualified_sides(cat);
     test_join_using_multi(cat);
     test_select_star_over_using(cat);
     test_qualified_star_over_join_rejected(cat);
