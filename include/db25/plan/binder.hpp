@@ -253,6 +253,16 @@ private:
     // reports the self-reference as an unresolved table).
     std::vector<const db25::ast::ASTNode*> cte_expanding_;
 
+    // Current recursion depth of lower_expr. A long operator chain (a+b+c+...,
+    // a AND b AND ...) parses to a deep left-associative tree that lower_expr
+    // walks recursively; without a bound a pathological expression overflows the
+    // stack during binding. Bounded exactly like the analyzer's infer_expr
+    // (kMaxExprDepth): over the limit, lower_expr fails with an error instead of
+    // recursing, so bind() degrades to BindResult{ok=false} rather than crashing
+    // - staying defensive even if the AST was not analyzed (or the analyzer's own
+    // bound changes). A RAII guard in lower_expr increments/decrements it.
+    int expr_lower_depth_ = 0;
+
     friend struct BinderExprTestAccess;
 };
 

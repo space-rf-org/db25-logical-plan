@@ -51,6 +51,25 @@ ExprPtr make_expr(ExprKind kind, const ASTNode* source) {
     return e;
 }
 
+// Maximum lower_expr recursion depth. A long operator chain (a+b+c+..., a AND b
+// AND ...) parses to a deep left-deep tree that lower_expr walks recursively;
+// this cap keeps a pathological expression from overflowing the stack during
+// binding. Set to match the analyzer's kMaxExprDepth (infer_expr) so any
+// expression the analyzer accepts also lowers, and any it rejects as too deep is
+// rejected here too rather than crashing. Far above any genuine query, well
+// below the stack limit.
+constexpr int kMaxLowerDepth = 1000;
+
+// RAII: bump a depth counter on entry, restore on any exit (lower_expr has many
+// early returns), mirroring the analyzer's DepthGuard.
+struct LowerDepthGuard {
+    int& depth;
+    explicit LowerDepthGuard(int& d) noexcept : depth(d) { ++depth; }
+    ~LowerDepthGuard() { --depth; }
+    LowerDepthGuard(const LowerDepthGuard&) = delete;
+    LowerDepthGuard& operator=(const LowerDepthGuard&) = delete;
+};
+
 std::string to_upper(std::string_view s) {
     std::string out;
     out.reserve(s.size());
@@ -341,6 +360,16 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
         error = "cannot lower a null expression";
         return nullptr;
     }
+
+    // Bound the recursion: an over-deep expression tree (a long a+b+c+... or
+    // a AND b AND ... chain) is abandoned with an error instead of overflowing
+    // the stack, so bind() returns BindResult{ok=false} and stays defensive
+    // regardless of whether the analyzer already flagged it as too complex.
+    if (expr_lower_depth_ >= kMaxLowerDepth) {
+        error = "expression nesting is too deep to bind";
+        return nullptr;
+    }
+    const LowerDepthGuard depth_guard{expr_lower_depth_};
 
     const DataType type = analyzer_.type_of(n);
     const auto nullability = static_cast<std::uint8_t>(analyzer_.nullability_of(n));
