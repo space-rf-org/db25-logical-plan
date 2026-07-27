@@ -1453,6 +1453,25 @@ void test_cte(const InMemoryCatalog& cat) {
         check(root->output.size() == 1 && root->output[0].name == "a",
               "col-list: renamed column 'a' resolves");
     });
+
+    // A CTE whose body is a set operation binds end to end: the reference lowers
+    // to the UNION subplan (previously the set-op body was not registered, so `t`
+    // resolved to nothing and the bind failed with 'unresolved table').
+    with_plan(cat,
+              "WITH t AS (SELECT id FROM users UNION SELECT user_id FROM orders) "
+              "SELECT id FROM t",
+              [](const LogicalNode* root) {
+        check(root != nullptr && root->op == LogicalOp::Project,
+              "setop-cte: root is Project");
+        bool has_setop = false;
+        std::function<void(const LogicalNode*)> walk = [&](const LogicalNode* n) {
+            if (n == nullptr) return;
+            if (n->op == LogicalOp::SetOp) has_setop = true;
+            for (std::size_t i = 0; i < n->child_count(); ++i) walk(n->child(i));
+        };
+        walk(root);
+        check(has_setop, "setop-cte: the CTE body lowered to a SetOp");
+    });
 }
 
 // A self-join of two derived tables (or two references to one CTE) over the same

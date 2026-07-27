@@ -315,7 +315,10 @@ LogicalNodePtr Binder::bind_table_ref(const ASTNode* table_ref, std::string& err
     for (auto it = ctes_.rbegin(); it != ctes_.rend(); ++it) {
         if (iequals(it->first, name)) {  // CTE names are identifiers: fold case
             const ASTNode* def = it->second;
-            auto body = bind_query(find_child(def, NodeType::SelectStmt), error);
+            // The CTE body is a SELECT or a set operation (UNION/INTERSECT/EXCEPT);
+            // subquery_body handles both. find_child(SelectStmt) alone missed a
+            // set-op body, so `WITH t AS (SELECT .. UNION SELECT ..)` failed to bind.
+            auto body = bind_query(subquery_body(def), error);
             if (!body) {
                 return nullptr;
             }
@@ -948,7 +951,10 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
             if (def->node_type != NodeType::CTEDefinition) {
                 continue;
             }
-            if (find_child(def, NodeType::SelectStmt) != nullptr) {
+            // Register a CTE with a SELECT or a set-operation body (subquery_body
+            // handles both); a set-op body was previously skipped, so a reference
+            // to it resolved to nothing.
+            if (subquery_body(def) != nullptr) {
                 ctes_.emplace_back(std::string{def->primary_text}, def);
             }
         }
