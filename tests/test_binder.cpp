@@ -756,6 +756,47 @@ void test_group_by_positional(const InMemoryCatalog& cat) {
             expect_col_ref(agg->group_keys[0], 1, "ord+agg: group key is dept (#1)");
         }
     });
+
+    // Regression: the ordinal literal is a positional SELECTOR, not the grouped
+    // value. It must NOT be registered as an aggregate-frame producer - if it
+    // were, every structurally-equal integer constant above the Aggregate would
+    // be rewritten into the group slot. Here the `1` in `COUNT(*)+1` must stay a
+    // Literal, exactly as it does for the named-key form `GROUP BY dept`.
+    with_plan(cat, "SELECT dept, COUNT(*)+1 FROM emp GROUP BY 1",
+              [](const LogicalNode* root) {
+        check(root->exprs.size() == 2, "lit: project has 2 exprs");
+        if (root->exprs.size() == 2) {
+            expect_col_ref(root->exprs[0], 0, "lit: dept -> group-key slot #0");
+            const auto& add = root->exprs[1];
+            check(add && add->kind == ExprKind::BinaryOp && add->children.size() == 2,
+                  "lit: second item is COUNT(*)+1 (BinaryOp)");
+            if (add && add->kind == ExprKind::BinaryOp && add->children.size() == 2) {
+                expect_col_ref(add->children[0], 1, "lit: COUNT(*) -> agg slot #1");
+                check(add->children[1] && add->children[1]->kind == ExprKind::Literal,
+                      "lit: the literal 1 stays a Literal, not a ColumnRef into the group slot");
+            }
+        }
+    });
+
+    // Regression: HAVING constant on a two-key positional grouping. `GROUP BY 1, 2`
+    // registers dept (slot #0) and sal (slot #1); the `2` in `HAVING sal > 2` is
+    // structurally equal to the ordinal `2` key but must remain a Literal, not be
+    // rewritten into the sal slot (#1).
+    with_plan(cat, "SELECT dept, sal, COUNT(*) FROM emp GROUP BY 1, 2 HAVING sal > 2",
+              [](const LogicalNode* root) {
+        const LogicalNode* filter = only_child(root);
+        check(filter && filter->op == LogicalOp::Filter, "having: child is Filter");
+        if (filter && filter->predicate) {
+            const auto& p = filter->predicate;
+            check(p->kind == ExprKind::BinaryOp && p->children.size() == 2,
+                  "having: predicate is sal > 2 (BinaryOp)");
+            if (p->kind == ExprKind::BinaryOp && p->children.size() == 2) {
+                expect_col_ref(p->children[0], 1, "having: sal -> group-key slot #1");
+                check(p->children[1] && p->children[1]->kind == ExprKind::Literal,
+                      "having: the literal 2 stays a Literal, not a ColumnRef into the sal slot");
+            }
+        }
+    });
 }
 
 // The Aggregate output is group_keys ++ aggregates, independent of SELECT order.
