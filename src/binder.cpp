@@ -279,6 +279,30 @@ bool parse_int_literal(const ASTNode* op, std::int64_t& out) {
     return true;
 }
 
+// True if a LOWERED expression tree contains a raw Aggregate node - a freshly
+// computed aggregate, as opposed to a ColumnRef routed to a precomputed
+// Aggregate output slot. Above the Aggregate node (in a Project / Sort) an
+// aggregate must always be the precomputed value; a raw one here would
+// re-aggregate the already-grouped rows. Does not cross into an owned Subquery
+// (its aggregates belong to its own plan).
+bool contains_raw_aggregate(const ExprPtr& e) {
+    if (!e) {
+        return false;
+    }
+    if (e->kind == ExprKind::Aggregate) {
+        return true;
+    }
+    if (e->kind == ExprKind::Subquery) {
+        return false;
+    }
+    for (const auto& c : e->children) {
+        if (contains_raw_aggregate(c)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // A window-function call: a FunctionCall / FunctionExpr that carries a
 // WindowSpec child (the OVER (...) specification). The WindowSpec in turn holds
 // the PARTITION BY / ORDER BY / frame sub-clauses.
@@ -1639,12 +1663,23 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
             }
 
             // Resolve against the input's current output (a selected column, an
-            // output alias, or a prior hidden sort column already appended).
+            // output alias, or a prior hidden sort column already appended). A key
+            // that lowers to a RAW aggregate is rejected here and routed to the
+            // frame-active path below instead: an ORDER-BY aggregate not in the
+            // SELECT list (e.g. `ORDER BY COUNT(*)`, `ORDER BY COUNT(dept)`) has no
+            // unresolvable argument, so against the already-grouped Project output
+            // it lowers to a fresh Aggregate over one-row-per-group (COUNT() == 1
+            // for every group) instead of the precomputed value. `ORDER BY
+            // SUM(sal)` already lands in the frame path by failing to resolve its
+            // arg `sal` here; this makes the no-arg / selected-arg aggregates
+            // behave the same, resolving to the Aggregate's output slot.
             std::string local_error;
             if (auto e = lower_expr(key, input_node->output, local_error)) {
-                sk.expr = std::move(e);
-                sort->sort_keys.push_back(std::move(sk));
-                continue;
+                if (!contains_raw_aggregate(e)) {
+                    sk.expr = std::move(e);
+                    sort->sort_keys.push_back(std::move(sk));
+                    continue;
+                }
             }
             // Not a visible output column: append a hidden sort column (or reject
             // under DISTINCT).
