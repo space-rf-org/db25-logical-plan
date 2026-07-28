@@ -659,13 +659,17 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
                 return e;
             }
             // An aggregate / window call surfacing above its Aggregate / Window
-            // node (e.g. in HAVING or ORDER BY) reads the already-computed output
-            // column by name rather than re-lowering the call, whose base-column
-            // arguments are no longer in scope. Self-gating: only fires when the
-            // input schema actually carries a same-named producer column.
-            if (auto precomputed = lower_precomputed_aggregate(n, input)) {
-                return precomputed;
-            }
+            // node (HAVING / ORDER BY / a SELECT item like `SUM(x)+1`) is resolved
+            // to its precomputed output column at the TOP of this function, by
+            // STRUCTURAL identity against the active aggregate frame
+            // (aggregate_frame_slot) / window slots - the same way the window path
+            // does. That is the ONLY correct precomputed-aggregate resolution:
+            // the frame is active only above the Aggregate, and matching is by the
+            // call's structure, not its output name. A by-OUTPUT-NAME fallback here
+            // additionally mis-fired during aggregate CONSTRUCTION - where `input`
+            // is the aggregate's INPUT relation (scan/join) - binding e.g.
+            // `SELECT MAX(sal) AS id FROM emp` to the base column `emp.id` instead
+            // of computing MAX(sal); it is removed.
             const ASTNode* window_spec = find_child(n, NodeType::WindowSpec);
             const std::string uname = to_upper(n->primary_text);
             const ExprKind fk = window_spec != nullptr ? ExprKind::WindowFunction
