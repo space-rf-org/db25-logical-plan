@@ -2422,6 +2422,81 @@ void test_window_over_aggregate(const InMemoryCatalog& cat) {
     });
 }
 
+// A grouping aggregate that appears ONLY inside a window function's OVER clause
+// (PARTITION BY / ORDER BY) must still be precomputed by the Aggregate node.
+// Regression: collect_aggregates early-returned on any window call, so it never
+// saw SUM(sal) inside OVER (ORDER BY SUM(sal)). With GROUP BY the aggregate was
+// absent from the frame and the window ORDER BY re-lowered raw `sal` -> bind
+// failed; with no GROUP BY the aggregates set stayed empty so NO Aggregate node
+// was built and the Window ran over the raw Scan (wrong cardinality + result).
+void test_window_over_clause_only_aggregate(const InMemoryCatalog& cat) {
+    // (A) With GROUP BY: the OVER-clause aggregate must precompute and the window
+    // ORDER BY key resolve to it. dept is the sole group key (#0), SUM(sal) the
+    // sole aggregate (#1).
+    std::printf("[test] SELECT dept, RANK() OVER (ORDER BY SUM(sal)) FROM emp GROUP BY dept\n");
+    with_plan(cat, "SELECT dept, RANK() OVER (ORDER BY SUM(sal)) FROM emp GROUP BY dept",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "A: root is Project");
+        const LogicalNode* window = only_child(root);
+        check(window && window->op == LogicalOp::Window, "A: child is Window");
+        if (window && window->window_functions.size() == 1) {
+            const auto& w = *window->window_functions[0];
+            check(w.window.order_by.size() == 1 &&
+                      w.window.order_by[0].expr->kind == ExprKind::ColumnRef &&
+                      w.window.order_by[0].expr->input_index == 1,
+                  "A: window ORDER BY SUM(sal) -> agg output #1");
+        }
+        const LogicalNode* agg = window ? only_child(window) : nullptr;
+        check(agg && agg->op == LogicalOp::Aggregate, "A: window child is Aggregate");
+        check(agg && agg->group_keys.size() == 1, "A: 1 group key (dept)");
+        check(agg && agg->aggregates.size() == 1, "A: 1 aggregate (SUM(sal))");
+    });
+
+    // (B) No GROUP BY: the OVER-clause aggregate forces implicit single-group
+    // aggregation - an Aggregate with ZERO keys and one aggregate must exist, so
+    // the query yields exactly one row (RANK over a single row). The bug produced
+    // a Window directly over the Scan (one row per emp row).
+    std::printf("[test] SELECT RANK() OVER (ORDER BY SUM(sal)) FROM emp (implicit group)\n");
+    with_plan(cat, "SELECT RANK() OVER (ORDER BY SUM(sal)) FROM emp",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "B: root is Project");
+        const LogicalNode* window = only_child(root);
+        check(window && window->op == LogicalOp::Window, "B: child is Window");
+        const LogicalNode* agg = window ? only_child(window) : nullptr;
+        check(agg && agg->op == LogicalOp::Aggregate,
+              "B: an Aggregate node exists (implicit single group)");
+        check(agg && agg->group_keys.empty(), "B: zero group keys");
+        check(agg && agg->aggregates.size() == 1, "B: one aggregate (SUM(sal))");
+        const LogicalNode* scan = agg ? only_child(agg) : nullptr;
+        check(scan && scan->op == LogicalOp::Scan && scan->table_name == "emp",
+              "B: Aggregate over Scan emp (not Window over raw Scan)");
+    });
+
+    // (C) PARTITION BY aggregate, with GROUP BY: same requirement via the
+    // PARTITION BY key.
+    std::printf("[test] SELECT dept, RANK() OVER (PARTITION BY MAX(sal)) FROM emp GROUP BY dept\n");
+    with_plan(cat, "SELECT dept, RANK() OVER (PARTITION BY MAX(sal)) FROM emp GROUP BY dept",
+              [](const LogicalNode* root) {
+        const LogicalNode* window = only_child(root);
+        const LogicalNode* agg = window ? only_child(window) : nullptr;
+        check(agg && agg->op == LogicalOp::Aggregate, "C: window child is Aggregate");
+        check(agg && agg->aggregates.size() == 1, "C: MAX(sal) precomputed");
+    });
+
+    // (D) A plain window aggregate over raw columns must NOT trigger grouping:
+    // SUM(sal) OVER (PARTITION BY dept) has no grouping aggregate, so no Aggregate
+    // node (its child is the Scan). Guards against over-collecting.
+    std::printf("[test] SELECT dept, SUM(sal) OVER (PARTITION BY dept) FROM emp (no grouping)\n");
+    with_plan(cat, "SELECT dept, SUM(sal) OVER (PARTITION BY dept) FROM emp",
+              [](const LogicalNode* root) {
+        const LogicalNode* window = only_child(root);
+        check(window && window->op == LogicalOp::Window, "D: child is Window");
+        const LogicalNode* below = window ? only_child(window) : nullptr;
+        check(below && below->op == LogicalOp::Scan,
+              "D: Window directly over Scan (no spurious Aggregate)");
+    });
+}
+
 // A window function NESTED inside a larger expression must STILL be evaluated by
 // a Window node below the Project; the Project references the window's output
 // column and re-applies the wrapper (`... + 1`). Previously the window call was
@@ -3035,6 +3110,7 @@ int main() {
     test_window_rank(cat);
     test_window_row_number(cat);
     test_window_over_aggregate(cat);
+    test_window_over_clause_only_aggregate(cat);
     test_window_sum(cat);
     test_window_same_name_distinct_slots(cat);
     test_window_nested_in_expr(cat);

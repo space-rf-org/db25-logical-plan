@@ -211,13 +211,26 @@ bool is_window_call(const ASTNode* n);
 // Walk an expression subtree collecting aggregate call nodes into `out`. Unlike
 // the top-level `is_aggregate_call` check this finds aggregates nested inside a
 // larger expression (e.g. `SUM(x) + 1`) and aggregates that appear only in
-// HAVING / ORDER BY. It deliberately does NOT descend into a window call (an
-// aggregate written as a window function is handled by the Window node, not by
-// grouping) nor into an embedded Subquery (which owns its own aggregates), and it
-// does not descend into an aggregate's own arguments (SQL forbids nesting one
-// aggregate inside another).
+// HAVING / ORDER BY. It does not descend into an embedded Subquery (which owns
+// its own aggregates), nor into an aggregate's own arguments (SQL forbids nesting
+// one aggregate inside another).
+//
+// A window call is NOT itself a grouping aggregate (it is handled by the Window
+// node), but grouping aggregates can appear INSIDE it and must still be gathered
+// so the Aggregate node precomputes them:
+//   - in its OVER clause: `RANK() OVER (ORDER BY SUM(sal))` / `... PARTITION BY MAX(x)`
+//   - in its arguments:   `SUM(SUM(sal)) OVER (...)` (a window aggregate of a group aggregate)
+// So on a window call we skip recording the call but DO descend into its children.
+// (A plain window aggregate over raw columns - `SUM(sal) OVER (PARTITION BY dept)`
+// - contributes nothing, since neither its arg `sal` nor `dept` is an aggregate.)
 void collect_aggregates(const ASTNode* n, std::vector<const ASTNode*>& out) {
-    if (n == nullptr || n->node_type == NodeType::Subquery || is_window_call(n)) {
+    if (n == nullptr || n->node_type == NodeType::Subquery) {
+        return;
+    }
+    if (is_window_call(n)) {
+        for (const ASTNode* c = first_child(n); c != nullptr; c = c->next_sibling) {
+            collect_aggregates(c, out);
+        }
         return;
     }
     if (is_aggregate_call(n)) {
