@@ -333,6 +333,40 @@ const ASTNode* group_key_alias_target(const ASTNode* key, const ASTNode* select_
     return nullptr;
 }
 
+// Positional GROUP BY: `GROUP BY <n>` groups by the n-th (1-based) SELECT output
+// column's expression - standard SQL (Postgres / MySQL / SQLite / DuckDB), which
+// the analyzer accepts and validates. Return that SELECT item so its expression
+// is lowered as the grouping key (mirroring group_key_alias_target); the integer
+// literal itself must NOT be lowered as a constant single-group key. Out of range
+// or a `*` before the ordinal -> nullptr (leave the existing handling).
+const ASTNode* group_key_ordinal_target(const ASTNode* key, const ASTNode* select_list) {
+    if (key == nullptr || select_list == nullptr ||
+        key->node_type != NodeType::IntegerLiteral || key->primary_text.empty()) {
+        return nullptr;
+    }
+    std::size_t ordinal = 0;
+    for (const char c : key->primary_text) {
+        if (c < '0' || c > '9') {
+            return nullptr;  // not a plain non-negative integer (e.g. hex / sign)
+        }
+        ordinal = ordinal * 10 + static_cast<std::size_t>(c - '0');
+    }
+    if (ordinal < 1) {
+        return nullptr;
+    }
+    std::size_t i = 1;
+    for (const ASTNode* item = first_child(select_list); item != nullptr;
+         item = item->next_sibling, ++i) {
+        if (item->node_type == NodeType::Star) {
+            return nullptr;  // ordinal into an unexpanded `*`: out of scope
+        }
+        if (i == ordinal) {
+            return item;
+        }
+    }
+    return nullptr;  // out of range
+}
+
 // Build an owned ColumnRef Expr that references slot `slot` of an input schema,
 // carrying the referenced column's type, nullability (parser 2-bit: 1 not-null /
 // 2 nullable) and provenance ids. The single place a positional projection leaf
@@ -1218,24 +1252,45 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
         for (const ASTNode* key = group_by != nullptr ? first_child(group_by) : nullptr;
              key != nullptr; key = key->next_sibling) {
             const ASTNode* lowered_from = key;
-            auto e = lower_expr(key, agg_input, error);
-            if (!e) {
-                // Not an input column/expression: try a SELECT output alias.
-                // (Reaching here means the key did not resolve against the input,
-                // so input-column precedence is already honoured.)
-                if (const ASTNode* alias_item = group_key_alias_target(key, select_list)) {
-                    error.clear();
-                    e = lower_expr(alias_item, agg_input, error);
-                    lowered_from = alias_item;
-                }
+            ExprPtr e;
+            // Positional GROUP BY: `GROUP BY <n>` groups by the n-th SELECT item's
+            // expression (which the analyzer accepts / validates). Resolve it and
+            // lower THAT item, not the integer literal - lowering the literal would
+            // succeed as a constant single-group key, and the bare SELECT column it
+            // stands for would then fail to resolve. Checked before lower_expr for
+            // exactly that reason. The literal's own name ("n") / Integer type must
+            // not be used for the key column, so take them from the resolved item.
+            const ASTNode* ordinal_item = group_key_ordinal_target(key, select_list);
+            if (ordinal_item != nullptr) {
+                e = lower_expr(ordinal_item, agg_input, error);
                 if (!e) {
                     return nullptr;
                 }
+                lowered_from = ordinal_item;
+            } else {
+                e = lower_expr(key, agg_input, error);
+                if (!e) {
+                    // Not an input column/expression: try a SELECT output alias.
+                    // (Reaching here means the key did not resolve against the
+                    // input, so input-column precedence is already honoured.)
+                    if (const ASTNode* alias_item =
+                            group_key_alias_target(key, select_list)) {
+                        error.clear();
+                        e = lower_expr(alias_item, agg_input, error);
+                        lowered_from = alias_item;
+                    }
+                    if (!e) {
+                        return nullptr;
+                    }
+                }
             }
+            // A positional key's name/type come from the resolved item (the literal
+            // is Integer and named "n"); a column / alias key already carries them.
+            const ASTNode* name_src = (ordinal_item != nullptr) ? lowered_from : key;
             ColumnSchema col;
-            col.name = item_output_name(key);
-            col.type = analyzer_.type_of(key);
-            col.nullable = analyzer_.nullability_of(key) != 1;
+            col.name = item_output_name(name_src);
+            col.type = analyzer_.type_of(name_src);
+            col.nullable = analyzer_.nullability_of(name_src) != 1;
             if (lowered_from->node_type == NodeType::ColumnRef ||
                 lowered_from->node_type == NodeType::Identifier) {
                 col.table_id = lowered_from->context.analysis.table_id;

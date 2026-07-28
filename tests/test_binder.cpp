@@ -714,6 +714,50 @@ void test_group_by_output_alias(const InMemoryCatalog& cat) {
     });
 }
 
+// Positional GROUP BY: `GROUP BY <n>` groups by the n-th SELECT output column's
+// expression - standard SQL the analyzer accepts and validates. Regression: the
+// binder lowered the integer literal as a CONSTANT single-group key (its comment
+// wrongly assumed ordinals were "rejected upstream"), so the referenced bare
+// column then failed to resolve and a legal, analyzer-blessed query failed to
+// bind. The plan must be identical to spelling the column out.
+void test_group_by_positional(const InMemoryCatalog& cat) {
+    std::printf("[test] GROUP BY <ordinal>\n");
+
+    // `GROUP BY 1` == `GROUP BY dept`: Aggregate group=(dept #1), COUNT agg.
+    with_plan(cat, "SELECT dept, COUNT(*) FROM emp GROUP BY 1",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "ord: root is Project");
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->op == LogicalOp::Aggregate, "ord: child is Aggregate");
+        check(agg && agg->group_keys.size() == 1, "ord: 1 group key");
+        if (agg && agg->group_keys.size() == 1) {
+            expect_col_ref(agg->group_keys[0], 1, "ord: group key is dept (#1)");
+        }
+        check(agg && agg->aggregates.size() == 1, "ord: 1 aggregate (COUNT)");
+        // The bare `dept` in the SELECT resolves to the group-key slot #0.
+        if (root->exprs.size() == 2) {
+            expect_col_ref(root->exprs[0], 0, "ord: proj dept -> group-key slot #0");
+        }
+        if (!agg->output.empty()) {
+            check(agg->output[0].name == "dept", "ord: key column named 'dept'");
+            check(agg->output[0].type == DataType::VarChar,
+                  "ord: key column typed VarChar (from the item, not the literal)");
+        }
+    });
+
+    // `GROUP BY 1` with an aggregate also present binds and groups by dept.
+    with_plan(cat, "SELECT dept, SUM(sal) FROM emp GROUP BY 1",
+              [](const LogicalNode* root) {
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->op == LogicalOp::Aggregate, "ord+agg: child is Aggregate");
+        check(agg && agg->group_keys.size() == 1 && agg->aggregates.size() == 1,
+              "ord+agg: 1 key + 1 aggregate");
+        if (agg && agg->group_keys.size() == 1) {
+            expect_col_ref(agg->group_keys[0], 1, "ord+agg: group key is dept (#1)");
+        }
+    });
+}
+
 // The Aggregate output is group_keys ++ aggregates, independent of SELECT order.
 // `SELECT COUNT(*), dept` puts the aggregate first in the select list but the
 // Aggregate output is still [dept (key), COUNT (agg)]; the Project reorders it
@@ -3081,6 +3125,7 @@ int main() {
     test_table_name_qualifier(cat);
     test_group_by(cat);
     test_group_by_output_alias(cat);
+    test_group_by_positional(cat);
     test_group_by_select_reordered(cat);
     test_group_by_same_name_aggregates(cat);
     test_self_join_group_key_distinct_slots(cat);
