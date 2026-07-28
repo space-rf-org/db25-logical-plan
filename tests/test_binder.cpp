@@ -1092,6 +1092,37 @@ void test_order_by_aggregate_not_selected(const InMemoryCatalog& cat) {
         check(agg && agg->op == LogicalOp::Aggregate && agg->output.size() == 2,
               "aggregate output is [dept, SUM]");
     });
+
+    // Regression: a no-argument aggregate (COUNT(*)) - or one whose argument is
+    // resolvable against the grouped Project output (COUNT(dept)) - must ALSO
+    // route to its precomputed Aggregate slot, not be re-lowered as a fresh
+    // Aggregate over the one-row-per-group Project output (which would make
+    // COUNT() == 1 for every row - a meaningless sort). Unlike SUM(sal) it has no
+    // unresolvable argument, so it does not fail the visible-output attempt on its
+    // own; the raw-aggregate guard is what diverts it to the frame path.
+    std::printf("[test] SELECT dept FROM emp GROUP BY dept ORDER BY COUNT(*)\n");
+    with_plan(cat, "SELECT dept FROM emp GROUP BY dept ORDER BY COUNT(*)",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Sort, "count: root is Sort");
+        check(root->sort_keys.size() == 1, "count: one sort key");
+        if (root->sort_keys.size() == 1) {
+            // The sort key is a ColumnRef into the hidden COUNT column - NOT a raw
+            // ExprKind::Aggregate re-computed above the Aggregate node.
+            const auto& k = root->sort_keys[0].expr;
+            check(k && k->kind == ExprKind::ColumnRef,
+                  "count: sort key is a ColumnRef (precomputed), not a raw aggregate");
+        }
+        const LogicalNode* project = only_child(root);
+        check(project && project->op == LogicalOp::Project, "count: sort child is Project");
+        // dept (visible) + a hidden COUNT column = ColumnRef into agg slot #1.
+        check(project && project->output.size() == 2,
+              "count: project has dept + hidden COUNT");
+        if (project && project->exprs.size() == 2) {
+            expect_col_ref(project->exprs[1], 1, "count: hidden sort col -> agg COUNT slot #1");
+        }
+        // The Sort drops the hidden column: its visible output is just dept.
+        check(root->output.size() == 1, "count: sort visible output is just dept");
+    });
 }
 
 // -------------------------------------------------------------------------
