@@ -2800,9 +2800,52 @@ void test_chained_using_natural_single_merged_column(const InMemoryCatalog& cat)
     }
 }
 
+// An aggregate whose SELECT-list output ALIAS equals a base-column name in the
+// FROM relation must still COMPUTE the aggregate - the alias must never redirect
+// the aggregate to a same-named base column of its input. Regression: the
+// by-output-name precomputed-aggregate shortcut mis-fired during aggregate
+// construction (where the input is the scan/join), lowering `MAX(sal) AS id` to
+// a ColumnRef to emp.id instead of MAX(sal). The correct precomputed resolution
+// is by STRUCTURAL identity against the active aggregate frame, which is inactive
+// during construction.
+void test_aggregate_alias_collides_with_base_column(const InMemoryCatalog& cat) {
+    std::printf("[test] aggregate output alias colliding with a base column name\n");
+    struct Case { const char* sql; std::size_t n_aggs; const char* func0; };
+    const Case cases[] = {
+        {"SELECT MAX(sal) AS id FROM emp", 1, "MAX"},                 // alias = base col
+        {"SELECT SUM(sal) AS sal FROM emp GROUP BY dept", 1, "SUM"},   // alias = agg'd col
+        {"SELECT SUM(sal) AS dept FROM emp GROUP BY dept", 1, "SUM"},  // alias = group key
+        {"SELECT AVG(sal) AS dept, COUNT(*) AS id FROM emp GROUP BY dept", 2, "AVG"},
+    };
+    for (const Case& c : cases) {
+        with_plan(cat, c.sql, [&](const LogicalNode* root) {
+            const LogicalNode* agg = only_child(root);
+            check(agg && agg->op == LogicalOp::Aggregate,
+                  std::string{"child is Aggregate: "} + c.sql);
+            if (!agg || agg->op != LogicalOp::Aggregate) return;
+            check(agg->aggregates.size() == c.n_aggs,
+                  std::string{"aggregate count: "} + c.sql);
+            // Every aggregate slot must be a real Aggregate expr - NOT a ColumnRef
+            // that the colliding alias redirected to a base column.
+            bool all_agg = true;
+            for (const auto& a : agg->aggregates) {
+                if (!a || a->kind != ExprKind::Aggregate) all_agg = false;
+            }
+            check(all_agg,
+                  std::string{"every aggregate lowers to an Aggregate expr (not a "
+                              "base-column ref): "} + c.sql);
+            if (!agg->aggregates.empty() && agg->aggregates[0]) {
+                check(agg->aggregates[0]->func_name == c.func0,
+                      std::string{"first aggregate func is "} + c.func0 + ": " + c.sql);
+            }
+        });
+    }
+}
+
 int main() {
     const InMemoryCatalog cat = make_catalog();
     test_chained_using_natural_single_merged_column(cat);
+    test_aggregate_alias_collides_with_base_column(cat);
 
     test_scan_filter_project_limit(cat);
     test_derived_table_column_alias(cat);

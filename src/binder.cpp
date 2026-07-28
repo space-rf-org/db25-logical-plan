@@ -347,18 +347,6 @@ int slot_by_name(const Schema& s, std::string_view name) {
 
 }  // namespace
 
-ExprPtr Binder::lower_precomputed_aggregate(const ASTNode* call, const Schema& input) const {
-    if (call == nullptr || !(is_aggregate_call(call) || is_window_call(call))) {
-        return nullptr;
-    }
-    const int slot = slot_by_name(input, item_output_name(call));
-    if (slot < 0) {
-        return nullptr;
-    }
-    return make_column_ref(static_cast<std::uint32_t>(slot),
-                           input[static_cast<std::size_t>(slot)]);
-}
-
 Schema Binder::scan_schema(const TableInfo& table, std::uint32_t table_id,
                            std::string_view alias) const {
     Schema schema;

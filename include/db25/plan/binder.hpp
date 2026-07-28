@@ -131,19 +131,6 @@ private:
     [[nodiscard]] ExprPtr lower_expr(const db25::ast::ASTNode* n, const Schema& input,
                                      std::string& error);
 
-    // If `call` is an aggregate / window call whose result a child Aggregate /
-    // Window node already produced (matched by output name in `input`), return a
-    // ColumnRef reading that precomputed output column; otherwise null. This is
-    // the producer map applied inside expression lowering, so an aggregate that
-    // surfaces *above* its Aggregate node - referenced in HAVING or ORDER BY,
-    // e.g. `HAVING SUM(x) > 10` - resolves to the already-computed column instead
-    // of being re-lowered as a fresh call whose base-column arguments are no
-    // longer in scope. Self-gating: it only matches when `input` actually carries
-    // a same-named column, so lowering an aggregate against its pre-aggregation
-    // input (where no such column exists) is unaffected.
-    [[nodiscard]] ExprPtr lower_precomputed_aggregate(const db25::ast::ASTNode* call,
-                                                      const Schema& input) const;
-
     // If `n` structurally matches a producer in the active Aggregate frame
     // (`agg_frame_`), return that producer's output slot; otherwise -1. This is
     // the aggregate producer map applied inside expression lowering: an aggregate
