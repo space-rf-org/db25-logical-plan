@@ -1318,10 +1318,21 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
             const Schema& win_input = current->output;
             window->output = current->output;  // input columns pass through
             const auto base_width = static_cast<std::uint32_t>(window->output.size());
+            // Lower with the aggregate frame active, exactly as HAVING / the
+            // Project do. A window clause over a grouped query may reference an
+            // aggregate of the group (`RANK() OVER (ORDER BY SUM(sal))`,
+            // `... PARTITION BY MAX(x)`): the window node sits above the
+            // Aggregate, so that SUM(sal) must resolve to the precomputed
+            // Aggregate output column, not re-lower the raw `sal` the
+            // post-aggregation input no longer exposes. `agg_frame` is empty when
+            // the query does not aggregate, so this is a no-op there.
+            agg_frame_ = &agg_frame;
+            bool window_ok = true;
             for (const ASTNode* fn : window_fns) {
                 auto e = lower_expr(fn, win_input, error);
                 if (!e) {
-                    return nullptr;
+                    window_ok = false;
+                    break;
                 }
                 // Record this call's exact output slot so the Project references
                 // the right column - not the first same-named window output.
@@ -1334,6 +1345,10 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
                 col.type = analyzer_.type_of(fn);
                 col.nullable = analyzer_.nullability_of(fn) != 1;
                 window->output.push_back(std::move(col));
+            }
+            agg_frame_ = nullptr;
+            if (!window_ok) {
+                return nullptr;
             }
             window->add_child(std::move(current));
             current = std::move(window);

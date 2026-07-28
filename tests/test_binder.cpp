@@ -2318,6 +2318,52 @@ void test_window_same_name_distinct_slots(const InMemoryCatalog& cat) {
     });
 }
 
+// A window clause over a GROUPED query may reference an aggregate of the group.
+// The Window node sits above the Aggregate, so an aggregate in the window's
+// ORDER BY / PARTITION BY (`RANK() OVER (ORDER BY SUM(sal))`) must resolve to
+// the precomputed Aggregate output column - not re-lower the raw `sal` the
+// post-aggregation input no longer exposes. Regression: the window-function
+// lowering loop ran with the aggregate frame inactive (unlike HAVING and the
+// Project), so this legal query failed to bind ("column reference 'sal'
+// resolves to no input or enclosing slot").
+void test_window_over_aggregate(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT dept, SUM(sal), RANK() OVER (ORDER BY SUM(sal)) "
+                "FROM emp GROUP BY dept\n");
+    with_plan(cat,
+              "SELECT dept, SUM(sal), RANK() OVER (ORDER BY SUM(sal)) "
+              "FROM emp GROUP BY dept",
+              [](const LogicalNode* root) {
+        // Project <- Window <- Aggregate <- Scan emp.
+        check(root->op == LogicalOp::Project, "root is Project");
+        check(root->output.size() == 3, "project 3 cols (dept, SUM(sal), RANK)");
+        const LogicalNode* window = only_child(root);
+        check(window && window->op == LogicalOp::Window, "child is Window");
+        check(window && window->window_functions.size() == 1, "1 window function");
+        if (window && window->window_functions.size() == 1) {
+            const auto& w = *window->window_functions[0];
+            check(w.kind == ExprKind::WindowFunction && w.func_name == "RANK",
+                  "window func is RANK");
+            // The ORDER BY key is SUM(sal), which lives in the Aggregate output at
+            // slot #1 (after the group key dept #0) - a positional ref, NOT a
+            // re-lowered raw column.
+            check(w.window.order_by.size() == 1, "1 ORDER BY key");
+            if (w.window.order_by.size() == 1) {
+                expect_col_ref(w.window.order_by[0].expr, 1,
+                               "window ORDER BY SUM(sal) -> agg output #1");
+            }
+        }
+        // Window output = [dept #0, SUM(sal) #1, RANK #2].
+        check(window && window->output.size() == 3, "window output = 3 cols");
+        const LogicalNode* agg = only_child(window);
+        check(agg && agg->op == LogicalOp::Aggregate, "window child is Aggregate");
+        check(agg && agg->group_keys.size() == 1, "1 group key (dept)");
+        check(agg && agg->aggregates.size() == 1, "1 aggregate (SUM(sal))");
+        const LogicalNode* scan = only_child(agg);
+        check(scan && scan->op == LogicalOp::Scan && scan->table_name == "emp",
+              "leaf scan emp");
+    });
+}
+
 // A window function NESTED inside a larger expression must STILL be evaluated by
 // a Window node below the Project; the Project references the window's output
 // column and re-applies the wrapper (`... + 1`). Previously the window call was
@@ -2929,6 +2975,7 @@ int main() {
 
     test_window_rank(cat);
     test_window_row_number(cat);
+    test_window_over_aggregate(cat);
     test_window_sum(cat);
     test_window_same_name_distinct_slots(cat);
     test_window_nested_in_expr(cat);
