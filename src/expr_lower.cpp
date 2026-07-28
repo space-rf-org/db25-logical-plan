@@ -532,24 +532,24 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
             const auto [ptr, ec] = std::from_chars(t.data(), t.data() + t.size(), v);
             if (ec == std::errc{} && ptr == t.data() + t.size()) {
                 e->value.value = v;
+            } else if (ec == std::errc::result_out_of_range) {
+                // The magnitude exceeds int64 (e.g. 9223372036854775809,
+                // 18446744073709551615, or a 26-digit literal). The analyzer types
+                // such a literal Decimal (exact SQL numeric); casting it to double -
+                // as this path used to - corrupts the value past 2^53 (off-by-one
+                // and worse) AND contradicts that Decimal schema type, so a VALUES
+                // column reconciled the wrong way (Double vs the analyzer's Decimal).
+                // Preserve the value EXACTLY by carrying the literal text in the
+                // string arm, keeping the analyzer's Decimal type - the IR's
+                // text-backed-literal convention (as for Interval). Constant folding
+                // reads only the int64/double arms (via get_if), so it leaves this
+                // literal unfolded rather than mis-folding an inexact double.
+                e->value.value = std::string{t};
+                e->type = ast::DataType::Decimal;
             } else {
-                // The literal does not fit in int64 (e.g. 9223372036854775808).
-                // Leaving value.value at its default (monostate == NULL) while the
-                // type stays Integer silently turns every comparison against it
-                // into UNKNOWN and drops rows. Promote it to double instead -
-                // the numeric widening SQLite applies to oversized integer
-                // literals - so the value is preserved and comparisons evaluate.
-                double dv = 0.0;
-                const auto [dptr, dec] =
-                    std::from_chars(t.data(), t.data() + t.size(), dv);
-                if (dec == std::errc{} && dptr == t.data() + t.size()) {
-                    e->value.value = dv;
-                    e->type = ast::DataType::Double;
-                } else {
-                    error = "integer literal '" + std::string{t} +
-                            "' is not a valid number";
-                    return nullptr;
-                }
+                error = "integer literal '" + std::string{t} +
+                        "' is not a valid number";
+                return nullptr;
             }
             return e;
         }

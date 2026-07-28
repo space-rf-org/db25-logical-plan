@@ -424,6 +424,64 @@ void test_hex_binary_literals(const InMemoryCatalog& cat) {
     });
 }
 
+// An integer literal whose magnitude exceeds int64 is typed Decimal (exact SQL
+// numeric) by the analyzer. The binder must lower it preserving that value and
+// type. Regression: it cast the magnitude to double - corrupting the value past
+// 2^53 (e.g. 9223372036854775809 -> 9223372036854775808) and overwriting the
+// schema's Decimal type with Double, which also made a VALUES column reconcile
+// Double instead of the analyzer's Decimal.
+void test_oversized_integer_literal_stays_exact_decimal(const InMemoryCatalog& cat) {
+    std::printf("[test] integer literal > int64 lowers to an exact Decimal\n");
+
+    auto proj_literal = [&](const char* sql, const std::string& ctx,
+                            auto&& inspect) {
+        with_plan(cat, sql, [&](const LogicalNode* root) {
+            const LogicalNode* proj =
+                (root->op == LogicalOp::Project) ? root : only_child(root);
+            check(proj && proj->op == LogicalOp::Project && !proj->exprs.empty(),
+                  ctx + ": has Project");
+            if (!proj || proj->exprs.empty()) return;
+            const auto& e = proj->exprs[0];
+            check(e && e->kind == ExprKind::Literal, ctx + ": item is a literal");
+            if (e && e->kind == ExprKind::Literal) inspect(*e);
+        });
+    };
+
+    // > int64: exact text carried in the string arm, type Decimal (NOT a lossy
+    // Double). The value string must be byte-exact.
+    proj_literal("SELECT 9223372036854775809", "9223372036854775809",
+                 [](const db25::plan::Expr& e) {
+        check(e.type == DataType::Decimal, "9223372036854775809: type Decimal");
+        const auto* s = std::get_if<std::string>(&e.value.value);
+        check(s != nullptr, "9223372036854775809: exact text in string arm");
+        check(s && *s == "9223372036854775809", "9223372036854775809: value exact");
+    });
+    proj_literal("SELECT 18446744073709551615", "18446744073709551615",
+                 [](const db25::plan::Expr& e) {
+        check(e.type == DataType::Decimal, "u64max: type Decimal");
+        const auto* s = std::get_if<std::string>(&e.value.value);
+        check(s && *s == "18446744073709551615", "u64max: value exact");
+    });
+
+    // Fits int64: unchanged - int64 arm, BigInt type.
+    proj_literal("SELECT 9223372036854775807", "int64max",
+                 [](const db25::plan::Expr& e) {
+        const auto* v = std::get_if<std::int64_t>(&e.value.value);
+        check(v && *v == 9223372036854775807LL, "int64max: exact int64");
+    });
+
+    // The VALUES column type reconciles to Decimal (matching the analyzer), not
+    // Double: (Integer, Decimal) -> Decimal.
+    with_plan(cat, "SELECT * FROM (VALUES (1),(9223372036854775808)) AS t(x)",
+              [](const LogicalNode* root) {
+        check(root->output.size() == 1, "VALUES: one output column");
+        if (!root->output.empty()) {
+            check(root->output[0].type == DataType::Decimal,
+                  "VALUES (1),(2^63) reconciles to Decimal, not Double");
+        }
+    });
+}
+
 void test_limit_offset(const InMemoryCatalog& cat) {
     std::printf("[test] ... LIMIT 10 OFFSET 5\n");
     with_plan(cat, "SELECT id, name FROM users WHERE id = 1 LIMIT 10 OFFSET 5",
@@ -2897,6 +2955,7 @@ int main() {
     test_derived_table_column_alias(cat);
     test_values_derived_table(cat);
     test_hex_binary_literals(cat);
+    test_oversized_integer_literal_stays_exact_decimal(cat);
     test_delimited_identifiers(cat);
     test_string_escape_unquote(cat);
     test_cast_modifiers(cat);

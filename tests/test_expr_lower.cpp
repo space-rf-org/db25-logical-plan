@@ -519,10 +519,13 @@ void test_correlated_exists(const InMemoryCatalog& cat) {
 }  // namespace
 
 // -------------------------------------------------------------------------
-// An integer literal too large for int64 must not silently lower to NULL: it is
-// promoted to double (SQLite's numeric widening), so comparisons still evaluate.
+// An integer literal too large for int64 must not silently lower to NULL, and
+// must not lose its value: the analyzer types it Decimal (exact SQL numeric), so
+// the binder carries the exact literal text in the string arm keeping that
+// Decimal type - NOT a lossy Double (which corrupts the value past 2^53 and
+// contradicts the Decimal schema type).
 // -------------------------------------------------------------------------
-void test_integer_literal_overflow_promotes_double(const InMemoryCatalog& cat) {
+void test_integer_literal_overflow_stays_exact_decimal(const InMemoryCatalog& cat) {
     std::printf("[test] (overflow) WHERE id < 9223372036854775808\n");
     Analyzer az(cat);
     Analyzed a;
@@ -542,12 +545,13 @@ void test_integer_literal_overflow_promotes_double(const InMemoryCatalog& cat) {
 
     const Expr& rhs = *e->children[1];
     check(rhs.kind == ExprKind::Literal, "rhs is Literal");
-    // INT64_MAX + 1 overflows int64: promoted to Double with a real value, NOT
-    // silently left as a NULL (monostate) with an Integer type.
-    check(rhs.type == DataType::Double,
-          "overflowing integer literal promoted to Double");
-    check(std::holds_alternative<double>(rhs.value.value),
-          "literal value is a double, not NULL");
+    // INT64_MAX + 1 overflows int64: carried as an EXACT Decimal (text in the
+    // string arm), NOT a lossy Double and NOT a NULL (monostate).
+    check(rhs.type == DataType::Decimal,
+          "overflowing integer literal stays Decimal");
+    const auto* s = std::get_if<std::string>(&rhs.value.value);
+    check(s != nullptr, "literal value is the exact text, not NULL/double");
+    check(s && *s == "9223372036854775808", "literal value is exact");
 }
 
 // -------------------------------------------------------------------------
@@ -732,7 +736,7 @@ int main() {
     test_qualified_computed_column_disambiguates(cat);
     test_join_concatenated_index(cat);
     test_correlated_exists(cat);
-    test_integer_literal_overflow_promotes_double(cat);
+    test_integer_literal_overflow_stays_exact_decimal(cat);
     test_extract_datepart_lowered_as_literal(cat);
     test_boolean_test_lowering(cat);
     test_ilike_lowering(cat);
