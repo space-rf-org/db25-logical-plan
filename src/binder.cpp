@@ -617,14 +617,24 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
             merged.push_back(split_column_ref(col->primary_text).column);
         }
     } else {
+        // A `hidden` column is an internal per-side copy retained from an EARLIER
+        // USING/NATURAL merge (so a qualified `u.c` still resolves after the merge);
+        // it is not a user-visible relation column, so it is NOT a NATURAL common
+        // column and must not inflate the duplicate/ambiguity count. Excluding it
+        // keeps a chained `A NATURAL RIGHT JOIN B NATURAL RIGHT JOIN C` from seeing
+        // the first merge's hidden copies as duplicate `id`s and falsely rejecting
+        // the (legal) query as ambiguous.
         const auto count_by_name = [](const Schema& s, std::string_view name) {
             int n = 0;
             for (const auto& c : s) {
-                if (iequals(c.name, name)) ++n;
+                if (!c.hidden && iequals(c.name, name)) ++n;
             }
             return n;
         };
         for (const auto& lc : left->output) {
+            if (lc.hidden) {
+                continue;  // internal per-side copy, not a common column
+            }
             const int right_count = count_by_name(right->output, lc.name);
             if (right_count == 0) {
                 continue;  // not a common column
@@ -758,7 +768,12 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
     std::vector<ExprPtr> pexprs;
     for (std::uint32_t i = 0; i < left_width; ++i) {
         const ColumnSchema& lc = join->output[i];  // null_left-adjusted
-        if (!is_merged(lc.name)) {
+        // A hidden per-side copy from an EARLIER merge is not itself a merge key -
+        // it passes through UNCHANGED (still hidden, keeping its qualified-ref
+        // identity). Only a VISIBLE column is materialized as the COALESCE, so a
+        // chained `... RIGHT JOIN o USING(id) RIGHT JOIN e USING(id)` emits exactly
+        // ONE visible `id` instead of one per prior copy.
+        if (lc.hidden || !is_merged(lc.name)) {
             pexprs.push_back(make_column_ref(i, lc));
             pout.push_back(lc);
             continue;
@@ -820,7 +835,11 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
     }
     for (std::uint32_t j = 0; j < static_cast<std::uint32_t>(right->output.size()); ++j) {
         const ColumnSchema& rc = join->output[left_width + j];
-        if (is_merged(rc.name)) {
+        // A VISIBLE right column whose name is merged has its value in the left
+        // section (the COALESCE). A hidden right copy from an earlier merge is not
+        // a merge key and passes through unchanged, so a qualified reference into
+        // that side still resolves after this join.
+        if (!rc.hidden && is_merged(rc.name)) {
             continue;  // its coalesced value lives in the left section
         }
         pexprs.push_back(make_column_ref(left_width + j, rc));

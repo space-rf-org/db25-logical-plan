@@ -2763,8 +2763,46 @@ void test_order_by_qualified_null_side_right_join(const InMemoryCatalog& cat) {
     });
 }
 
+// A USING / NATURAL merge whose result is itself an input of a SECOND USING /
+// NATURAL join on the same column must still produce exactly ONE visible merged
+// column. The first merge leaves HIDDEN per-side copies of the key; the second
+// join must exclude them from merge-key emission (else RIGHT / FULL emit the key
+// once PER copy - three visible `id`s) and from NATURAL common-column discovery
+// (else the extra copies read as duplicates and the legal query is rejected
+// "ambiguous"). Regression from the hidden-per-side-copy design.
+void test_chained_using_natural_single_merged_column(const InMemoryCatalog& cat) {
+    std::printf("[test] chained USING / NATURAL keeps one merged column\n");
+    const char* queries[] = {
+        "SELECT * FROM users u RIGHT JOIN orders o USING(id) RIGHT JOIN emp e USING(id)",
+        "SELECT * FROM users u FULL JOIN orders o USING(id) FULL JOIN emp e USING(id)",
+        "SELECT * FROM users u NATURAL RIGHT JOIN orders o NATURAL RIGHT JOIN emp e",
+    };
+    for (const char* sql : queries) {
+        // with_plan asserts the bind SUCCEEDS (the NATURAL chain previously failed
+        // "ambiguous") before invoking the body.
+        with_plan(cat, sql, [&](const LogicalNode* root) {
+            // users(id,name) ++ orders(id,user_id,total) ++ emp(id,dept,sal) with
+            // id merged across the whole chain -> exactly [id, name, user_id,
+            // total, dept, sal]: six visible columns, one `id`.
+            int id_count = 0;
+            int visible = 0;
+            for (const auto& c : root->output) {
+                if (!c.hidden) {
+                    ++visible;
+                    if (c.name == "id") {
+                        ++id_count;
+                    }
+                }
+            }
+            check(id_count == 1, std::string{"exactly one visible merged id: "} + sql);
+            check(visible == 6, std::string{"six visible output columns: "} + sql);
+        });
+    }
+}
+
 int main() {
     const InMemoryCatalog cat = make_catalog();
+    test_chained_using_natural_single_merged_column(cat);
 
     test_scan_filter_project_limit(cat);
     test_derived_table_column_alias(cat);
