@@ -1298,13 +1298,26 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
             }
             agg->output.push_back(std::move(col));
             agg->group_keys.push_back(std::move(e));
-            // Register BOTH the key and (when distinct) the aliased item as
-            // producers of this slot, so a SELECT/HAVING/ORDER BY reference that
-            // matches either the alias key or the underlying expression routes
-            // here.
-            agg_frame.producers.emplace_back(key, slot);
-            if (lowered_from != key) {
+            // Register the producer(s) of this slot so a SELECT/HAVING/ORDER BY
+            // reference routes here. Producers are matched STRUCTURALLY, so what
+            // we register must be an expression whose recurrence above the
+            // Aggregate genuinely denotes this group key:
+            //   - column / expression key: register the key itself.
+            //   - alias key (`GROUP BY d` for `x AS d`): also register the
+            //     underlying expression, so a reference to either routes here.
+            //   - positional key (`GROUP BY 1`): register ONLY the resolved
+            //     n-th SELECT item, NEVER the integer-literal key. The literal
+            //     is a positional selector, not the grouped value; registering
+            //     it would rewrite every structurally-identical constant above
+            //     the Aggregate (e.g. the `1` in `COUNT(*)+1`, a `2` in
+            //     `HAVING sal > 2`) into a ColumnRef pointing at this slot.
+            if (ordinal_item != nullptr) {
                 agg_frame.producers.emplace_back(lowered_from, slot);
+            } else {
+                agg_frame.producers.emplace_back(key, slot);
+                if (lowered_from != key) {
+                    agg_frame.producers.emplace_back(lowered_from, slot);
+                }
             }
             ++slot;
         }
