@@ -1430,6 +1430,25 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
                     std::to_string(project->output.size()) + ")";
             return nullptr;
         }
+        // Reconcile each projected column's declared nullability with the actual
+        // bound plan. A projected ColumnRef's output column IS the child slot it
+        // references, so its nullability must equal that slot's - the output
+        // schema is otherwise seeded from the analyzer's projection annotation,
+        // which is conservatively NULLABLE for a RIGHT / FULL USING (or NATURAL
+        // RIGHT/FULL) merged key. That merged key is COALESCE(left, right) over a
+        // preserved (non-null) side, which the binder's own COALESCE node has
+        // already proven non-null; copying the analyzer's nullable annotation
+        // left the top Project declaring the key nullable while its expr (and the
+        // child COALESCE) typed it non-null - an internally inconsistent node.
+        // The child slot is the ground truth for a pass-through column reference.
+        for (std::size_t i = 0; i < project->exprs.size(); ++i) {
+            const Expr* e = project->exprs[i].get();
+            if (e != nullptr && e->kind == ExprKind::ColumnRef &&
+                e->input_index < current->output.size()) {
+                project->output[i].nullable =
+                    current->output[e->input_index].nullable;
+            }
+        }
     }
     project->add_child(std::move(current));
     current = std::move(project);

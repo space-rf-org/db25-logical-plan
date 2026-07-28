@@ -1550,6 +1550,43 @@ void test_right_full_using_qualified_sides(const InMemoryCatalog& cat) {
     });
 }
 
+// The merged USING/NATURAL key of a RIGHT / NATURAL-RIGHT join is
+// COALESCE(left, right) over a preserved (non-null) right side, so it is NON-NULL.
+// The top Project's output schema (seeded from the analyzer's conservatively-
+// nullable projection annotation) must agree with the ColumnRef expr and the
+// child COALESCE, which both type it non-null - not declare it nullable.
+void test_right_using_merged_key_output_notnull(const InMemoryCatalog& cat) {
+    std::printf("[test] RIGHT/NATURAL-RIGHT USING merged key: output schema is NOT NULL\n");
+    // users(id NOT NULL,...), orders(id NOT NULL,...): the merged id is non-null.
+    with_plan(cat, "SELECT id FROM users u RIGHT JOIN orders o USING (id)",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project && root->output.size() == 1,
+              "right: project of 1");
+        if (!root->output.empty()) {
+            check(!root->output[0].nullable,
+                  "right: merged id output schema is NOT NULL (matches COALESCE)");
+        }
+        // The projected expr references the child's non-null COALESCE slot.
+        if (!root->exprs.empty() && root->exprs[0]->kind == ExprKind::ColumnRef) {
+            const LogicalNode* child = only_child(root);
+            const auto idx = root->exprs[0]->input_index;
+            check(child && idx < child->output.size() && !child->output[idx].nullable,
+                  "right: child slot for merged id is non-null (expr/schema agree)");
+        }
+    });
+    // LEFT / INNER were already non-null; assert they still are (no regression).
+    with_plan(cat, "SELECT id FROM users u LEFT JOIN orders o USING (id)",
+              [](const LogicalNode* root) {
+        check(!root->output.empty() && !root->output[0].nullable,
+              "left: merged id still NOT NULL");
+    });
+    with_plan(cat, "SELECT id FROM users u JOIN orders o USING (id)",
+              [](const LogicalNode* root) {
+        check(!root->output.empty() && !root->output[0].nullable,
+              "inner: merged id still NOT NULL");
+    });
+}
+
 // A NATURAL join whose common column is ambiguous on one side (here `id` occurs
 // in both users and emp on the left) must be REJECTED, not silently tie only the
 // first slot and leave the duplicate unconstrained (which returns wrong rows).
@@ -3078,6 +3115,7 @@ int main() {
     test_left_join_using_keeps_left_copy(cat);
     test_using_qualified_null_side(cat);
     test_right_full_using_qualified_sides(cat);
+    test_right_using_merged_key_output_notnull(cat);
     test_using_natural_join_matrix(cat);
     test_values_column_types_match_analyzer(cat);
     test_order_by_qualified_null_side_right_join(cat);
