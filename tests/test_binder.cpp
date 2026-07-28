@@ -1298,6 +1298,58 @@ void test_comma_join(const InMemoryCatalog& cat) {
     });
 }
 
+// Comma binds looser than JOIN: `emp, users u RIGHT JOIN orders o` is
+// `emp CROSS (users RIGHT JOIN orders)`, so the RIGHT join null-supplies only
+// `users` (its own left operand) - NOT the comma-joined `emp`. Regression: the
+// FROM list was folded left-associatively into `(emp CROSS users) RIGHT JOIN
+// orders`, whose whole left input (including emp) was null-extended, so a NOT
+// NULL column of the comma table came out nullable.
+void test_comma_then_outer_join_nullability(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT emp.id FROM emp, users u RIGHT JOIN orders o ON ...\n");
+    with_plan(cat,
+              "SELECT emp.id, u.name FROM emp, users u "
+              "RIGHT JOIN orders o ON u.id = o.user_id",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        // Tree shape: Project -> Join(CROSS) -> [Scan emp, Join(RIGHT)].
+        const LogicalNode* cross = only_child(root);
+        check(cross && cross->op == LogicalOp::Join &&
+                  cross->join_type == db25::ast::JoinType::Cross,
+              "child is a CROSS join (comma binds looser than JOIN)");
+        if (cross && cross->child_count() == 2) {
+            check(cross->child(0)->op == LogicalOp::Scan &&
+                      cross->child(0)->table_name == "emp",
+                  "CROSS left is the bare comma relation emp");
+            check(cross->child(1)->op == LogicalOp::Join &&
+                      cross->child(1)->join_type == db25::ast::JoinType::Right,
+                  "CROSS right is the (users RIGHT JOIN orders) group");
+        }
+        // emp.id is comma-joined, NOT on the RIGHT join's null-supplying side, so
+        // it keeps its base NOT NULL. u.name is on the null-supplied left of the
+        // RIGHT join, so it is nullable.
+        check(root->output.size() == 2, "project has 2 cols");
+        if (root->output.size() == 2) {
+            expect_col(root->output[0], "id", DataType::Integer, false,
+                       "comma emp.id stays NOT NULL");
+            expect_col(root->output[1], "name", DataType::VarChar, true,
+                       "RIGHT-join left u.name is nullable");
+        }
+    });
+
+    // FULL variant: the comma relation still keeps NOT NULL; both sides of the
+    // FULL join are null-supplied.
+    with_plan(cat,
+              "SELECT emp.id FROM emp, users u "
+              "FULL JOIN orders o ON u.id = o.user_id",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "full: root is Project");
+        if (!root->output.empty()) {
+            expect_col(root->output[0], "id", DataType::Integer, false,
+                       "full: comma emp.id stays NOT NULL");
+        }
+    });
+}
+
 void test_cross_join(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT u.id FROM users u CROSS JOIN orders o\n");
     with_plan(cat, "SELECT u.id FROM users u CROSS JOIN orders o",
@@ -3188,6 +3240,7 @@ int main() {
     test_select_no_from_const(cat);
     test_select_no_from_func(cat);
     test_comma_join(cat);
+    test_comma_then_outer_join_nullability(cat);
     test_cross_join(cat);
     test_join_using(cat);
     test_natural_join(cat);

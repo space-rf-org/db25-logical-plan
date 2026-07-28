@@ -895,28 +895,47 @@ LogicalNodePtr Binder::bind_from(const ASTNode* from_clause, std::string& error)
         error = "empty FROM clause";
         return nullptr;
     }
-    LogicalNodePtr current = bind_relation(item, error);
-    if (!current) {
+    // Comma binds looser than JOIN. The FROM list is a sequence of
+    // comma-separated table_references, and each table_reference may itself be a
+    // chain of joins. `group` is the table_reference being built right now (an
+    // explicit JOIN attaches to it as its left operand); `current` is the
+    // CROSS-join of the table_references already completed. Folding a JOIN onto
+    // the whole accumulated `current` instead would place a preceding comma
+    // relation on the join's left operand, so a RIGHT/FULL join would wrongly
+    // null-extend it: `A, B RIGHT JOIN C` is `A CROSS (B RIGHT JOIN C)`, NOT
+    // `(A CROSS B) RIGHT JOIN C`. (Column order - left ++ right at every node -
+    // is identical to the old fold, so slot indices are unchanged.)
+    LogicalNodePtr group = bind_relation(item, error);
+    if (!group) {
         return nullptr;
     }
+    LogicalNodePtr current;  // completed table_references, CROSS-joined together
     for (item = item->next_sibling; item != nullptr; item = item->next_sibling) {
         if (is_join_node(item->node_type)) {
-            current = bind_join(std::move(current), item, error);
-            if (!current) {
+            // A JOIN extends the current table_reference (left-associative within
+            // the group) - its left operand is `group`, not the whole FROM so far.
+            group = bind_join(std::move(group), item, error);
+            if (!group) {
                 return nullptr;
             }
         } else if (item->node_type == NodeType::TableRef ||
                    is_derived_node(item->node_type)) {
-            // A comma-separated FROM item is a CROSS join of the two relations.
-            auto right = bind_relation(item, error);
-            if (!right) {
+            // A comma starts a new table_reference: the current group is complete,
+            // so CROSS it into the accumulated result, then begin the new group.
+            current = current ? make_join_node(std::move(current), std::move(group),
+                                               ast::JoinType::Cross)
+                              : std::move(group);
+            group = bind_relation(item, error);
+            if (!group) {
                 return nullptr;
             }
-            current = make_join_node(std::move(current), std::move(right),
-                                     ast::JoinType::Cross);
         }
         // Other node kinds at FROM level are ignored (defensive).
     }
+    // Fold the final (or only) table_reference into the accumulated cross-join.
+    current = current ? make_join_node(std::move(current), std::move(group),
+                                       ast::JoinType::Cross)
+                      : std::move(group);
     return current;
 }
 
