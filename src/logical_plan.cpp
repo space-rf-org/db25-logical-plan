@@ -33,6 +33,8 @@ const char* logical_op_to_string(LogicalOp op) noexcept {
         case LogicalOp::Update:    return "Update";
         case LogicalOp::Delete:    return "Delete";
         case LogicalOp::Returning: return "Returning";
+        case LogicalOp::RecursiveCTE:     return "RecursiveCTE";
+        case LogicalOp::WorkingTableScan: return "WorkingTableScan";
     }
     return "?";
 }
@@ -255,6 +257,22 @@ void dump_rec(const LogicalNode* n, int depth, std::string& out) {
         case LogicalOp::Returning:
             out.push_back(' ');
             out.append(n->table_name);
+            break;
+        case LogicalOp::RecursiveCTE:
+            out.push_back(' ');
+            out.append(n->table_name);
+            out.append(" (");
+            // A recursive CTE reconciles its branches by UNION or UNION ALL only.
+            out.append(n->set_op == ast::SetOp::UnionAll ? "UNION ALL" : "UNION");
+            out.push_back(')');
+            break;
+        case LogicalOp::WorkingTableScan:
+            out.push_back(' ');
+            out.append(n->table_name);
+            if (!n->alias.empty() && n->alias != n->table_name) {
+                out.append(" AS ");
+                out.append(n->alias);
+            }
             break;
         default:
             break;

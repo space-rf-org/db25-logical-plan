@@ -102,6 +102,28 @@ bool is_setop_node(NodeType t) {
            t == NodeType::ExceptStmt;
 }
 
+// True if `node`'s subtree contains a table reference named `name` (identifiers
+// fold case). A `WITH RECURSIVE` CTE is only actually recursive if its recursive
+// term references the CTE; this decides whether to lower to a RecursiveCTE node
+// or expand the CTE inline. It is an over-approximation used only for that
+// decision - the self-reference itself is resolved in bind_table_ref.
+bool subtree_references_cte(const ASTNode* node, std::string_view name) {
+    if (node == nullptr) {
+        return false;
+    }
+    if (node->node_type == NodeType::TableRef &&
+        iequals(node->primary_text, name)) {
+        return true;
+    }
+    for (const ASTNode* c = first_child(node); c != nullptr;
+         c = c->next_sibling) {
+        if (subtree_references_cte(c, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // The inner query block of a subquery / derived table: a SELECT block or a
 // nested set operation.
 const ASTNode* subquery_body(const ASTNode* node) {
@@ -439,17 +461,55 @@ LogicalNodePtr Binder::bind_table_ref(const ASTNode* table_ref, std::string& err
     // (or the CTE name when unaliased) so qualified `name.col` refs resolve.
     // Search innermost-first so an inner WITH shadows an enclosing one.
     for (auto it = ctes_.rbegin(); it != ctes_.rend(); ++it) {
-        if (iequals(it->first, name)) {  // CTE names are identifiers: fold case
-            const ASTNode* def = it->second;
+        if (iequals(it->name, name)) {  // CTE names are identifiers: fold case
+            const ASTNode* def = it->def;
+            // A reference to a recursive CTE whose RECURSIVE TERM is currently
+            // being bound is the recursive self-reference: it reads the working
+            // table (the previous iteration's rows), so bind a WorkingTableScan
+            // carrying the CTE's columns rather than re-expanding the body.
+            for (auto rit = recursive_working_.rbegin();
+                 rit != recursive_working_.rend(); ++rit) {
+                if (rit->def == def) {
+                    auto ws = make_node(LogicalOp::WorkingTableScan);
+                    ws->table_name = rit->name;
+                    const std::string_view a = alias_of(table_ref);
+                    ws->alias = a.empty() ? rit->name : std::string{a};
+                    ws->output = rit->schema;  // the CTE columns (ids preserved)
+                    // Stamp the reference name so a qualified `r.col` (and a
+                    // self-join of the working table) stays distinguishable, just
+                    // like a base-table Scan.
+                    for (auto& c : ws->output) c.alias = ws->alias;
+                    return ws;
+                }
+            }
             // Refuse to re-expand a CTE that is already being expanded higher up:
-            // a reference to it inside its own body (recursive or mutually
-            // recursive) would recurse without bound and overflow the stack.
-            // Recursive CTEs are unsupported; reject gracefully.
+            // a reference to it inside its own body would recurse without bound
+            // and overflow the stack. For a recursive CTE this is a self-reference
+            // in the ANCHOR term (illegal SQL); for a plain CTE it is direct or
+            // mutual recursion, which we do not support. Reject gracefully.
             for (const ASTNode* active : cte_expanding_) {
                 if (active == def) {
-                    error = "recursive CTE '" + std::string{name} +
-                            "' is not supported";
+                    error = it->recursive
+                        ? "recursive CTE '" + std::string{name} +
+                              "': self-reference is only allowed in the recursive term"
+                        : "recursive CTE '" + std::string{name} +
+                              "' is not supported";
                     return nullptr;
+                }
+            }
+            // A `WITH RECURSIVE` CTE whose body is `<anchor> UNION [ALL] <term>`
+            // and whose recursive term actually references the CTE lowers to a
+            // RecursiveCTE fixpoint node. A recursive-keyword CTE that does not
+            // self-reference (or is not a UNION) is an ordinary CTE: fall through
+            // to plain inline expansion below.
+            if (it->recursive) {
+                const ASTNode* rbody = subquery_body(def);
+                if (rbody != nullptr && is_setop_node(rbody->node_type)) {
+                    const ASTNode* anchor = first_child(rbody);
+                    const ASTNode* rterm = anchor ? anchor->next_sibling : nullptr;
+                    if (rterm != nullptr && subtree_references_cte(rterm, name)) {
+                        return bind_recursive_cte(*it, table_ref, error);
+                    }
                 }
             }
             // The CTE body is a SELECT or a set operation (UNION/INTERSECT/EXCEPT);
@@ -497,6 +557,93 @@ LogicalNodePtr Binder::bind_table_ref(const ASTNode* table_ref, std::string& err
     const std::string_view eff_alias = scan->alias.empty() ? name : scan->alias;
     scan->output = scan_schema(*table, table->table_id, eff_alias);
     return scan;
+}
+
+LogicalNodePtr Binder::bind_recursive_cte(CteEntry entry,
+                                          const ASTNode* table_ref,
+                                          std::string& error) {
+    const ASTNode* def = entry.def;
+    const ASTNode* body = subquery_body(def);  // an <anchor> UNION[ALL] <term> node
+    const ASTNode* anchor = first_child(body);
+    const ASTNode* rec_term = anchor != nullptr ? anchor->next_sibling : nullptr;
+    if (anchor == nullptr || rec_term == nullptr) {
+        error = "recursive CTE '" + entry.name +
+                "' must be an anchor term UNION a recursive term";
+        return nullptr;
+    }
+    // SQL / Postgres allow only UNION [ALL] to combine the terms of a recursive
+    // CTE (INTERSECT / EXCEPT recursion is not defined). Reject the others.
+    const ast::SetOp combine = setop_kind(body);
+    if (combine != ast::SetOp::Union && combine != ast::SetOp::UnionAll) {
+        error = "recursive CTE '" + entry.name +
+                "' must combine its terms with UNION [ALL]";
+        return nullptr;
+    }
+
+    // The CTE's columns are the analyzer's reconciled projection of the UNION
+    // body (anchor types unified with the recursive term, arity checked,
+    // nullability OR-ed). These columns carry the ids the analyzer stamped on
+    // references to the CTE - in the recursive term (through the working table)
+    // and in the outer query alike - so the same schema drives resolution in
+    // both places unchanged.
+    const auto* proj = analyzer_.projection_of(body);
+    if (proj == nullptr) {
+        error = "analyzer produced no projection for recursive CTE '" +
+                entry.name + "'";
+        return nullptr;
+    }
+    Schema cte_schema;
+    cte_schema.reserve(proj->size());
+    for (const auto& c : *proj) {
+        cte_schema.push_back(to_schema(c));
+    }
+    // Optional `WITH r(a, b)` column-list rename: rename positionally so a bare
+    // `a` / `r.a` (a computed CTE column the analyzer resolves by name) and the
+    // dumped schema use the declared names.
+    if (const ASTNode* col_list = find_child(def, NodeType::ColumnList)) {
+        std::size_t i = 0;
+        for (const ASTNode* cn = first_child(col_list);
+             cn != nullptr && i < cte_schema.size();
+             cn = cn->next_sibling, ++i) {
+            cte_schema[i].name =
+                std::string{split_column_ref(cn->primary_text).column};
+        }
+    }
+
+    // Bind the anchor term. The CTE is marked as expanding (so a self-reference
+    // in the ANCHOR is rejected - it is illegal there) but its working table is
+    // NOT yet in scope: only the recursive term may read the working table.
+    cte_expanding_.push_back(def);
+    auto anchor_plan = bind_query(anchor, error);
+    if (!anchor_plan) {
+        cte_expanding_.pop_back();
+        return nullptr;
+    }
+
+    // Bind the recursive term with the working table in scope, so its
+    // self-reference resolves to a WorkingTableScan carrying the CTE columns.
+    recursive_working_.push_back({def, cte_schema, entry.name});
+    auto rec_plan = bind_query(rec_term, error);
+    recursive_working_.pop_back();
+    cte_expanding_.pop_back();
+    if (!rec_plan) {
+        return nullptr;
+    }
+
+    auto node = make_node(LogicalOp::RecursiveCTE);
+    node->table_name = entry.name;
+    node->set_op = combine;  // UNION (dedup across iterations) vs UNION ALL
+    node->output = cte_schema;
+    // Label this reference so the outer query's `name.col` (and a self-join of
+    // the CTE) stay distinguishable, mirroring the non-recursive CTE path.
+    const std::string_view a = alias_of(table_ref);
+    node->alias = a.empty() ? entry.name : std::string{a};
+    for (auto& c : node->output) {
+        c.alias = node->alias;
+    }
+    node->add_child(std::move(anchor_plan));
+    node->add_child(std::move(rec_plan));
+    return node;
 }
 
 LogicalNodePtr Binder::bind_values_relation(const ASTNode* values_stmt,
@@ -1181,11 +1328,16 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
     // scoped: restore the previous set on every exit so a nested block's CTEs do
     // not leak outward while enclosing CTEs stay visible inward.
     struct CteGuard {
-        std::vector<std::pair<std::string, const ASTNode*>>* v;
+        std::vector<CteEntry>* v;
         std::size_t mark;
         ~CteGuard() { v->resize(mark); }
     } cte_guard{&ctes_, ctes_.size()};
     if (const ASTNode* cte_clause = find_child(select_stmt, NodeType::CTEClause)) {
+        // `WITH RECURSIVE` (the parser sets NodeFlags::IsRecursive on the clause)
+        // lets a CTE reference itself; such a CTE lowers to a RecursiveCTE node
+        // instead of being inlined, and only then is a self-reference legal.
+        const bool clause_recursive =
+            cte_clause->has_flag(ast::NodeFlags::IsRecursive);
         for (const ASTNode* def = first_child(cte_clause); def != nullptr;
              def = def->next_sibling) {
             if (def->node_type != NodeType::CTEDefinition) {
@@ -1195,7 +1347,7 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
             // handles both); a set-op body was previously skipped, so a reference
             // to it resolved to nothing.
             if (subquery_body(def) != nullptr) {
-                ctes_.emplace_back(std::string{def->primary_text}, def);
+                ctes_.push_back({std::string{def->primary_text}, def, clause_recursive});
             }
         }
     }

@@ -69,6 +69,18 @@ enum class LogicalOp : std::uint8_t {
     Update,     // UPDATE target SET ... [WHERE] over a Scan / Filter child
     Delete,     // DELETE FROM target [WHERE] over a Scan / Filter child
     Returning,  // RETURNING projection on top of an Insert / Update / Delete
+    RecursiveCTE,     // WITH RECURSIVE t AS (<anchor> UNION [ALL] <recursive term>):
+                      // the fixpoint over children[0] = anchor (the non-recursive
+                      // seed) and children[1] = recursive term (which reads the
+                      // working table via a WorkingTableScan). `set_op` records
+                      // UNION (dedup across iterations) vs UNION ALL; `table_name`
+                      // is the CTE name. `output` is the CTE's reconciled columns.
+                      // There is no executor: this node REPRESENTS the recursion.
+    WorkingTableScan, // the recursive self-reference: reads the working table (the
+                      // rows the previous iteration produced). `table_name` is the
+                      // CTE name, `alias` the reference's correlation name, and
+                      // `output` the CTE's columns (so refs in the recursive term
+                      // resolve exactly as against any other relation).
 };
 
 [[nodiscard]] const char* logical_op_to_string(LogicalOp op) noexcept;

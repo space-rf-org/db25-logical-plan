@@ -71,6 +71,15 @@ public:
     [[nodiscard]] BindResult bind(const db25::ast::ASTNode* stmt);
 
 private:
+    // One CTE visible while binding a query block: its name, its definition node,
+    // and whether the owning WITH clause carried the RECURSIVE keyword. Declared
+    // here (ahead of the helpers) so bind_recursive_cte can take it by value.
+    struct CteEntry {
+        std::string name;
+        const db25::ast::ASTNode* def;
+        bool recursive;
+    };
+
     // Dispatch a row-producing query block: a SELECT or a set operation. Used at
     // the top level, for derived tables, and for INSERT ... SELECT sources.
     LogicalNodePtr bind_query(const db25::ast::ASTNode* query, std::string& error);
@@ -91,6 +100,14 @@ private:
                                  std::string& error);
     LogicalNodePtr bind_table_ref(const db25::ast::ASTNode* table_ref,
                                   std::string& error);
+    // Lower a reference to a `WITH RECURSIVE` CTE into a RecursiveCTE fixpoint
+    // node: bind the anchor term, then bind the recursive term with the CTE's
+    // working table in scope so its self-reference resolves to a WorkingTableScan.
+    // `entry` is taken by value: binding the body may register nested CTEs and
+    // reallocate ctes_, which would dangle a reference into it.
+    LogicalNodePtr bind_recursive_cte(CteEntry entry,
+                                      const db25::ast::ASTNode* table_ref,
+                                      std::string& error);
     // A VALUES list used as a derived table: lower its rows into a Values node
     // with a typed output schema (columns named by an alias list in bind_relation).
     LogicalNodePtr bind_values_relation(const db25::ast::ASTNode* values_stmt,
@@ -228,17 +245,34 @@ private:
     // registers this block's WITH clause on entry and truncates back to the saved
     // size on exit, giving each query block lexical visibility of its own and all
     // enclosing CTEs. The back-to-front lookup means an inner redefinition
-    // shadows an outer one.
-    std::vector<std::pair<std::string, const db25::ast::ASTNode*>> ctes_;
+    // shadows an outer one. `recursive` records whether the owning WITH clause
+    // carried the RECURSIVE keyword (parser NodeFlags::IsRecursive): only such a
+    // CTE may reference itself, and it lowers to a RecursiveCTE fixpoint node
+    // rather than being inlined. (CteEntry is declared above the helpers.)
+    std::vector<CteEntry> ctes_;
 
     // CTE definitions whose body is currently being expanded (a stack). A CTE
-    // reference that appears inside its own body - directly (`WITH RECURSIVE r AS
-    // (... FROM r)`) or mutually (`WITH a AS (SELECT FROM b), b AS (SELECT FROM
-    // a)`) - would otherwise re-expand the body without end and overflow the
-    // stack. bind_table_ref refuses to re-enter a definition already on this
-    // stack (recursive CTEs are not supported; this matches the analyzer, which
-    // reports the self-reference as an unresolved table).
+    // reference that appears inside its own body - directly (`WITH a AS (... FROM
+    // a)`) or mutually (`WITH a AS (SELECT FROM b), b AS (SELECT FROM a)`) -
+    // would otherwise re-expand the body without end and overflow the stack. For
+    // a non-recursive CTE, bind_table_ref refuses to re-enter a definition
+    // already on this stack. A `WITH RECURSIVE` CTE is handled separately (see
+    // recursive_working_): its recursive-term self-reference resolves to a
+    // WorkingTableScan instead of being rejected.
     std::vector<const db25::ast::ASTNode*> cte_expanding_;
+
+    // The recursive CTEs whose RECURSIVE TERM is currently being bound (a stack).
+    // While binding that term, a reference to the CTE's own name is the recursive
+    // self-reference: it resolves to a WorkingTableScan carrying `schema` (the
+    // CTE's columns) rather than re-expanding the body. Pushed only for the
+    // recursive-term bind, so a self-reference in the ANCHOR term (illegal SQL)
+    // finds no entry here and is rejected.
+    struct RecursiveFrame {
+        const db25::ast::ASTNode* def;
+        Schema schema;       // the working table's output columns (the CTE columns)
+        std::string name;    // the CTE name (for the WorkingTableScan label)
+    };
+    std::vector<RecursiveFrame> recursive_working_;
 
     // Current recursion depth of lower_expr. A long operator chain (a+b+c+...,
     // a AND b AND ...) parses to a deep left-associative tree that lower_expr
