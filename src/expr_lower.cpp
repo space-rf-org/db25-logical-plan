@@ -472,6 +472,26 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
                 e->input_index = static_cast<std::uint32_t>(slot);
                 return e;
             }
+            // Not in this operator's input: a correlated reference to an outer
+            // COMPUTED column (a derived-table alias like `sal+1 AS x`, or a
+            // recursive-CTE working-table column produced by a literal), which has
+            // no catalog id to match by. Mirror the by-id branch above and resolve
+            // it against the enclosing inputs by name; on a hit emit an OuterRef.
+            // Without this, a legal correlated reference the analyzer accepted
+            // (e.g. `EXISTS (SELECT 1 FROM emp e WHERE e.sal > x)` under a derived
+            // table `t(.. , sal+1 AS x)`) failed to bind.
+            for (std::size_t d = 1; d <= outer_inputs_.size(); ++d) {
+                const Schema& outer = *outer_inputs_[outer_inputs_.size() - d];
+                const int os = find_slot_by_name(outer, name, qual);
+                if (os >= 0) {
+                    auto e = make_expr(ExprKind::OuterRef, n);
+                    e->type = type;
+                    e->nullability = nullability;
+                    e->outer_depth = static_cast<std::uint32_t>(d);
+                    e->input_index = static_cast<std::uint32_t>(os);
+                    return e;
+                }
+            }
             error = "unresolved column reference '" + std::string{n->primary_text} + "'";
             return nullptr;
         }

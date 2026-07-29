@@ -3030,6 +3030,37 @@ void test_self_correlated_subquery(const InMemoryCatalog& cat) {
     });
 }
 
+// A correlated subquery may reference an outer COMPUTED column (a derived-table
+// alias like `sal + 1 AS x`, which has no catalog id). The computed-column
+// resolution path must fall back to the enclosing inputs by name - exactly as
+// the base-column path already does by id - and emit an OuterRef. Before the
+// fix, the by-name branch resolved only against the current input and then
+// errored, so this analyzer-accepted, legal query failed to bind.
+void test_correlated_outer_computed_column(const InMemoryCatalog& cat) {
+    std::printf("[test] correlated EXISTS referencing an outer computed (aliased) column\n");
+    with_plan(cat,
+              "SELECT t.id FROM (SELECT id, sal + 1 AS x FROM emp) t "
+              "WHERE EXISTS (SELECT 1 FROM emp e WHERE e.sal > x)",
+              [](const LogicalNode* root) {
+        const LogicalNode* filter = only_child(root);
+        check(filter && filter->op == LogicalOp::Filter, "child is Filter");
+        const db25::plan::Expr* sub = filter ? filter->predicate.get() : nullptr;
+        expect_subquery(sub, SubqueryKind::Exists, true,
+                        "EXISTS predicate subquery");
+        // The outer computed column `x` survives as an OuterRef in the inner plan.
+        check(sub && sub->kind == ExprKind::Subquery && sub->sub_plan &&
+                  plan_has_outer_ref(sub->sub_plan.get()),
+              "inner plan carries an OuterRef to the outer computed column 'x'");
+    });
+    // The scalar-subquery form (qualified `t.x`) likewise binds.
+    with_plan(cat,
+              "SELECT t.id, (SELECT COUNT(*) FROM emp e WHERE e.sal > t.x) "
+              "FROM (SELECT id, sal + 1 AS x FROM emp) t",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "scalar-subquery form binds");
+    });
+}
+
 }  // namespace
 
 void test_derived_table_column_alias(const InMemoryCatalog& cat) {
@@ -3436,6 +3467,7 @@ int main() {
     test_in_subquery(cat);
     test_exists_subquery(cat);
     test_self_correlated_subquery(cat);
+    test_correlated_outer_computed_column(cat);
     test_not_exists_negated(cat);
     test_scalar_subquery_over_aggregate(cat);
 
