@@ -1970,11 +1970,10 @@ void test_cte(const InMemoryCatalog& cat) {
         check(has_setop, "setop-cte: the CTE body lowered to a SetOp");
     });
 
-    // A recursive or mutually-recursive CTE must be rejected gracefully, not
-    // crash: a reference to the CTE inside its own body would re-expand the body
-    // without bound and overflow the stack. Recursive CTEs are unsupported.
-    // (These bind directly - the analyzer flags the self-reference, and bind()
-    // must stay defensive regardless.)
+    // A self-reference that is NOT under `WITH RECURSIVE` - or a mutual cycle -
+    // must be rejected gracefully, not crash: re-expanding the body would recurse
+    // without bound and overflow the stack. (A genuine `WITH RECURSIVE` is bound
+    // to a RecursiveCTE node instead; see test_recursive_cte.)
     {
         db25::parser::Parser parser;
         auto reject = [&](const char* sql, const char* what) {
@@ -1987,13 +1986,15 @@ void test_cte(const InMemoryCatalog& cat) {
             BindResult res = binder.bind(parsed.value());
             check(!res.ok, what);  // rejected, and (the point) did not crash
         };
-        reject("WITH RECURSIVE r AS (SELECT 1 UNION ALL SELECT * FROM r) SELECT * FROM r",
-               "recursive: direct self-reference rejected, no stack overflow");
-        reject("WITH RECURSIVE r(n) AS "
-               "(SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 10) SELECT n FROM r",
-               "recursive: recursive-term self-reference rejected");
+        // Plain (non-RECURSIVE) self-reference: not allowed to re-expand.
+        reject("WITH r AS (SELECT id FROM r) SELECT id FROM r",
+               "non-recursive self-reference rejected, no stack overflow");
+        // Mutual recursion is not supported (neither is under RECURSIVE anyway).
         reject("WITH a AS (SELECT id FROM b), b AS (SELECT id FROM a) SELECT id FROM a",
                "recursive: mutual a<->b reference rejected");
+        // A self-reference in the ANCHOR term is illegal even under RECURSIVE.
+        reject("WITH RECURSIVE r(n) AS (SELECT n FROM r UNION ALL SELECT 1) SELECT n FROM r",
+               "recursive: self-reference in the anchor term rejected");
     }
 
     // Guard: a CTE referenced twice in a self-join is TWO sequential (non-nested)
@@ -2004,6 +2005,112 @@ void test_cte(const InMemoryCatalog& cat) {
               [](const LogicalNode* root) {
         check(root != nullptr && root->op == LogicalOp::Project,
               "cte-self-join: binds (two references are not a recursive cycle)");
+    });
+}
+
+// WITH RECURSIVE: the CTE lowers to a RecursiveCTE fixpoint node - anchor term
+// (child 0) and recursive term (child 1) - and the recursive term's
+// self-reference resolves to a WorkingTableScan carrying the CTE's columns.
+// There is no executor: this REPRESENTS the recursion (Postgres-compatible base;
+// DuckDB USING KEY is a separate follow-up).
+void test_recursive_cte(const InMemoryCatalog& cat) {
+    // Find the first node of a given op in the tree (pre-order).
+    std::function<const LogicalNode*(const LogicalNode*, LogicalOp)> find_op =
+        [&](const LogicalNode* n, LogicalOp op) -> const LogicalNode* {
+        if (n == nullptr) return nullptr;
+        if (n->op == op) return n;
+        for (std::size_t i = 0; i < n->child_count(); ++i)
+            if (const LogicalNode* f = find_op(n->child(i), op)) return f;
+        return nullptr;
+    };
+    std::function<int(const LogicalNode*, LogicalOp)> count_op =
+        [&](const LogicalNode* n, LogicalOp op) -> int {
+        if (n == nullptr) return 0;
+        int c = (n->op == op) ? 1 : 0;
+        for (std::size_t i = 0; i < n->child_count(); ++i)
+            c += count_op(n->child(i), op);
+        return c;
+    };
+
+    // Canonical counter: WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1
+    // FROM t WHERE n<10). The n column types Integer from the anchor.
+    with_plan(cat,
+              "WITH RECURSIVE t(n) AS "
+              "(SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 10) SELECT n FROM t",
+              [&](const LogicalNode* root) {
+        const LogicalNode* rec = find_op(root, LogicalOp::RecursiveCTE);
+        check(rec != nullptr, "recursive-cte: a RecursiveCTE node is produced");
+        if (rec == nullptr) return;
+        check(rec->set_op == SetOp::UnionAll, "recursive-cte: UNION ALL recorded");
+        check(rec->table_name == "t", "recursive-cte: CTE name on the node");
+        check(rec->child_count() == 2, "recursive-cte: anchor + recursive-term children");
+        check(rec->output.size() == 1 && rec->output[0].name == "n" &&
+                  rec->output[0].type == DataType::Integer,
+              "recursive-cte: output is [n:Integer] from the anchor via the alias");
+        // The recursive term (child 1) reads the working table.
+        const LogicalNode* wt =
+            rec->child_count() == 2 ? find_op(rec->child(1), LogicalOp::WorkingTableScan)
+                                    : nullptr;
+        check(wt != nullptr, "recursive-cte: recursive term reads a WorkingTableScan");
+        if (wt != nullptr) {
+            check(wt->table_name == "t", "recursive-cte: working table carries the CTE name");
+            check(wt->output.size() == 1 && wt->output[0].name == "n",
+                  "recursive-cte: working table exposes the CTE columns");
+        }
+        // The anchor term (child 0) does NOT read a working table.
+        if (rec->child_count() == 2)
+            check(find_op(rec->child(0), LogicalOp::WorkingTableScan) == nullptr,
+                  "recursive-cte: anchor term has no working-table read");
+    });
+
+    // A base-table JOIN in the recursive term: the self-reference `anc a` joins
+    // against `emp e`. `a.id` and `e.id` share emp's base id and are disambiguated
+    // by qualifier - the working table binds like any other relation.
+    with_plan(cat,
+              "WITH RECURSIVE anc(id, mgr) AS ("
+              "  SELECT id, user_id FROM orders WHERE user_id IS NULL "
+              "  UNION ALL "
+              "  SELECT o.id, o.user_id FROM orders o JOIN anc a ON o.user_id = a.id) "
+              "SELECT id FROM anc",
+              [&](const LogicalNode* root) {
+        const LogicalNode* rec = find_op(root, LogicalOp::RecursiveCTE);
+        check(rec != nullptr, "recursive-join: RecursiveCTE produced");
+        if (rec == nullptr) return;
+        check(rec->output.size() == 2, "recursive-join: two output columns");
+        const LogicalNode* wt = find_op(rec->child(1), LogicalOp::WorkingTableScan);
+        check(wt != nullptr, "recursive-join: recursive term reads working table");
+        check(find_op(rec->child(1), LogicalOp::Join) != nullptr,
+              "recursive-join: recursive term contains the JOIN");
+    });
+
+    // UNION (distinct) form records Union, not UnionAll.
+    with_plan(cat,
+              "WITH RECURSIVE t(n) AS "
+              "(SELECT 1 UNION SELECT n + 1 FROM t WHERE n < 5) SELECT n FROM t",
+              [&](const LogicalNode* root) {
+        const LogicalNode* rec = find_op(root, LogicalOp::RecursiveCTE);
+        check(rec != nullptr && rec->set_op == SetOp::Union,
+              "recursive-cte: UNION (distinct) recorded");
+    });
+
+    // A recursive-keyword CTE whose body does NOT self-reference is an ordinary
+    // CTE: it inlines, with no RecursiveCTE node.
+    with_plan(cat,
+              "WITH RECURSIVE t AS (SELECT id FROM users) SELECT id FROM t",
+              [&](const LogicalNode* root) {
+        check(find_op(root, LogicalOp::RecursiveCTE) == nullptr,
+              "recursive-keyword non-recursive body: inlined, no RecursiveCTE node");
+    });
+
+    // The CTE referenced twice: each reference is an independent RecursiveCTE
+    // subplan (mirrors the non-recursive self-join expansion).
+    with_plan(cat,
+              "WITH RECURSIVE t(n) AS "
+              "(SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 10) "
+              "SELECT a.n FROM t a JOIN t b ON a.n = b.n",
+              [&](const LogicalNode* root) {
+        check(count_op(root, LogicalOp::RecursiveCTE) == 2,
+              "recursive-cte self-join: two independent RecursiveCTE subplans");
     });
 }
 
@@ -3295,6 +3402,7 @@ int main() {
     test_derived_table(cat);
     test_derived_self_join(cat);
     test_cte(cat);
+    test_recursive_cte(cat);
     test_deep_expression_no_overflow(cat);
     test_union(cat);
     test_union_all(cat);
