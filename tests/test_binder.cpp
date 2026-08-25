@@ -3364,10 +3364,38 @@ void test_aggregate_alias_collides_with_base_column(const InMemoryCatalog& cat) 
     }
 }
 
+// A quantified comparison `x <cmp> ALL|ANY|SOME (subquery)` is typed Boolean by
+// the analyzer, but the binder does not yet lower it. It must be rejected with a
+// SPECIFIC "not yet supported" message, not the generic "unrecognized binary
+// operator" (which wrongly implies a malformed / typo'd operator).
+void test_quantified_comparison_rejected_clearly(const InMemoryCatalog& cat) {
+    std::printf("[test] quantified comparison rejected with a specific message\n");
+    const char* forms[] = {
+        "SELECT id FROM emp WHERE sal > ALL (SELECT sal FROM emp)",
+        "SELECT id FROM emp WHERE sal > ANY (SELECT sal FROM emp)",
+        "SELECT id FROM emp WHERE sal = SOME (SELECT sal FROM emp)",
+    };
+    for (const char* sql : forms) {
+        db25::parser::Parser parser;
+        auto parsed = parser.parse(sql);
+        check(parsed.has_value(), std::string{"parse: "} + sql);
+        if (!parsed) continue;
+        Analyzer analyzer(cat);
+        analyzer.analyze(parsed.value());
+        Binder binder(analyzer, cat);
+        BindResult res = binder.bind(parsed.value());
+        check(!res.ok, std::string{"quantified comparison must not bind: "} + sql);
+        check(res.error.find("quantified comparison") != std::string::npos,
+              std::string{"error names the unsupported feature, not a generic "
+                          "'unrecognized binary operator': "} + res.error);
+    }
+}
+
 int main() {
     const InMemoryCatalog cat = make_catalog();
     test_chained_using_natural_single_merged_column(cat);
     test_aggregate_alias_collides_with_base_column(cat);
+    test_quantified_comparison_rejected_clearly(cat);
 
     test_scan_filter_project_limit(cat);
     test_derived_table_column_alias(cat);
