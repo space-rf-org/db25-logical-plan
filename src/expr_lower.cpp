@@ -215,6 +215,26 @@ bool map_binary_op(std::string_view text, BinaryOp& out) {
     return false;
 }
 
+// A quantified comparison operator text - "> ALL", ">= ALL", "= ANY", "<> ANY",
+// "= SOME", ... - which the parser packs into a single BinaryExpr op and the
+// analyzer types Boolean. Lowering it (to a semi/anti-join or a scalar
+// quantified expression) is not yet implemented, so the binder rejects it with a
+// specific message rather than the generic "unrecognized binary operator", which
+// wrongly implies a typo / malformed operator. SOME is a synonym for ANY.
+bool is_quantified_comparison_text(std::string_view text) {
+    const std::size_t sp = text.rfind(' ');
+    if (sp == std::string_view::npos) {
+        return false;
+    }
+    const std::string_view quant = text.substr(sp + 1);
+    if (quant != "ALL" && quant != "ANY" && quant != "SOME") {
+        return false;
+    }
+    const std::string_view cmp = text.substr(0, sp);
+    return cmp == "=" || cmp == "==" || cmp == "<>" || cmp == "!=" ||
+           cmp == "<" || cmp == ">" || cmp == "<=" || cmp == ">=";
+}
+
 // Map a unary operator's text to the parser UnaryOp enum. EXISTS / NOT EXISTS
 // are handled upstream (they lower to a Subquery Expr), not here.
 bool map_unary_op(std::string_view text, UnaryOp& out) {
@@ -614,7 +634,13 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
             const ASTNode* rhs = lhs != nullptr ? lhs->next_sibling : nullptr;
             BinaryOp op{};
             if (!map_binary_op(n->primary_text, op)) {
-                error = "unrecognized binary operator '" + std::string{n->primary_text} + "'";
+                if (is_quantified_comparison_text(n->primary_text)) {
+                    error = "quantified comparison (ALL / ANY / SOME) is not yet "
+                            "supported: '" + std::string{n->primary_text} + "'";
+                } else {
+                    error = "unrecognized binary operator '" +
+                            std::string{n->primary_text} + "'";
+                }
                 return nullptr;
             }
             auto e = make_expr(ExprKind::BinaryOp, n);
