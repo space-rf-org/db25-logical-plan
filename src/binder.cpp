@@ -208,9 +208,12 @@ ast::JoinType join_type_of(const ASTNode* join) {
     return ast::JoinType::Inner;
 }
 
-// Minimal aggregate-function recognizer. The analyzer has a richer private list;
-// this covers the standard SQL set which is all the binder needs to separate
-// grouping keys from aggregate outputs in a SELECT list.
+// Aggregate-function recognizer. The name set MUST match the analyzer's
+// kAggregateNames (and expr_lower.cpp's is_aggregate_name) exactly - the
+// analyzer is the authority that validated the bare-column / GROUP BY discipline
+// against this set, so any divergence lowers a real aggregate as a per-row
+// scalar (silently wrong) or builds an Aggregate the analyzer never grouped for
+// (a legal query fails to bind).
 bool is_aggregate_call(const ASTNode* n) {
     if (n == nullptr) {
         return false;
@@ -220,9 +223,16 @@ bool is_aggregate_call(const ASTNode* n) {
         return false;
     }
     const std::string name = upper(n->primary_text);
-    return name == "COUNT" || name == "SUM" || name == "AVG" ||
-           name == "MIN" || name == "MAX" || name == "TOTAL" ||
-           name == "GROUP_CONCAT" || name == "STRING_AGG";
+    return
+        // Core SQL aggregates.
+        name == "COUNT" || name == "SUM" || name == "AVG" || name == "MIN" ||
+        name == "MAX" ||
+        // Statistical aggregates.
+        name == "STDDEV" || name == "STDDEV_POP" || name == "STDDEV_SAMP" ||
+        name == "VARIANCE" || name == "VAR_POP" || name == "VAR_SAMP" ||
+        // Collection / boolean aggregates.
+        name == "STRING_AGG" || name == "ARRAY_AGG" || name == "BOOL_AND" ||
+        name == "BOOL_OR";
 }
 
 // A window-function call: a FunctionCall / FunctionExpr that carries a WindowSpec
