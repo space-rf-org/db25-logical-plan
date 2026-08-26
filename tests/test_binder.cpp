@@ -676,6 +676,33 @@ void test_group_by(const InMemoryCatalog& cat) {
     });
 }
 
+// Ordered aggregate: string_agg(dept, ',' ORDER BY sal DESC). The ORDER BY is
+// lowered into the Aggregate expr's agg_order_by (a positional key into the
+// aggregate's input), NOT as a value argument, and the DESC flag rides along.
+void test_ordered_aggregate(const InMemoryCatalog& cat) {
+    std::printf("[test] string_agg(dept, ',' ORDER BY sal DESC)\n");
+    with_plan(cat, "SELECT string_agg(dept, ',' ORDER BY sal DESC) FROM emp",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "root is Project");
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->op == LogicalOp::Aggregate, "child is Aggregate");
+        check(agg && agg->aggregates.size() == 1, "1 aggregate");
+        if (agg && agg->aggregates.size() == 1) {
+            const auto& a = agg->aggregates[0];
+            check(a->kind == ExprKind::Aggregate, "aggregate is Aggregate expr");
+            check(a->func_name == "STRING_AGG", "func is STRING_AGG");
+            // Two value arguments (dept, ','); the ORDER BY is NOT a third arg.
+            check(a->children.size() == 2, "two value args (ORDER BY is not an arg)");
+            // Exactly one ordered-aggregate key: sal (emp slot #2), DESC.
+            check(a->agg_order_by.size() == 1, "1 ORDER BY key");
+            if (a->agg_order_by.size() == 1) {
+                expect_col_ref(a->agg_order_by[0].expr, 2, "ORDER BY key -> sal (#2)");
+                check(a->agg_order_by[0].descending, "ORDER BY key is DESC");
+            }
+        }
+    });
+}
+
 // A GROUP BY key may name a SELECT-list output alias (PostgreSQL extension the
 // analyzer accepts): the binder must group by the aliased expression, not fail
 // to resolve the alias as a base column. Regression: `... GROUP BY d` for
@@ -3463,6 +3490,7 @@ int main() {
     test_derived_expr_alias_join_qualifier_resolution(cat);
     test_table_name_qualifier(cat);
     test_group_by(cat);
+    test_ordered_aggregate(cat);
     test_group_by_output_alias(cat);
     test_group_by_positional(cat);
     test_group_by_select_reordered(cat);
