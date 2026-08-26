@@ -703,6 +703,51 @@ void test_ordered_aggregate(const InMemoryCatalog& cat) {
     });
 }
 
+// Two ordered aggregates that share func + args + sort-key COLUMN but differ in
+// direction (ASC vs DESC) or NULLS ordering are DISTINCT producers - they build
+// oppositely-ordered results. The binder must keep both (2 aggregates, projection
+// column i -> slot i), not dedup them into one (which silently returned one
+// ordering for both). Two IDENTICAL ordered aggregates must still dedup to one.
+void test_ordered_aggregate_dedup(const InMemoryCatalog& cat) {
+    std::printf("[test] array_agg(x ORDER BY y ASC) vs (... DESC) stay distinct\n");
+
+    with_plan(cat,
+              "SELECT array_agg(sal ORDER BY sal ASC), array_agg(sal ORDER BY sal DESC) FROM emp",
+              [](const LogicalNode* root) {
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->op == LogicalOp::Aggregate, "asc/desc: child is Aggregate");
+        check(agg && agg->aggregates.size() == 2,
+              "ASC and DESC are two distinct aggregates");
+        // The projection maps col 0 -> slot 0 and col 1 -> slot 1 (not both to 0).
+        check(root->exprs.size() == 2, "two projected columns");
+        if (root->exprs.size() == 2) {
+            expect_col_ref(root->exprs[0], 0, "proj[0] -> agg slot 0 (ASC)");
+            expect_col_ref(root->exprs[1], 1, "proj[1] -> agg slot 1 (DESC)");
+        }
+    });
+
+    // NULLS FIRST vs the default likewise splits.
+    with_plan(cat,
+              "SELECT array_agg(sal ORDER BY sal), array_agg(sal ORDER BY sal NULLS FIRST) FROM emp",
+              [](const LogicalNode* root) {
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->aggregates.size() == 2, "NULLS ordering splits producers");
+    });
+
+    // Two IDENTICAL ordered aggregates still collapse to one (no over-splitting).
+    with_plan(cat,
+              "SELECT array_agg(sal ORDER BY sal), array_agg(sal ORDER BY sal) FROM emp",
+              [](const LogicalNode* root) {
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->aggregates.size() == 1,
+              "identical ordered aggregates dedup to one");
+        if (root->exprs.size() == 2) {
+            expect_col_ref(root->exprs[0], 0, "identical proj[0] -> slot 0");
+            expect_col_ref(root->exprs[1], 0, "identical proj[1] -> slot 0");
+        }
+    });
+}
+
 // The binder's aggregate-name set must match the analyzer's exactly. ARRAY_AGG,
 // STDDEV*, VARIANCE/VAR_*, BOOL_AND/OR are aggregates the analyzer recognizes;
 // the binder previously omitted them, lowering them as per-row scalars (no
@@ -3535,6 +3580,7 @@ int main() {
     test_table_name_qualifier(cat);
     test_group_by(cat);
     test_ordered_aggregate(cat);
+    test_ordered_aggregate_dedup(cat);
     test_aggregate_name_parity(cat);
     test_group_by_output_alias(cat);
     test_group_by_positional(cat);

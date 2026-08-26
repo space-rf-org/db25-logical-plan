@@ -348,6 +348,20 @@ bool Binder::same_producer_expr(const ASTNode* a, const ASTNode* b) {
     if (a == nullptr || b == nullptr || a->node_type != b->node_type) {
         return false;
     }
+    // Sort-key ordering (ASC/DESC + NULLS FIRST/LAST) rides on the item node's
+    // semantic_flags (bit 7 = DESC, bit 5 = NULLS explicit, bit 4 = NULLS FIRST)
+    // and matters only when the node IS an ORDER BY key - a direct child of an
+    // OrderByClause, e.g. an ordered aggregate's `ORDER BY sal DESC`. Two
+    // aggregates whose sort keys share the same expression but differ in
+    // direction / nulls are DISTINCT producers (they build oppositely-ordered
+    // results); without this they alias and one is silently dropped. Scoped to
+    // ORDER BY keys so these bits never falsely split a plain argument.
+    constexpr std::uint16_t kOrderMask =
+        (1u << 7) | (1u << 5) | (1u << 4);
+    if (a->parent != nullptr && a->parent->node_type == NodeType::OrderByClause &&
+        (a->semantic_flags & kOrderMask) != (b->semantic_flags & kOrderMask)) {
+        return false;
+    }
     if (a->node_type == NodeType::ColumnRef || a->node_type == NodeType::Identifier) {
         const std::uint32_t at = a->context.analysis.table_id;
         const std::uint32_t ac = a->context.analysis.column_id;
