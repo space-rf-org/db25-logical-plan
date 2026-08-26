@@ -235,6 +235,9 @@ void fold_expr(ExprPtr& e) {
     if (e->filter) {  // aggregate FILTER predicate is an owned sub-expression too
         fold_expr(e->filter);
     }
+    for (auto& k : e->agg_order_by) {  // ordered-aggregate ORDER BY keys, too
+        fold_expr(k.expr);
+    }
 
     // With children folded, try to fold this node.
     if (e->kind == ExprKind::BinaryOp && e->children.size() == 2 &&
@@ -279,6 +282,9 @@ void simplify_expr(ExprPtr& e) {
     }
     if (e->filter) {  // aggregate FILTER predicate is an owned sub-expression too
         simplify_expr(e->filter);
+    }
+    for (auto& k : e->agg_order_by) {  // ordered-aggregate ORDER BY keys, too
+        simplify_expr(k.expr);
     }
 
     if (e->kind == ExprKind::BinaryOp && e->children.size() == 2 &&
@@ -423,6 +429,9 @@ void push_down_in_expr(ExprPtr& e) {
     if (e->filter) {  // aggregate FILTER predicate may embed its own subquery
         push_down_in_expr(e->filter);
     }
+    for (auto& k : e->agg_order_by) {  // ordered-aggregate keys may embed subqueries
+        push_down_in_expr(k.expr);
+    }
     if (e->kind == ExprKind::WindowFunction) {
         for (auto& p : e->window.partition_by) push_down_in_expr(p);
         for (auto& k : e->window.order_by) push_down_in_expr(k.expr);
@@ -509,6 +518,11 @@ void collect_slots(const Expr& e, std::vector<bool>& used, bool& has_subquery) {
     if (e.filter) {  // aggregate FILTER predicate reads input slots that must stay live
         collect_slots(*e.filter, used, has_subquery);
     }
+    // Ordered-aggregate ORDER BY keys read input slots too - they must not be
+    // pruned away, or the aggregate's sort key loses its column.
+    for (const auto& k : e.agg_order_by) {
+        collect_slots(*k.expr, used, has_subquery);
+    }
 }
 
 // Rewrite each positional column slot in `e` through `remap` (old index -> new
@@ -528,6 +542,9 @@ void remap_expr_slots(Expr& e, const std::vector<int>& remap) {
     }
     if (e.filter) {  // keep the FILTER predicate's slots consistent under pruning
         remap_expr_slots(*e.filter, remap);
+    }
+    for (auto& k : e.agg_order_by) {  // keep ordered-aggregate keys' slots consistent
+        remap_expr_slots(*k.expr, remap);
     }
 }
 
@@ -833,6 +850,9 @@ void prune_subplans_in_expr(ExprPtr& e) {
     if (e->filter) {  // aggregate FILTER predicate may embed its own subquery
         prune_subplans_in_expr(e->filter);
     }
+    for (auto& k : e->agg_order_by) {  // ordered-aggregate keys may embed subqueries
+        prune_subplans_in_expr(k.expr);
+    }
     if (e->kind == ExprKind::WindowFunction) {
         for (auto& p : e->window.partition_by) prune_subplans_in_expr(p);
         for (auto& k : e->window.order_by) prune_subplans_in_expr(k.expr);
@@ -874,6 +894,10 @@ bool expr_has_outer_ref(const Expr& e) {
     // A correlation can live inside an aggregate FILTER predicate; missing it
     // would misclassify the subquery as uncorrelated and decorrelate unsoundly.
     if (e.filter && expr_has_outer_ref(*e.filter)) return true;
+    // ...and likewise inside an ordered-aggregate's ORDER BY keys.
+    for (const auto& k : e.agg_order_by) {
+        if (expr_has_outer_ref(*k.expr)) return true;
+    }
     return false;
 }
 
@@ -892,6 +916,9 @@ bool expr_has_subquery(const Expr& e) {
         for (const auto& k : e.window.order_by) if (expr_has_subquery(*k.expr)) return true;
     }
     if (e.filter && expr_has_subquery(*e.filter)) return true;
+    for (const auto& k : e.agg_order_by) {
+        if (expr_has_subquery(*k.expr)) return true;
+    }
     return false;
 }
 

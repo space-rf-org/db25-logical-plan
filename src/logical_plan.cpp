@@ -65,6 +65,9 @@ void collect_subqueries(const Expr* e, std::vector<const Expr*>& out) {
     if (e->filter) {  // a subquery can live in an aggregate FILTER predicate
         collect_subqueries(e->filter.get(), out);
     }
+    for (const auto& k : e->agg_order_by) {  // ...or in an ordered-aggregate key
+        collect_subqueries(k.expr.get(), out);
+    }
 }
 
 // Gather every subquery embedded in a node's owned expression payloads.

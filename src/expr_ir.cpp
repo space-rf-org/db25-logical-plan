@@ -125,6 +125,20 @@ void render(const Expr& e, std::string& out) {
                 }
                 render(*e.children[i], out);
             }
+            // Ordered aggregate: the ORDER BY sits inside the argument parens
+            // (`array_agg(x ORDER BY y DESC)`), so a re-parse round-trips.
+            if (e.kind == ExprKind::Aggregate && !e.agg_order_by.empty()) {
+                out += " ORDER BY ";
+                for (std::size_t i = 0; i < e.agg_order_by.size(); ++i) {
+                    if (i != 0) {
+                        out += ", ";
+                    }
+                    render(*e.agg_order_by[i].expr, out);
+                    if (e.agg_order_by[i].descending) {
+                        out += " DESC";
+                    }
+                }
+            }
             out += ")";
             if (e.kind == ExprKind::Aggregate && e.filter) {
                 out += " FILTER (WHERE ";

@@ -486,6 +486,42 @@ void test_aggregate_filter_survives_pruning(const InMemoryCatalog& cat) {
     });
 }
 
+// An ordered aggregate's ORDER BY key is an owned sub-expression that reads
+// input slots. Column pruning must count those slots as used (keep the column)
+// and remap the key's references, or the surviving key points at a pruned /
+// out-of-range slot. `sal` is referenced ONLY by the ORDER BY here, so if the
+// pruner ignores agg_order_by it drops `sal` from the scan and corrupts the key.
+void test_ordered_aggregate_key_survives_pruning(const InMemoryCatalog& cat) {
+    std::printf("[test] string_agg(dept, ',' ORDER BY sal): ORDER BY key survives pruning\n");
+    with_optimized_plan(cat, "SELECT string_agg(dept, ',' ORDER BY sal) FROM emp",
+                        [](const LogicalNode* root) {
+        const LogicalNode* scan = find_scan(root, "emp");
+        check(scan != nullptr, "emp scan present");
+        if (scan != nullptr) {
+            // dept (aggregate arg) and sal (ORDER BY key) are both used; id drops.
+            check(scan->output.size() == 2, "emp scan pruned to [dept, sal]");
+            bool has_sal = false;
+            for (const auto& c : scan->output) if (c.name == "sal") has_sal = true;
+            check(has_sal, "the ORDER-BY-only column sal survived pruning");
+        }
+        const LogicalNode* agg = find_op(root, LogicalOp::Aggregate);
+        check(agg != nullptr && !agg->aggregates.empty(), "plan has an Aggregate");
+        if (agg == nullptr || agg->aggregates.empty() || agg->child_count() != 1) return;
+        const LogicalNode* input = agg->child(0);
+        const Expr* a = agg->aggregates[0].get();
+        check(a->agg_order_by.size() == 1, "aggregate carries one ORDER BY key");
+        if (a->agg_order_by.size() != 1) return;
+        const Expr* key = a->agg_order_by[0].expr.get();
+        check(key->kind == ExprKind::ColumnRef, "ORDER BY key is a ColumnRef");
+        check(input != nullptr && key->input_index < input->output.size(),
+              "ORDER BY key slot is in-bounds of the pruned aggregate input");
+        if (input != nullptr && key->input_index < input->output.size()) {
+            check(input->output[key->input_index].name == "sal",
+                  "ORDER BY key resolves to sal after pruning/remap");
+        }
+    });
+}
+
 // A join input drops the columns neither the join, a filter, nor the projection
 // needs (here orders.id).
 void test_prune_join_input(const InMemoryCatalog& cat) {
@@ -1037,6 +1073,7 @@ int main() {
     test_prune_single_table(cat);
     test_prune_under_aggregate(cat);
     test_aggregate_filter_survives_pruning(cat);
+    test_ordered_aggregate_key_survives_pruning(cat);
     test_prune_join_input(cat);
     test_no_prune_all_used(cat);
     test_prune_barrier_correlated_subquery(cat);

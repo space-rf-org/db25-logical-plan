@@ -152,6 +152,12 @@ struct Expr {
     // predicate is TRUE contribute to the aggregate. Null on an unfiltered
     // aggregate and on non-aggregate kinds.
     ExprPtr filter;                    // Aggregate FILTER predicate (owned), or null
+    // Ordered aggregate: the ORDER BY inside an aggregate's argument list
+    // (`array_agg(x ORDER BY y)`, `string_agg(v, ',' ORDER BY v)`) orders the
+    // aggregated input. Empty on an unordered aggregate and on non-aggregate
+    // kinds; the sort keys are lowered against the aggregate's INPUT schema (the
+    // same schema the value arguments bind against).
+    std::vector<SortKeyIR> agg_order_by;  // Aggregate ORDER BY keys, in order
 
     // --- Cast ---
     DataType target_type = DataType::Unknown;  // == `type`, kept explicit

@@ -744,6 +744,24 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
                     e->filter = std::move(f);
                     continue;
                 }
+                if (arg->node_type == NodeType::OrderByClause) {
+                    // Ordered aggregate `array_agg(x ORDER BY y)`: lower the sort
+                    // keys into the aggregate's own order-by list (against the same
+                    // input schema as its arguments), not as value arguments. The
+                    // ASC/DESC and NULLS bits ride the parser's semantic_flags,
+                    // exactly as for a window / statement ORDER BY.
+                    for (const ASTNode* k = first_child(arg); k != nullptr;
+                         k = k->next_sibling) {
+                        SortKeyIR sk;
+                        sk.descending = (k->semantic_flags & (1u << 7)) != 0;
+                        sk.nulls_order_explicit = (k->semantic_flags & (1u << 5)) != 0;
+                        sk.nulls_first = (k->semantic_flags & (1u << 4)) != 0;
+                        sk.expr = lower_expr(k, input, error);
+                        if (!sk.expr) return nullptr;
+                        e->agg_order_by.push_back(std::move(sk));
+                    }
+                    continue;
+                }
                 if (arg->node_type == NodeType::Star) {
                     continue;  // COUNT(*): the star contributes no value expression
                 }
