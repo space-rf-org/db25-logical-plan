@@ -86,6 +86,15 @@ private:
     LogicalNodePtr bind_select(const db25::ast::ASTNode* select_stmt, std::string& error);
     LogicalNodePtr bind_setop(const db25::ast::ASTNode* setop, std::string& error);
 
+    // Register the CTEs declared by a query block's WITH clause (a CTEClause
+    // child of `stmt`) onto ctes_, so a FROM reference in the block resolves
+    // them. The caller owns the scoping: it records a ctes_.size() mark first
+    // and restores it on exit. A set operation carries its WITH ABOVE the
+    // branches (`WITH t AS (...) SELECT ... UNION SELECT ...`), where the CTE is
+    // in scope for every branch, so bind_select and bind_setop both go through
+    // here rather than only bind_select registering CTEs.
+    void register_block_ctes(const db25::ast::ASTNode* stmt);
+
     // DML entry points.
     LogicalNodePtr bind_insert(const db25::ast::ASTNode* insert_stmt, std::string& error);
     LogicalNodePtr bind_update(const db25::ast::ASTNode* update_stmt, std::string& error);

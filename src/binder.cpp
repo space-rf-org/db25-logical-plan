@@ -1156,11 +1156,37 @@ LogicalNodePtr Binder::bind_query(const ASTNode* query, std::string& error) {
 }
 
 LogicalNodePtr Binder::bind_setop(const ASTNode* setop, std::string& error) {
+    // A `WITH` above a top-level set operation attaches its CTEClause as a child
+    // of THIS node, and the CTE is in scope for every branch (`WITH t AS (...)
+    // SELECT ... FROM t UNION SELECT ... FROM t`). Register it before binding the
+    // branches, scoped like bind_select's, so a branch's FROM reference resolves.
+    // Without this the branch bind failed (unknown table), and reading the branch
+    // off first_child would instead pick the CTEClause itself.
+    struct CteGuard {
+        std::vector<CteEntry>* v;
+        std::size_t mark;
+        ~CteGuard() { v->resize(mark); }
+    } cte_guard{&ctes_, ctes_.size()};
+    register_block_ctes(setop);
+
     // A set-operation node has exactly two branch children (left, right); the
     // parser folds successive operators left-deep, so the left child may itself
-    // be a nested set operation. This left-associativity is preserved here.
-    const ASTNode* left_q = first_child(setop);
-    const ASTNode* right_q = left_q != nullptr ? left_q->next_sibling : nullptr;
+    // be a nested set operation. This left-associativity is preserved here. The
+    // branches are the SelectStmt / set-op children specifically - the node may
+    // also carry a leading CTEClause and a trailing ORDER BY / LIMIT, so select
+    // the branch children by kind rather than reading the first two children.
+    const ASTNode* left_q = nullptr;
+    const ASTNode* right_q = nullptr;
+    for (const ASTNode* c = first_child(setop); c != nullptr; c = c->next_sibling) {
+        if (c->node_type != NodeType::SelectStmt && !is_setop_node(c->node_type)) {
+            continue;
+        }
+        if (left_q == nullptr) {
+            left_q = c;
+        } else if (right_q == nullptr) {
+            right_q = c;
+        }
+    }
     if (left_q == nullptr || right_q == nullptr) {
         error = "set operation without two branches";
         return nullptr;
@@ -1305,6 +1331,30 @@ LogicalNodePtr Binder::bind_setop(const ASTNode* setop, std::string& error) {
     return result;
 }
 
+void Binder::register_block_ctes(const ASTNode* stmt) {
+    const ASTNode* cte_clause = find_child(stmt, NodeType::CTEClause);
+    if (cte_clause == nullptr) {
+        return;
+    }
+    // `WITH RECURSIVE` (the parser sets NodeFlags::IsRecursive on the clause)
+    // lets a CTE reference itself; such a CTE lowers to a RecursiveCTE node
+    // instead of being inlined, and only then is a self-reference legal.
+    const bool clause_recursive =
+        cte_clause->has_flag(ast::NodeFlags::IsRecursive);
+    for (const ASTNode* def = first_child(cte_clause); def != nullptr;
+         def = def->next_sibling) {
+        if (def->node_type != NodeType::CTEDefinition) {
+            continue;
+        }
+        // Register a CTE with a SELECT or a set-operation body (subquery_body
+        // handles both); a set-op body was previously skipped, so a reference
+        // to it resolved to nothing.
+        if (subquery_body(def) != nullptr) {
+            ctes_.push_back({std::string{def->primary_text}, def, clause_recursive});
+        }
+    }
+}
+
 LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& error) {
     // This block's Aggregate frame is local; a scalar subquery in a select item
     // recurses into bind_select and would clobber `agg_frame_`. Save the
@@ -1332,25 +1382,7 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
         std::size_t mark;
         ~CteGuard() { v->resize(mark); }
     } cte_guard{&ctes_, ctes_.size()};
-    if (const ASTNode* cte_clause = find_child(select_stmt, NodeType::CTEClause)) {
-        // `WITH RECURSIVE` (the parser sets NodeFlags::IsRecursive on the clause)
-        // lets a CTE reference itself; such a CTE lowers to a RecursiveCTE node
-        // instead of being inlined, and only then is a self-reference legal.
-        const bool clause_recursive =
-            cte_clause->has_flag(ast::NodeFlags::IsRecursive);
-        for (const ASTNode* def = first_child(cte_clause); def != nullptr;
-             def = def->next_sibling) {
-            if (def->node_type != NodeType::CTEDefinition) {
-                continue;
-            }
-            // Register a CTE with a SELECT or a set-operation body (subquery_body
-            // handles both); a set-op body was previously skipped, so a reference
-            // to it resolved to nothing.
-            if (subquery_body(def) != nullptr) {
-                ctes_.push_back({std::string{def->primary_text}, def, clause_recursive});
-            }
-        }
-    }
+    register_block_ctes(select_stmt);
 
     // --- FROM -> Scan / Join subtree (or a synthetic single row) ---
     LogicalNodePtr current;

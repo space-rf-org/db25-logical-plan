@@ -2305,6 +2305,55 @@ void test_union(const InMemoryCatalog& cat) {
     });
 }
 
+// A `WITH` above a top-level set operation: the CTE is in scope for every
+// branch (Postgres). The parser attaches the CTEClause to the set-op node, so
+// bind_setop must register the CTE before binding branches AND select the two
+// branch children by kind (not read the first two children, which would pick
+// up the CTEClause). Before the fix the branch bind failed - the analyzer now
+// accepts these (its own C3 fix), so the binder gap became reachable.
+void test_cte_above_setop(const InMemoryCatalog& cat) {
+    std::printf("[test] WITH above a set operation (CTE in scope for both arms)\n");
+
+    // CTE referenced in BOTH branches.
+    with_plan(cat,
+              "WITH t AS (SELECT id FROM users) "
+              "SELECT id FROM t UNION SELECT id FROM t",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::SetOp, "root is SetOp");
+        check(root->set_op == SetOp::Union, "UNION (distinct)");
+        check(root->child_count() == 2, "two branches");
+        if (root->child_count() == 2) {
+            check(root->child(0)->op == LogicalOp::Project, "left branch Project");
+            check(root->child(1)->op == LogicalOp::Project, "right branch Project");
+        }
+        check(root->output.size() == 1 && root->output[0].type == DataType::Integer,
+              "reconciled to 1 Integer col");
+    });
+
+    // CTE referenced in one arm only, the other reads a base table (UNION ALL).
+    with_plan(cat,
+              "WITH t AS (SELECT id FROM users) "
+              "SELECT id FROM t UNION ALL SELECT id FROM users",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::SetOp, "root is SetOp");
+        check(root->set_op == SetOp::UnionAll, "UNION ALL");
+        check(root->child_count() == 2, "two branches");
+    });
+
+    // A trailing ORDER BY / LIMIT scopes to the whole set operation and must
+    // still be found when a leading CTEClause precedes the branches.
+    with_plan(cat,
+              "WITH t AS (SELECT id FROM users) "
+              "SELECT id FROM t UNION SELECT id FROM t ORDER BY id LIMIT 5",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Limit, "root is Limit over the set op");
+        const LogicalNode* sort = only_child(root);
+        check(sort && sort->op == LogicalOp::Sort, "Limit over a Sort");
+        const LogicalNode* setop = sort ? only_child(sort) : nullptr;
+        check(setop && setop->op == LogicalOp::SetOp, "Sort over the SetOp");
+    });
+}
+
 void test_union_all(const InMemoryCatalog& cat) {
     std::printf("[test] ... UNION ALL ...\n");
     with_plan(cat, "SELECT id FROM users UNION ALL SELECT id FROM orders",
@@ -3464,6 +3513,7 @@ int main() {
     test_recursive_cte(cat);
     test_deep_expression_no_overflow(cat);
     test_union(cat);
+    test_cte_above_setop(cat);
     test_union_all(cat);
     test_intersect_except(cat);
     test_union_chain(cat);
