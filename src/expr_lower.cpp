@@ -350,15 +350,23 @@ bool Binder::same_producer_expr(const ASTNode* a, const ASTNode* b) {
     }
     // Sort-key ordering (ASC/DESC + NULLS FIRST/LAST) rides on the item node's
     // semantic_flags (bit 7 = DESC, bit 5 = NULLS explicit, bit 4 = NULLS FIRST)
-    // and matters only when the node IS an ORDER BY key - a direct child of an
-    // OrderByClause, e.g. an ordered aggregate's `ORDER BY sal DESC`. Two
-    // aggregates whose sort keys share the same expression but differ in
-    // direction / nulls are DISTINCT producers (they build oppositely-ordered
-    // results); without this they alias and one is silently dropped. Scoped to
-    // ORDER BY keys so these bits never falsely split a plain argument.
+    // and is part of a producer's identity ONLY for an ordered AGGREGATE's own
+    // sort keys - e.g. `array_agg(x ORDER BY y DESC)` vs `... ASC` build
+    // oppositely-ordered results and must stay distinct producers. It is NOT part
+    // of identity for a statement-level (or window) ORDER BY: `ORDER BY sum(sal)
+    // DESC` is the same aggregate producer as SELECT's `sum(sal)` - the DESC is a
+    // property of the Sort node, not the aggregate - so it must still dedup to the
+    // one producer slot. Both kinds of key are a direct child of an OrderByClause,
+    // so scope this to the aggregate case: the OrderByClause must itself be a
+    // child of the FunctionCall (an aggregate's argument-list ORDER BY). Applying
+    // it to a statement ORDER BY key wrongly split the producer and emitted a
+    // redundant aggregate column.
     constexpr std::uint16_t kOrderMask =
         (1u << 7) | (1u << 5) | (1u << 4);
     if (a->parent != nullptr && a->parent->node_type == NodeType::OrderByClause &&
+        a->parent->parent != nullptr &&
+        (a->parent->parent->node_type == NodeType::FunctionCall ||
+         a->parent->parent->node_type == NodeType::FunctionExpr) &&
         (a->semantic_flags & kOrderMask) != (b->semantic_flags & kOrderMask)) {
         return false;
     }
