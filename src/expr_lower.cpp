@@ -170,12 +170,26 @@ int find_slot_by_name(const Schema& s, std::string_view name,
     return first;
 }
 
-// The standard SQL aggregate names the binder separates from scalar functions
-// (mirrors binder.cpp's recognizer). A windowed call is handled separately.
+// The aggregate function names the binder separates from scalar functions. This
+// MUST match the analyzer's kAggregateNames exactly (analyzer.cpp): the analyzer
+// is the authority on aggregate-ness (it validates the bare-column / GROUP BY
+// discipline against precisely this set), and any name the binder recognizes
+// differently is either lowered to a per-row scalar when it should aggregate
+// (silently wrong plan) or built into an Aggregate the analyzer never grouped
+// for (a legal query fails to bind). A windowed call (OVER ...) is handled
+// separately and is never a grouping aggregate. Keep this list and binder.cpp's
+// is_aggregate_call identical to the analyzer's.
 bool is_aggregate_name(std::string_view upper) {
-    return upper == "COUNT" || upper == "SUM" || upper == "AVG" || upper == "MIN" ||
-           upper == "MAX" || upper == "TOTAL" || upper == "GROUP_CONCAT" ||
-           upper == "STRING_AGG";
+    return
+        // Core SQL aggregates.
+        upper == "COUNT" || upper == "SUM" || upper == "AVG" || upper == "MIN" ||
+        upper == "MAX" ||
+        // Statistical aggregates.
+        upper == "STDDEV" || upper == "STDDEV_POP" || upper == "STDDEV_SAMP" ||
+        upper == "VARIANCE" || upper == "VAR_POP" || upper == "VAR_SAMP" ||
+        // Collection / boolean aggregates.
+        upper == "STRING_AGG" || upper == "ARRAY_AGG" || upper == "BOOL_AND" ||
+        upper == "BOOL_OR";
 }
 
 // Map a binary operator's text (the analyzer reads it straight from

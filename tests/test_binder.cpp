@@ -703,6 +703,50 @@ void test_ordered_aggregate(const InMemoryCatalog& cat) {
     });
 }
 
+// The binder's aggregate-name set must match the analyzer's exactly. ARRAY_AGG,
+// STDDEV*, VARIANCE/VAR_*, BOOL_AND/OR are aggregates the analyzer recognizes;
+// the binder previously omitted them, lowering them as per-row scalars (no
+// Aggregate node - silently wrong) or failing to bind a legal GROUP BY.
+void test_aggregate_name_parity(const InMemoryCatalog& cat) {
+    std::printf("[test] binder aggregate-name set matches the analyzer\n");
+
+    // array_agg with no GROUP BY -> Aggregate(group=()) collapsing to one row,
+    // NOT a per-row ScalarFunction in the Project.
+    with_plan(cat, "SELECT array_agg(sal) FROM emp", [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "array_agg: root is Project");
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->op == LogicalOp::Aggregate,
+              "array_agg builds an Aggregate node (not a per-row scalar)");
+        check(agg && agg->group_keys.empty(), "no GROUP BY -> empty group");
+        check(agg && agg->aggregates.size() == 1 &&
+                  agg->aggregates[0]->kind == ExprKind::Aggregate &&
+                  agg->aggregates[0]->func_name == "ARRAY_AGG",
+              "the aggregate is ARRAY_AGG");
+    });
+
+    // A grouped stddev binds (previously bind-failed: bare `sal` looked up
+    // against the group-by output because stddev was not recognized).
+    with_plan(cat, "SELECT dept, stddev(sal) FROM emp GROUP BY dept",
+              [](const LogicalNode* root) {
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->op == LogicalOp::Aggregate, "stddev GROUP BY: Aggregate");
+        check(agg && agg->aggregates.size() == 1 &&
+                  agg->aggregates[0]->func_name == "STDDEV",
+              "the aggregate is STDDEV");
+    });
+
+    // The ordered-aggregate flagship now actually aggregates (ARRAY_AGG was the
+    // headline example of the ordered-aggregate work yet was not recognized).
+    with_plan(cat, "SELECT array_agg(sal ORDER BY id) FROM emp",
+              [](const LogicalNode* root) {
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->op == LogicalOp::Aggregate, "ordered array_agg: Aggregate");
+        check(agg && agg->aggregates.size() == 1 &&
+                  agg->aggregates[0]->agg_order_by.size() == 1,
+              "ordered array_agg carries its ORDER BY key on the Aggregate expr");
+    });
+}
+
 // A GROUP BY key may name a SELECT-list output alias (PostgreSQL extension the
 // analyzer accepts): the binder must group by the aliased expression, not fail
 // to resolve the alias as a base column. Regression: `... GROUP BY d` for
@@ -3491,6 +3535,7 @@ int main() {
     test_table_name_qualifier(cat);
     test_group_by(cat);
     test_ordered_aggregate(cat);
+    test_aggregate_name_parity(cat);
     test_group_by_output_alias(cat);
     test_group_by_positional(cat);
     test_group_by_select_reordered(cat);
