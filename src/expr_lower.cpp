@@ -1154,13 +1154,33 @@ ExprPtr Binder::lower_quantified_comparison(const ASTNode* n, const Schema& inpu
         return e;
     }
 
+    // A typed array RHS wraps the constructor in one or more casts, e.g.
+    // `ARRAY[1,2,3]::int[]` or the idiomatic typed empty array `ARRAY[]::int[]`
+    // (an empty array needs a type). Peek through the Cast wrapper(s) to the
+    // underlying ArrayConstructor / RowExpr so it takes the array/row fold below
+    // rather than the scalar fallback -- which would compare `x` to the WHOLE
+    // array value and silently drop the ANY/ALL quantifier. Array element types
+    // are not modeled distinctly (DataType::Array is opaque), so folding the raw
+    // element expressions matches the analyzer's own typing; the outer array cast
+    // is a no-op in that model.
+    const ASTNode* array_rhs = rhs;
+    while (array_rhs->node_type == NodeType::CastExpr) {
+        const ASTNode* inner = first_child(array_rhs);
+        if (inner == nullptr || (inner->node_type != NodeType::ArrayConstructor &&
+                                 inner->node_type != NodeType::RowExpr)) {
+            break;
+        }
+        array_rhs = inner;
+    }
+
     // ---- Array / row RHS: expr <cmp> ANY|ALL (ARRAY[..] | (a, b, ..)) ---------
     // Expand to an OR (ANY/SOME) or AND (ALL) fold of per-element comparisons.
     // The left operand is re-lowered from its AST node per element, so no deep
     // clone of the bound expression is needed.
-    if (rhs->node_type == NodeType::ArrayConstructor || rhs->node_type == NodeType::RowExpr) {
+    if (array_rhs->node_type == NodeType::ArrayConstructor ||
+        array_rhs->node_type == NodeType::RowExpr) {
         std::vector<const ASTNode*> elems;
-        for (const ASTNode* c = first_child(rhs); c != nullptr; c = c->next_sibling) {
+        for (const ASTNode* c = first_child(array_rhs); c != nullptr; c = c->next_sibling) {
             elems.push_back(c);
         }
         if (elems.empty()) {
