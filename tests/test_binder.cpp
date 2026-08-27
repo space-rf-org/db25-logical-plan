@@ -930,6 +930,86 @@ void test_group_by_positional(const InMemoryCatalog& cat) {
     });
 }
 
+// Positional GROUP BY whose ordinal falls inside a `*` expansion. The analyzer
+// numbers output columns AFTER star expansion, so `SELECT * FROM emp GROUP BY 1,
+// 2, 3` groups by the three EXPANDED star columns (id, dept, sal). Each key must
+// lower to a ColumnRef into the child slot the star expanded to - NOT to the
+// integer literal (which would bind as a constant single-group key, silently
+// grouping the whole table into one group). A HAVING reference to a grouped
+// column then resolves against the Aggregate output by its (table_id, column_id).
+void test_group_by_positional_over_star(const InMemoryCatalog& cat) {
+    std::printf("[test] GROUP BY <ordinal> into a * expansion\n");
+
+    // `SELECT * FROM emp GROUP BY 1, 2, 3`: three star columns fully grouped.
+    with_plan(cat, "SELECT * FROM emp GROUP BY 1, 2, 3",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "star-ord: root is Project");
+        const LogicalNode* agg = only_child(root);
+        check(agg && agg->op == LogicalOp::Aggregate, "star-ord: child is Aggregate");
+        check(agg && agg->group_keys.size() == 3, "star-ord: 3 group keys");
+        check(agg && agg->aggregates.empty(), "star-ord: no aggregate results");
+        if (agg && agg->group_keys.size() == 3) {
+            // The core fix: each key is a real ColumnRef into the emp scan slot,
+            // NOT a constant literal. id->#0, dept->#1, sal->#2.
+            expect_col_ref(agg->group_keys[0], 0, "star-ord: key 1 -> id (#0)");
+            expect_col_ref(agg->group_keys[1], 1, "star-ord: key 2 -> dept (#1)");
+            expect_col_ref(agg->group_keys[2], 2, "star-ord: key 3 -> sal (#2)");
+        }
+        if (agg && agg->output.size() == 3) {
+            // Output columns take the base column's identity (name/type), not the
+            // literal's ("1"/Integer).
+            expect_col(agg->output[0], "id", DataType::Integer, false, "star-ord out0");
+            expect_col(agg->output[1], "dept", DataType::VarChar, true, "star-ord out1");
+            expect_col(agg->output[2], "sal", DataType::Double, true, "star-ord out2");
+        }
+        // The projected `*` expands positionally over the Aggregate output.
+        if (root->exprs.size() == 3) {
+            expect_col_ref(root->exprs[0], 0, "star-ord: proj id -> #0");
+            expect_col_ref(root->exprs[1], 1, "star-ord: proj dept -> #1");
+            expect_col_ref(root->exprs[2], 2, "star-ord: proj sal -> #2");
+        }
+    });
+
+    // Mixed: a star fully grouped plus an aggregate. Keys stay the three star
+    // columns; the aggregate is a separate output column. The aggregate is put
+    // in HAVING (not the SELECT list) so the projection stays a plain `*`,
+    // sidestepping the separate, pre-existing `SELECT *, <agg>` projection-star
+    // arity limitation - which affects the named-key form `GROUP BY id, dept,
+    // sal` identically and is therefore out of scope for this positional fix.
+    with_plan(cat, "SELECT * FROM emp GROUP BY 1, 2, 3 HAVING COUNT(*) > 1",
+              [](const LogicalNode* root) {
+        const LogicalNode* filter = only_child(root);
+        check(filter && filter->op == LogicalOp::Filter, "star-ord+agg: child is Filter");
+        const LogicalNode* agg = filter ? only_child(filter) : nullptr;
+        check(agg && agg->op == LogicalOp::Aggregate, "star-ord+agg: Aggregate under Filter");
+        check(agg && agg->group_keys.size() == 3 && agg->aggregates.size() == 1,
+              "star-ord+agg: 3 keys + 1 aggregate");
+        if (agg && agg->group_keys.size() == 3) {
+            expect_col_ref(agg->group_keys[0], 0, "star-ord+agg: key 1 -> id (#0)");
+            expect_col_ref(agg->group_keys[2], 2, "star-ord+agg: key 3 -> sal (#2)");
+        }
+    });
+
+    // A HAVING reference to a star-grouped column resolves to its group slot by
+    // id (no structural producer is registered for a star-slot key); the literal
+    // bound stays a Literal, not rewritten into the id slot.
+    with_plan(cat, "SELECT * FROM emp GROUP BY 1, 2, 3 HAVING id > 5",
+              [](const LogicalNode* root) {
+        const LogicalNode* filter = only_child(root);
+        check(filter && filter->op == LogicalOp::Filter, "star-ord+having: child is Filter");
+        if (filter && filter->predicate) {
+            const auto& p = filter->predicate;
+            check(p->kind == ExprKind::BinaryOp && p->children.size() == 2,
+                  "star-ord+having: predicate is id > 5 (BinaryOp)");
+            if (p->kind == ExprKind::BinaryOp && p->children.size() == 2) {
+                expect_col_ref(p->children[0], 0, "star-ord+having: id -> group slot #0");
+                check(p->children[1] && p->children[1]->kind == ExprKind::Literal,
+                      "star-ord+having: the literal 5 stays a Literal");
+            }
+        }
+    });
+}
+
 // The Aggregate output is group_keys ++ aggregates, independent of SELECT order.
 // `SELECT COUNT(*), dept` puts the aggregate first in the select list but the
 // Aggregate output is still [dept (key), COUNT (agg)]; the Project reorders it
@@ -3786,6 +3866,7 @@ int main() {
     test_aggregate_name_parity(cat);
     test_group_by_output_alias(cat);
     test_group_by_positional(cat);
+    test_group_by_positional_over_star(cat);
     test_group_by_select_reordered(cat);
     test_group_by_same_name_aggregates(cat);
     test_self_join_group_key_distinct_slots(cat);

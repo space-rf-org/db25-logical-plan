@@ -394,36 +394,82 @@ const ASTNode* group_key_alias_target(const ASTNode* key, const ASTNode* select_
 
 // Positional GROUP BY: `GROUP BY <n>` groups by the n-th (1-based) SELECT output
 // column's expression - standard SQL (Postgres / MySQL / SQLite / DuckDB), which
-// the analyzer accepts and validates. Return that SELECT item so its expression
-// is lowered as the grouping key (mirroring group_key_alias_target); the integer
-// literal itself must NOT be lowered as a constant single-group key. Out of range
-// or a `*` before the ordinal -> nullptr (leave the existing handling).
-const ASTNode* group_key_ordinal_target(const ASTNode* key, const ASTNode* select_list) {
+// the analyzer accepts and validates. The n-th output column is one of:
+//   - an explicit (non-star) SELECT item -> `item` is set; lower that item's
+//     expression as the grouping key (mirroring group_key_alias_target).
+//   - a column produced by expanding a `*` -> `star_slot` is set to the child
+//     input slot the star expanded to at that position; the key is that base
+//     column (there is no distinct SELECT-item AST node to lower).
+// In both cases the integer literal itself must NOT be lowered as a constant
+// single-group key. `resolved` is false for a non-positional key or an ordinal
+// out of the expanded-output range.
+struct GroupOrdinalTarget {
+    const ASTNode* item = nullptr;   // explicit non-star SELECT item, or null
+    std::uint32_t star_slot = 0;     // child input slot for a star-expanded ordinal
+    bool is_star_slot = false;       // true when the ordinal falls inside a `*`
+    bool resolved = false;           // false: not positional / out of range
+};
+
+// Resolve `GROUP BY <n>` against the EXPANDED projection, mirroring
+// lower_projection's star expansion so ordinal n names the same column the
+// analyzer numbered. `input` is the Aggregate's input schema (the child output),
+// against which a `*` expands.
+GroupOrdinalTarget resolve_group_ordinal(const ASTNode* key,
+                                         const ASTNode* select_list,
+                                         const Schema& input) {
+    GroupOrdinalTarget r;
     if (key == nullptr || select_list == nullptr ||
         key->node_type != NodeType::IntegerLiteral || key->primary_text.empty()) {
-        return nullptr;
+        return r;
     }
     std::size_t ordinal = 0;
     for (const char c : key->primary_text) {
         if (c < '0' || c > '9') {
-            return nullptr;  // not a plain non-negative integer (e.g. hex / sign)
+            return r;  // not a plain non-negative integer (e.g. hex / sign)
         }
         ordinal = ordinal * 10 + static_cast<std::size_t>(c - '0');
     }
     if (ordinal < 1) {
-        return nullptr;
+        return r;
     }
-    std::size_t i = 1;
+    std::size_t count = 0;  // expanded output columns seen so far
     for (const ASTNode* item = first_child(select_list); item != nullptr;
-         item = item->next_sibling, ++i) {
+         item = item->next_sibling) {
         if (item->node_type == NodeType::Star) {
-            return nullptr;  // ordinal into an unexpanded `*`: out of scope
+            // A Star's qualifier lives in schema_name ("t" / "schema.table");
+            // primary_text is always "*". Expand in child-frame order, exactly as
+            // lower_projection does: bare `*` -> every non-hidden child column;
+            // qualified `q.*` -> the child columns whose relation alias matches.
+            const std::string_view star_qual = item->schema_name;
+            const bool qualified = !star_qual.empty();
+            const std::string_view tbl =
+                qualified ? split_column_ref(star_qual).column : std::string_view{};
+            for (std::size_t s = 0; s < input.size(); ++s) {
+                if (qualified) {
+                    if (!iequals(input[s].alias, tbl)) {
+                        continue;
+                    }
+                } else if (input[s].hidden) {
+                    continue;  // a hidden merged-right copy is not part of bare `*`
+                }
+                ++count;
+                if (count == ordinal) {
+                    r.star_slot = static_cast<std::uint32_t>(s);
+                    r.is_star_slot = true;
+                    r.resolved = true;
+                    return r;
+                }
+            }
+            continue;
         }
-        if (i == ordinal) {
-            return item;
+        ++count;
+        if (count == ordinal) {
+            r.item = item;
+            r.resolved = true;
+            return r;
         }
     }
-    return nullptr;  // out of range
+    return r;  // out of range
 }
 
 // Build an owned ColumnRef Expr that references slot `slot` of an input schema,
@@ -1500,8 +1546,25 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
             // stands for would then fail to resolve. Checked before lower_expr for
             // exactly that reason. The literal's own name ("n") / Integer type must
             // not be used for the key column, so take them from the resolved item.
-            const ASTNode* ordinal_item = group_key_ordinal_target(key, select_list);
-            if (ordinal_item != nullptr) {
+            // When the ordinal falls inside a `*`, there is no distinct SELECT-item
+            // AST node: the key is a base column of the child, so build a ColumnRef
+            // into the resolved child slot directly and take the output column's
+            // identity from that slot (so a HAVING/ORDER BY/SELECT reference to the
+            // same base column resolves against the Aggregate output by id).
+            const GroupOrdinalTarget ord =
+                resolve_group_ordinal(key, select_list, agg_input);
+            const ASTNode* ordinal_item = ord.item;  // explicit positional item
+            ColumnSchema col;
+            if (ord.is_star_slot) {
+                const ColumnSchema& sc = agg_input[ord.star_slot];
+                e = make_column_ref(ord.star_slot, sc);
+                lowered_from = key;  // no AST item; identity comes from the slot
+                col.name = sc.name;
+                col.type = sc.type;
+                col.nullable = sc.nullable;
+                col.table_id = sc.table_id;
+                col.column_id = sc.column_id;
+            } else if (ordinal_item != nullptr) {
                 e = lower_expr(ordinal_item, agg_input, error);
                 if (!e) {
                     return nullptr;
@@ -1524,17 +1587,19 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
                     }
                 }
             }
-            // A positional key's name/type come from the resolved item (the literal
-            // is Integer and named "n"); a column / alias key already carries them.
-            const ASTNode* name_src = (ordinal_item != nullptr) ? lowered_from : key;
-            ColumnSchema col;
-            col.name = item_output_name(name_src);
-            col.type = analyzer_.type_of(name_src);
-            col.nullable = analyzer_.nullability_of(name_src) != 1;
-            if (lowered_from->node_type == NodeType::ColumnRef ||
-                lowered_from->node_type == NodeType::Identifier) {
-                col.table_id = lowered_from->context.analysis.table_id;
-                col.column_id = lowered_from->context.analysis.column_id;
+            if (!ord.is_star_slot) {
+                // A positional key's name/type come from the resolved item (the
+                // literal is Integer and named "n"); a column / alias key already
+                // carries them. (The star-slot branch filled `col` from the slot.)
+                const ASTNode* name_src = (ordinal_item != nullptr) ? lowered_from : key;
+                col.name = item_output_name(name_src);
+                col.type = analyzer_.type_of(name_src);
+                col.nullable = analyzer_.nullability_of(name_src) != 1;
+                if (lowered_from->node_type == NodeType::ColumnRef ||
+                    lowered_from->node_type == NodeType::Identifier) {
+                    col.table_id = lowered_from->context.analysis.table_id;
+                    col.column_id = lowered_from->context.analysis.column_id;
+                }
             }
             // Carry the source relation alias onto the group-key output column.
             // For a plain column key `e` is a ColumnRef into the child schema, so
@@ -1563,7 +1628,16 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
             //     it would rewrite every structurally-identical constant above
             //     the Aggregate (e.g. the `1` in `COUNT(*)+1`, a `2` in
             //     `HAVING sal > 2`) into a ColumnRef pointing at this slot.
-            if (ordinal_item != nullptr) {
+            //   - positional key into a `*` expansion: register NOTHING. There is
+            //     no AST node denoting the base column, and the integer literal
+            //     must not be registered (same constant-rewrite hazard). A
+            //     reference to the grouped column carries the base (table_id,
+            //     column_id), which the group-key output column also carries, so
+            //     it resolves against the Aggregate output by id without a
+            //     structural producer.
+            if (ord.is_star_slot) {
+                // no producer
+            } else if (ordinal_item != nullptr) {
                 agg_frame.producers.emplace_back(lowered_from, slot);
             } else {
                 agg_frame.producers.emplace_back(key, slot);
