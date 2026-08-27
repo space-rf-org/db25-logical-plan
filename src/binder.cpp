@@ -1786,10 +1786,31 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
     if (bare_star) {
         // `*` projects the child's visible columns - excluding any HIDDEN column
         // (the right-hand copy of a USING/NATURAL merged column, kept only for
-        // qualified `right.c` resolution).
+        // qualified `right.c` resolution) - in the ANALYZER's output order. The
+        // child output is authoritative for a plain scan / join / merged frame
+        // (where it already equals the analyzer's projection), but over an
+        // Aggregate it is in group-key order (keys++aggs), so a reordered GROUP
+        // BY would transpose the `*` columns. Prefer the analyzer's projection,
+        // which is in relation/select order; fall back to the child's visible
+        // columns only if their counts diverge (a merged frame the projection
+        // does not model 1:1).
+        std::size_t visible = 0;
         for (const auto& c : current->output) {
             if (!c.hidden) {
-                project->output.push_back(c);
+                ++visible;
+            }
+        }
+        const auto* proj = analyzer_.projection_of(select_stmt);
+        if (proj != nullptr && proj->size() == visible) {
+            project->output.reserve(proj->size());
+            for (const auto& c : *proj) {
+                project->output.push_back(to_schema(c));
+            }
+        } else {
+            for (const auto& c : current->output) {
+                if (!c.hidden) {
+                    project->output.push_back(c);
+                }
             }
         }
     } else if (const auto* proj = analyzer_.projection_of(select_stmt)) {
@@ -2399,13 +2420,75 @@ bool Binder::lower_projection(const ASTNode* select_list, const LogicalNode* chi
             // whose split is always unqualified.
             const std::string_view star_qual = item->schema_name;
             if (star_qual.empty()) {
-                // Bare `*`: expand to one positional ColumnRef per visible child
-                // output column (a hidden merged-right copy is not part of `*`).
+                // Bare `*`: one ColumnRef per visible child column (a hidden
+                // merged-right copy is not part of `*`), emitted in the ANALYZER's
+                // output order (out_schema), not raw child order. Over an
+                // Aggregate the child output is group-key order (keys++aggs), but
+                // `*` must present columns in relation/select order - trusting
+                // child order transposed `SELECT * ... GROUP BY <reordered>` (and,
+                // mixed with a trailing item, fed an output column from the wrong
+                // slot). Map each out_schema column in this star's slice to the
+                // visible child slot with the same (table_id, column_id) identity
+                // and name, consuming slots so self-join duplicates map 1:1. For a
+                // plain scan / join / USING-NATURAL merged frame out_schema order
+                // already equals child order, so this reproduces the old
+                // expansion; if any column fails to map (an id-less or otherwise
+                // unmatchable projection), fall back to plain child order.
+                std::vector<std::uint32_t> visible;
                 for (std::size_t s = 0; s < input.size(); ++s) {
-                    if (input[s].hidden) {
-                        continue;
+                    if (!input[s].hidden) {
+                        visible.push_back(static_cast<std::uint32_t>(s));
                     }
-                    out.push_back(make_column_ref(static_cast<std::uint32_t>(s), input[s]));
+                }
+                const std::size_t slice_start = out.size();
+                bool reordered = slice_start + visible.size() <= out_schema.size();
+                std::vector<ExprPtr> slice;
+                std::vector<bool> used(visible.size(), false);
+                for (std::size_t k = 0; reordered && k < visible.size(); ++k) {
+                    const ColumnSchema& want = out_schema[slice_start + k];
+                    // Match by (table_id, column_id) identity. The child column
+                    // may carry an output ALIAS as its name (an aggregate group
+                    // key from `id AS foo` is named "foo" but has id's identity),
+                    // so the name only breaks ties between same-identity slots (a
+                    // self-join's two copies of a base column); prefer a name
+                    // match, else take the first unused identity match.
+                    std::size_t pick = visible.size();
+                    std::size_t id_only = visible.size();
+                    for (std::size_t j = 0; j < visible.size(); ++j) {
+                        if (used[j] || want.column_id == 0) {
+                            continue;
+                        }
+                        const ColumnSchema& cand = input[visible[j]];
+                        if (cand.table_id != want.table_id ||
+                            cand.column_id != want.column_id) {
+                            continue;
+                        }
+                        if (iequals(cand.name, want.name)) {
+                            pick = j;
+                            break;
+                        }
+                        if (id_only == visible.size()) {
+                            id_only = j;
+                        }
+                    }
+                    if (pick == visible.size()) {
+                        pick = id_only;
+                    }
+                    if (pick == visible.size()) {
+                        reordered = false;  // unmatchable -> abandon the reorder
+                        break;
+                    }
+                    used[pick] = true;
+                    slice.push_back(make_column_ref(visible[pick], input[visible[pick]]));
+                }
+                if (reordered) {
+                    for (auto& e : slice) {
+                        out.push_back(std::move(e));
+                    }
+                } else {
+                    for (std::uint32_t s : visible) {
+                        out.push_back(make_column_ref(s, input[s]));
+                    }
                 }
                 continue;
             }
