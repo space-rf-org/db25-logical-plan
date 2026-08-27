@@ -2177,6 +2177,32 @@ void test_qualified_star_over_reordered_derived(const InMemoryCatalog& cat) {
     });
 }
 
+// A qualified `q.*` over an AGGREGATE (a fully-grouped query) must bind: the
+// Aggregate group-key output columns carry the source relation alias, so the
+// qualified-star alias filter finds them. Without the alias the bind failed with
+// "qualified 'emp.*' matches no relation in the FROM clause".
+void test_qualified_star_over_aggregate(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT emp.* FROM emp GROUP BY id, dept, sal -> 3 grouped cols\n");
+    auto check_emp_star = [](const LogicalNode* root, const char* what) {
+        check(root->output.size() == 3, std::string{what} + ": emp.* -> 3 grouped cols");
+        if (root->output.size() == 3) {
+            check(root->output[0].name == "id" && root->output[1].name == "dept" &&
+                      root->output[2].name == "sal",
+                  std::string{what} + ": grouped columns id, dept, sal");
+            check(root->exprs.size() == 3, std::string{what} + ": 3 exprs");
+        }
+    };
+    with_plan(cat, "SELECT emp.* FROM emp GROUP BY id, dept, sal",
+              [&](const LogicalNode* root) { check_emp_star(root, "unaliased"); });
+    with_plan(cat, "SELECT e.* FROM emp e GROUP BY e.id, e.dept, e.sal",
+              [&](const LogicalNode* root) { check_emp_star(root, "aliased"); });
+    // Alongside an aggregate the qualified star still expands to the grouped cols.
+    with_plan(cat, "SELECT emp.*, COUNT(*) FROM emp GROUP BY id, dept, sal",
+              [](const LogicalNode* root) {
+        check(root->output.size() == 4, "emp.*, COUNT(*) -> 3 grouped cols + count");
+    });
+}
+
 // -------------------------------------------------------------------------
 // Derived tables / subqueries in FROM.
 
@@ -3806,6 +3832,7 @@ int main() {
     test_qualified_star_right_side_over_using(cat);
     test_qualified_star_right_full_merge_order(cat);
     test_qualified_star_over_reordered_derived(cat);
+    test_qualified_star_over_aggregate(cat);
     test_derived_table(cat);
     test_derived_self_join(cat);
     test_cte(cat);

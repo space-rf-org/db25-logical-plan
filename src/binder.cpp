@@ -1536,6 +1536,18 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
                 col.table_id = lowered_from->context.analysis.table_id;
                 col.column_id = lowered_from->context.analysis.column_id;
             }
+            // Carry the source relation alias onto the group-key output column.
+            // For a plain column key `e` is a ColumnRef into the child schema, so
+            // the child slot's alias is this column's relation instance. Without
+            // it the Aggregate output columns have alias="" and a qualified
+            // `q.*` over the grouped query (lower_projection's alias filter)
+            // matches zero slots - `SELECT emp.* FROM emp GROUP BY id, dept, sal`
+            // then failed to bind ("matches no relation"). Read it before `e` is
+            // moved into group_keys below.
+            if (e && e->kind == ExprKind::ColumnRef &&
+                e->input_index < agg_input.size()) {
+                col.alias = agg_input[e->input_index].alias;
+            }
             agg->output.push_back(std::move(col));
             agg->group_keys.push_back(std::move(e));
             // Register the producer(s) of this slot so a SELECT/HAVING/ORDER BY
