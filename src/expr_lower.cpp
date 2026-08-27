@@ -1155,22 +1155,24 @@ ExprPtr Binder::lower_quantified_comparison(const ASTNode* n, const Schema& inpu
     }
 
     // A typed array RHS wraps the constructor in one or more casts, e.g.
-    // `ARRAY[1,2,3]::int[]` or the idiomatic typed empty array `ARRAY[]::int[]`
-    // (an empty array needs a type). Peek through the Cast wrapper(s) to the
-    // underlying ArrayConstructor / RowExpr so it takes the array/row fold below
-    // rather than the scalar fallback -- which would compare `x` to the WHOLE
-    // array value and silently drop the ANY/ALL quantifier. Array element types
-    // are not modeled distinctly (DataType::Array is opaque), so folding the raw
-    // element expressions matches the analyzer's own typing; the outer array cast
-    // is a no-op in that model.
+    // `ARRAY[1,2,3]::int[]`, the idiomatic typed empty array `ARRAY[]::int[]`
+    // (an empty array needs a type), or even a nested re-cast
+    // `(ARRAY[1,2]::int[])::int[]`. Peel EVERY Cast wrapper down to the innermost
+    // operand so an array/row underneath takes the fold below rather than the
+    // scalar fallback -- which would compare `x` to the WHOLE array value and
+    // silently drop the ANY/ALL quantifier. Descend through a Cast whatever its
+    // child is (a nested Cast included); the array/row test happens once at the
+    // bottom. Array element types are not modeled distinctly (DataType::Array is
+    // opaque), so folding the raw element expressions matches the analyzer's own
+    // typing and the outer array cast(s) are a no-op in that model. If the
+    // innermost operand is not an array/row, array_rhs is left non-array and the
+    // scalar fallback below lowers the original rhs unchanged.
     const ASTNode* array_rhs = rhs;
-    while (array_rhs->node_type == NodeType::CastExpr) {
-        const ASTNode* inner = first_child(array_rhs);
-        if (inner == nullptr || (inner->node_type != NodeType::ArrayConstructor &&
-                                 inner->node_type != NodeType::RowExpr)) {
-            break;
-        }
-        array_rhs = inner;
+    while (array_rhs != nullptr && array_rhs->node_type == NodeType::CastExpr) {
+        array_rhs = first_child(array_rhs);
+    }
+    if (array_rhs == nullptr) {
+        array_rhs = rhs;  // defensive: a cast with no operand -> scalar fallback
     }
 
     // ---- Array / row RHS: expr <cmp> ANY|ALL (ARRAY[..] | (a, b, ..)) ---------

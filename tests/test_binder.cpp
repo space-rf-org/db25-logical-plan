@@ -4050,6 +4050,22 @@ void test_quantified_comparison_lowers(const InMemoryCatalog& cat) {
                         std::string{"ALL over a typed array still folds to AND:\n"} + d);
               });
 
+    // A NESTED cast around the array (`(ARRAY[..]::int[])::int[]`) must be peeled
+    // through EVERY layer -- one-level peeling dropped to the scalar fallback and
+    // lost the quantifier (regression guard for the nested-cast defect).
+    with_plan(cat, "SELECT id FROM emp WHERE sal < ANY ((ARRAY[1, 2, 3]::int[])::int[])",
+              [&](const LogicalNode* root) {
+                  const std::string d = dump_plan(root);
+                  check(d.find(" OR ") != std::string::npos,
+                        std::string{"ANY over a nested-cast array still folds to OR:\n"} + d);
+              });
+    with_plan(cat, "SELECT id FROM emp WHERE sal > ALL (CAST(CAST(ARRAY[1, 2] AS int[]) AS int[]))",
+              [&](const LogicalNode* root) {
+                  const std::string d = dump_plan(root);
+                  check(d.find(" AND ") != std::string::npos,
+                        std::string{"ALL over a doubly-CAST array still folds to AND:\n"} + d);
+              });
+
     // The idiomatic typed EMPTY array is vacuous: ANY -> FALSE, ALL -> TRUE, a
     // definite never-NULL boolean, and ANY and ALL must NOT produce the same
     // plan (the defect made both bind to `sal = <the whole array>`).
