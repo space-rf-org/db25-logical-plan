@@ -704,6 +704,17 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
                 return lower_subquery(sq, SubqueryKind::Exists, is_negated(n), nullptr,
                                       type, nullability, input, error);
             }
+            // Unary plus is a numeric identity: `+x` has exactly the operand's
+            // type, nullability and value (the analyzer types it that way -- see
+            // its UnaryExpr case, result == operand type -- and blesses it with
+            // no error). There is no UnaryOp::Plus in the parser AST enum, so
+            // rather than reject an analyzer-clean expression (which broke the
+            // analyzer-clean => bind-ok seam for `SELECT +1`, `SELECT +total`,
+            // `SUM(+sal)`, `WHERE +age > 5`), lower it directly to its operand,
+            // dropping the no-op wrapper.
+            if (n->primary_text == "+") {
+                return lower_expr(first_child(n), input, error);
+            }
             UnaryOp op{};
             if (!map_unary_op(n->primary_text, op)) {
                 error = "unrecognized unary operator '" + std::string{n->primary_text} + "'";

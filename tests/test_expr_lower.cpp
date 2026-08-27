@@ -725,6 +725,82 @@ void test_row_constructor_lowering(const InMemoryCatalog& cat) {
           "lhs row element 0 is a column ref (id)");
 }
 
+// Unary plus is a numeric identity the analyzer types and blesses (`+x` has the
+// operand's type and nullability), but the binder's map_unary_op had no entry
+// for '+', so every analyzer-clean expression with a leading unary '+' failed to
+// bind with "unrecognized unary operator '+'" -- a break of the analyzer-clean
+// => bind-ok seam. lower_expr now drops the no-op wrapper and lowers the operand
+// directly. Verify across a projection, an aggregate argument, and a predicate.
+void test_unary_plus_is_identity(const InMemoryCatalog& cat) {
+    std::printf("[test] (m) unary plus is a numeric identity (seam)\n");
+
+    // (1) Projection: `+total` -> the operand ColumnRef, wrapper dropped.
+    {
+        Analyzer az(cat);
+        Analyzed a;
+        analyze_into(a, cat, az, "SELECT +total FROM orders");
+        if (a.ok) {
+            const ASTNode* item = first_select_item(a.stmt);
+            check(item != nullptr && item->node_type == NodeType::UnaryExpr,
+                  "select item is a unary '+'");
+            const Schema input = schema_of(cat, "orders");  // id@0, user_id@1, total@2
+            Binder binder(az, cat);
+            std::string err;
+            ExprPtr e = BinderExprTestAccess::lower(binder, item, input, err);
+            check(e != nullptr, std::string{"lowered +total (seam: must not reject): "} + err);
+            if (e) {
+                check(e->kind == ExprKind::ColumnRef, "+total lowers to the bare operand ColumnRef");
+                check(e->input_index == 2, "+total resolves to the total slot (2)");
+                check(e->type == DataType::Double, "+total keeps the operand type (Double)");
+            }
+        }
+    }
+
+    // (2) Aggregate argument: `SUM(+sal)` -> SUM over the bare sal ColumnRef.
+    {
+        Analyzer az(cat);
+        Analyzed a;
+        analyze_into(a, cat, az, "SELECT SUM(+sal) FROM emp GROUP BY dept");
+        if (a.ok) {
+            const ASTNode* item = first_select_item(a.stmt);
+            const Schema input = schema_of(cat, "emp");  // id@0, dept@1, sal@2
+            Binder binder(az, cat);
+            std::string err;
+            ExprPtr e = BinderExprTestAccess::lower(binder, item, input, err);
+            check(e != nullptr, std::string{"lowered SUM(+sal): "} + err);
+            if (e) {
+                check(e->kind == ExprKind::Aggregate, "root is Aggregate");
+                check(e->func_name == "SUM", "aggregate is SUM");
+                if (e->children.size() == 1) {
+                    const Expr& arg = *e->children[0];
+                    check(arg.kind == ExprKind::ColumnRef, "SUM arg is the bare sal ColumnRef (wrapper dropped)");
+                    check(arg.input_index == 2, "SUM arg resolves to the sal slot (2)");
+                }
+            }
+        }
+    }
+
+    // (3) Predicate: `+total > 100` -> BinaryOp whose lhs is the bare operand.
+    {
+        Analyzer az(cat);
+        Analyzed a;
+        analyze_into(a, cat, az, "SELECT id FROM orders WHERE +total > 100");
+        if (a.ok) {
+            const ASTNode* pred = where_predicate(a.stmt);
+            const Schema input = schema_of(cat, "orders");
+            Binder binder(az, cat);
+            std::string err;
+            ExprPtr e = BinderExprTestAccess::lower(binder, pred, input, err);
+            check(e != nullptr, std::string{"lowered +total > 100: "} + err);
+            if (e && e->children.size() == 2) {
+                check(e->kind == ExprKind::BinaryOp, "root is BinaryOp");
+                check(e->children[0]->kind == ExprKind::ColumnRef,
+                      "lhs is the bare total ColumnRef (unary '+' dropped)");
+            }
+        }
+    }
+}
+
 int main() {
     const InMemoryCatalog cat = make_catalog();
 
@@ -742,6 +818,7 @@ int main() {
     test_ilike_lowering(cat);
     test_aggregate_filter_lowering(cat);
     test_row_constructor_lowering(cat);
+    test_unary_plus_is_identity(cat);
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     if (g_failures == 0) {
