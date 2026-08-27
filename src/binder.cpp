@@ -1724,7 +1724,7 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
         // resolved against the Project's input (the child's output).
         agg_frame_ = &agg_frame;
         const bool projected = lower_projection(select_list, current.get(),
-                                                project->exprs, error);
+                                                project->output, project->exprs, error);
         agg_frame_ = nullptr;
         if (!projected) {
             return nullptr;
@@ -2301,6 +2301,7 @@ ExprPtr Binder::lower_projection_item(const ASTNode* item, const Schema& input,
 }
 
 bool Binder::lower_projection(const ASTNode* select_list, const LogicalNode* child,
+                              const Schema& out_schema,
                               std::vector<ExprPtr>& out, std::string& error) {
     const Schema& input = child->output;
     for (const ASTNode* item = first_child(select_list); item != nullptr;
@@ -2335,34 +2336,51 @@ bool Binder::lower_projection(const ASTNode* select_list, const LogicalNode* chi
             // Postgres expands it to ALL of q's columns (the join column
             // included).
             //
-            // Emit q's columns in q's NATURAL (catalog) order - by column_id -
-            // NOT in frame order. Frame order is unreliable: a RIGHT/FULL
-            // USING/NATURAL merge HOISTS q's copy of the merged column up to the
-            // left merge position, so a non-merged column of q can precede it in
-            // the frame even though it FOLLOWS in q's catalog order (e.g. for
-            // s3(c, jid, d) USING (jid), s3.jid lands before s3.c/s3.d in the
-            // frame). The analyzer expands `q.*` in catalog order, so ordering
-            // the matched slots by column_id keeps the projection expressions
-            // aligned 1:1 with the analyzer's output columns; a stable sort keeps
-            // frame order for any ties (e.g. computed columns with column_id 0).
+            // Emit q's columns in the ANALYZER'S expansion order, taken from the
+            // output schema this Project was seeded with. Neither frame order nor
+            // column_id order is a reliable proxy: a RIGHT/FULL USING/NATURAL
+            // merge HOISTS q's copy of the merged column to the left merge slot
+            // (breaking frame order), while a reordered derived table / CTE (e.g.
+            // `(SELECT total, id FROM orders) q`) projects in select-list order
+            // that has nothing to do with the inherited column_id. The analyzer
+            // expanded this star into a CONTIGUOUS slice of out_schema starting
+            // at the current expression count (one expr per output column); bind
+            // each of those output columns to the frame slot of relation `tbl`
+            // with the same name, consuming slots so duplicate names still map
+            // 1:1 in order.
             const std::string_view tbl = split_column_ref(star_qual).column;
-            std::vector<std::pair<std::uint32_t, std::uint32_t>> hits;  // (column_id, slot)
+            std::vector<std::uint32_t> slots;  // q's frame slots, in frame order
             for (std::size_t s = 0; s < input.size(); ++s) {
-                if (!iequals(input[s].alias, tbl)) {
-                    continue;
+                if (iequals(input[s].alias, tbl)) {
+                    slots.push_back(static_cast<std::uint32_t>(s));
                 }
-                hits.emplace_back(input[s].column_id, static_cast<std::uint32_t>(s));
             }
-            if (hits.empty()) {
+            if (slots.empty()) {
                 error = "qualified '" + std::string{star_qual} +
                         ".*' matches no relation in the FROM clause";
                 return false;
             }
-            std::stable_sort(hits.begin(), hits.end(),
-                             [](const auto& a, const auto& b) { return a.first < b.first; });
-            for (const auto& [cid, slot] : hits) {
-                (void)cid;
-                out.push_back(make_column_ref(slot, input[slot]));
+            const std::size_t slice_start = out.size();  // this star's output slice
+            std::vector<bool> used(slots.size(), false);
+            for (std::size_t k = 0; k < slots.size(); ++k) {
+                if (slice_start + k >= out_schema.size()) {
+                    break;  // arity guard (caller) will report the count divergence
+                }
+                const std::string_view want = out_schema[slice_start + k].name;
+                std::size_t pick = slots.size();
+                for (std::size_t j = 0; j < slots.size(); ++j) {
+                    if (!used[j] && iequals(input[slots[j]].name, want)) {
+                        pick = j;
+                        break;
+                    }
+                }
+                if (pick == slots.size()) {
+                    error = "qualified '" + std::string{star_qual} + ".*' output column '" +
+                            std::string{want} + "' has no matching column in the relation";
+                    return false;
+                }
+                used[pick] = true;
+                out.push_back(make_column_ref(slots[pick], input[slots[pick]]));
             }
             continue;
         }

@@ -192,8 +192,15 @@ private:
     // `child` lowers to a ColumnRef into that child column (the producer map)
     // rather than a re-evaluated expression. Returns false and sets `error` on
     // an unlowerable shape (e.g. a qualified `t.*`, not yet supported).
+    // `out_schema` is the analyzer-seeded output schema of the Project being
+    // built (one column per emitted expression, in the analyzer's order). A
+    // qualified `q.*` uses it to reproduce the analyzer's exact expansion order
+    // for that relation, which is neither frame order nor column_id order in
+    // general (a RIGHT/FULL merge hoist breaks frame order; a reordered derived
+    // table / CTE breaks column_id order).
     [[nodiscard]] bool lower_projection(const db25::ast::ASTNode* select_list,
                                         const LogicalNode* child,
+                                        const Schema& out_schema,
                                         std::vector<ExprPtr>& out, std::string& error);
 
     // Lower a single non-star projected item against `input` (the child's output

@@ -2135,6 +2135,48 @@ void test_qualified_star_right_full_merge_order(const InMemoryCatalog& cat) {
     });
 }
 
+// A qualified `q.*` over a column-REORDERED derived table / CTE must bind each
+// output column to its own slot in the DERIVED TABLE's select-list order (the
+// analyzer's expansion order) - NOT in inherited-column_id order. For
+// `(SELECT total, id FROM orders) q`, q.* is [total, id]; total (Double) must
+// read the total slot and id (Integer) the id slot, even though id's base
+// column_id (0) is lower than total's (2).
+void test_qualified_star_over_reordered_derived(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT q.* FROM (SELECT total, id FROM orders) q -> select order\n");
+    auto check_reordered = [](const LogicalNode* root, const char* what) {
+        if (root->output.size() != 2 || root->exprs.size() != 2) {
+            check(false, std::string{what} + ": expected 2 output cols and 2 exprs");
+            return;
+        }
+        check(root->output[0].name == "total" && root->output[1].name == "id",
+              std::string{what} + ": output order total, id");
+        // Each expr must carry its own column's type - proof it reads the right
+        // slot rather than a column_id-transposed one.
+        check(root->exprs[0] && root->exprs[0]->type == DataType::Double,
+              std::string{what} + ": expr[0] (total) reads a Double slot");
+        check(root->exprs[1] && root->exprs[1]->type == DataType::Integer,
+              std::string{what} + ": expr[1] (id) reads an Integer slot");
+    };
+    with_plan(cat, "SELECT q.* FROM (SELECT total, id FROM orders) q",
+              [&](const LogicalNode* root) { check_reordered(root, "derived"); });
+    with_plan(cat, "WITH q AS (SELECT total, id FROM orders) SELECT q.* FROM q",
+              [&](const LogicalNode* root) { check_reordered(root, "cte"); });
+    // A three-column reorder confirms the mapping is not accidentally right.
+    with_plan(cat, "SELECT v.* FROM (SELECT total, user_id, id FROM orders) v",
+              [](const LogicalNode* root) {
+        if (root->output.size() == 3 && root->exprs.size() == 3) {
+            check(root->output[0].name == "total" && root->output[1].name == "user_id" &&
+                      root->output[2].name == "id",
+                  "3-col derived: output order total, user_id, id");
+            check(root->exprs[0]->type == DataType::Double, "v.* expr[0] total Double");
+            check(root->exprs[1]->type == DataType::Integer, "v.* expr[1] user_id Integer");
+            check(root->exprs[2]->type == DataType::Integer, "v.* expr[2] id Integer");
+        } else {
+            check(false, "3-col derived: expected 3 cols/exprs");
+        }
+    });
+}
+
 // -------------------------------------------------------------------------
 // Derived tables / subqueries in FROM.
 
@@ -3763,6 +3805,7 @@ int main() {
     test_qualified_star_over_join_expands(cat);
     test_qualified_star_right_side_over_using(cat);
     test_qualified_star_right_full_merge_order(cat);
+    test_qualified_star_over_reordered_derived(cat);
     test_derived_table(cat);
     test_derived_self_join(cat);
     test_cte(cat);
