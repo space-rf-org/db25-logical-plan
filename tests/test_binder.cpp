@@ -1010,6 +1010,95 @@ void test_group_by_positional_over_star(const InMemoryCatalog& cat) {
     });
 }
 
+// `SELECT *` over an Aggregate must present its columns in RELATION/select order,
+// independent of GROUP BY key order. The Aggregate output is keys++aggs (group-
+// key order), so a reordered GROUP BY made the bare-star Project follow that
+// order - transposing the output columns, and (mixed with a trailing item)
+// feeding an output column from the wrong slot: a value+type transposition.
+void test_star_over_aggregate_order(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT * over a reordered GROUP BY keeps relation order\n");
+
+    // emp = [id INT, dept VARCHAR, sal DOUBLE]. `GROUP BY 3, 2, 1` groups by sal,
+    // dept, id, so the Aggregate output is [sal, dept, id]; `*` must STILL be
+    // [id, dept, sal], with each expr referencing the matching Aggregate slot.
+    with_plan(cat, "SELECT * FROM emp GROUP BY 3, 2, 1", [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "star-order: root is Project");
+        check(root->output.size() == 3 && root->exprs.size() == 3,
+              "star-order: 3 output columns / exprs");
+        if (root->output.size() == 3) {
+            expect_col(root->output[0], "id", DataType::Integer, false, "star-order out0");
+            expect_col(root->output[1], "dept", DataType::VarChar, true, "star-order out1");
+            expect_col(root->output[2], "sal", DataType::Double, true, "star-order out2");
+        }
+        if (root->exprs.size() == 3) {
+            // Aggregate output is [sal#0, dept#1, id#2]; the star maps id->#2,
+            // dept->#1, sal->#0.
+            expect_col_ref(root->exprs[0], 2, "star-order: id -> agg slot #2");
+            expect_col_ref(root->exprs[1], 1, "star-order: dept -> agg slot #1");
+            expect_col_ref(root->exprs[2], 0, "star-order: sal -> agg slot #0");
+        }
+        // No transposition: every output column's type equals its expr's type.
+        for (std::size_t i = 0; i < root->output.size() && i < root->exprs.size(); ++i) {
+            check(root->output[i].type == root->exprs[i]->type,
+                  "star-order: output[" + std::to_string(i) + "].type == expr type");
+        }
+    });
+
+    // The same bug reproduces with NAMED keys in non-table order.
+    with_plan(cat, "SELECT * FROM emp GROUP BY dept, id, sal", [](const LogicalNode* root) {
+        if (root->output.size() == 3) {
+            expect_col(root->output[0], "id", DataType::Integer, false, "star-named out0");
+            expect_col(root->output[1], "dept", DataType::VarChar, true, "star-named out1");
+            expect_col(root->output[2], "sal", DataType::Double, true, "star-named out2");
+        }
+        for (std::size_t i = 0; i < root->output.size() && i < root->exprs.size(); ++i) {
+            check(root->output[i].type == root->exprs[i]->type,
+                  "star-named: output/expr type agree at " + std::to_string(i));
+        }
+    });
+
+    // Mixed `*, id AS foo` with reordered keys: the finding's type-transposition
+    // case. Output is [id, dept, sal, foo]; each expr must feed the matching type.
+    with_plan(cat, "SELECT *, id AS foo FROM emp GROUP BY 4, 3, 2",
+              [](const LogicalNode* root) {
+        check(root->output.size() == 4 && root->exprs.size() == 4,
+              "star-mixed: 4 output columns / exprs");
+        if (root->output.size() == 4) {
+            expect_col(root->output[0], "id", DataType::Integer, false, "star-mixed out0");
+            expect_col(root->output[1], "dept", DataType::VarChar, true, "star-mixed out1");
+            expect_col(root->output[2], "sal", DataType::Double, true, "star-mixed out2");
+            expect_col(root->output[3], "foo", DataType::Integer, false, "star-mixed out3");
+        }
+        for (std::size_t i = 0; i < root->output.size() && i < root->exprs.size(); ++i) {
+            check(root->output[i].type == root->exprs[i]->type,
+                  "star-mixed: no transposition at " + std::to_string(i));
+        }
+    });
+
+    // Guard: keys already in table order are unchanged.
+    with_plan(cat, "SELECT * FROM emp GROUP BY 1, 2, 3", [](const LogicalNode* root) {
+        if (root->output.size() == 3) {
+            expect_col(root->output[0], "id", DataType::Integer, false, "star-inorder out0");
+            expect_col(root->output[2], "sal", DataType::Double, true, "star-inorder out2");
+        }
+    });
+
+    // Guard: a bare `*` over a USING/NATURAL merged frame is unaffected (child
+    // order already equals the analyzer's projection: [a, jid, b, c, d]).
+    with_plan(cat, "SELECT * FROM t3 JOIN s3 USING(jid)", [](const LogicalNode* root) {
+        check(root->output.size() == 5, "star-merge: 5 output columns");
+        if (root->output.size() == 5) {
+            expect_col(root->output[0], "a", DataType::Integer, true, "star-merge out0");
+            expect_col(root->output[1], "jid", DataType::Integer, false, "star-merge out1");
+            expect_col(root->output[3], "c", DataType::Double, true, "star-merge out3");
+        }
+        for (std::size_t i = 0; i < root->output.size() && i < root->exprs.size(); ++i) {
+            check(root->output[i].type == root->exprs[i]->type,
+                  "star-merge: output/expr type agree at " + std::to_string(i));
+        }
+    });
+}
+
 // The Aggregate output is group_keys ++ aggregates, independent of SELECT order.
 // `SELECT COUNT(*), dept` puts the aggregate first in the select list but the
 // Aggregate output is still [dept (key), COUNT (agg)]; the Project reorders it
@@ -3867,6 +3956,7 @@ int main() {
     test_group_by_output_alias(cat);
     test_group_by_positional(cat);
     test_group_by_positional_over_star(cat);
+    test_star_over_aggregate_order(cat);
     test_group_by_select_reordered(cat);
     test_group_by_same_name_aggregates(cat);
     test_self_join_group_key_distinct_slots(cat);
