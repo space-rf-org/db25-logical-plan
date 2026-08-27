@@ -1092,6 +1092,8 @@ void test_quantified_comparison_optimizes_idempotently(const InMemoryCatalog& ca
              "SELECT id FROM emp WHERE sal = ANY (SELECT sal FROM emp)",
              "SELECT id FROM emp WHERE sal < ANY (ARRAY[1, 2, 3])",
              "SELECT id FROM emp WHERE sal > ALL (ARRAY[1, 2, 3])",
+             "SELECT id FROM emp WHERE sal < ANY (ARRAY[1, 2, 3]::int[])",
+             "SELECT id FROM emp WHERE sal = ANY (ARRAY[]::int[])",
          }) {
         db25::parser::Parser parser;
         auto parsed = parser.parse(sql);

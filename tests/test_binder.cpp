@@ -4033,6 +4033,39 @@ void test_quantified_comparison_lowers(const InMemoryCatalog& cat) {
                         std::string{"ALL over an array folds to AND:\n"} + d);
               });
 
+    // A typed array (a Cast-wrapped ArrayConstructor: `ARRAY[..]::int[]`) must be
+    // peeked through to the same OR/AND fold -- NOT dropped to the scalar
+    // fallback that compares `sal` to the whole array value and loses the
+    // quantifier (regression guard for the cast-wrapped array defect).
+    with_plan(cat, "SELECT id FROM emp WHERE sal < ANY (ARRAY[1, 2, 3]::int[])",
+              [&](const LogicalNode* root) {
+                  const std::string d = dump_plan(root);
+                  check(d.find(" OR ") != std::string::npos,
+                        std::string{"ANY over a typed array still folds to OR:\n"} + d);
+              });
+    with_plan(cat, "SELECT id FROM emp WHERE sal > ALL (ARRAY[1, 2, 3]::int[])",
+              [&](const LogicalNode* root) {
+                  const std::string d = dump_plan(root);
+                  check(d.find(" AND ") != std::string::npos,
+                        std::string{"ALL over a typed array still folds to AND:\n"} + d);
+              });
+
+    // The idiomatic typed EMPTY array is vacuous: ANY -> FALSE, ALL -> TRUE, a
+    // definite never-NULL boolean, and ANY and ALL must NOT produce the same
+    // plan (the defect made both bind to `sal = <the whole array>`).
+    with_plan(cat, "SELECT id FROM emp WHERE sal = ANY (ARRAY[]::int[])",
+              [&](const LogicalNode* root) {
+                  const std::string d = dump_plan(root);
+                  check(d.find("FALSE") != std::string::npos,
+                        std::string{"= ANY (empty typed array) is vacuously FALSE:\n"} + d);
+              });
+    with_plan(cat, "SELECT id FROM emp WHERE sal = ALL (ARRAY[]::int[])",
+              [&](const LogicalNode* root) {
+                  const std::string d = dump_plan(root);
+                  check(d.find("TRUE") != std::string::npos,
+                        std::string{"= ALL (empty typed array) is vacuously TRUE:\n"} + d);
+              });
+
     // Every position the analyzer accepts a quantified comparison must bind:
     // WHERE, HAVING, the SELECT list, and inside a CASE WHEN, over both a
     // subquery and an array RHS.
