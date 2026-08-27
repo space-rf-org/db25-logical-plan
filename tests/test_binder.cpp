@@ -2255,15 +2255,17 @@ void test_recursive_cte(const InMemoryCatalog& cat) {
 }
 
 // A pathologically deep expression tree (a long a+a+...+a chain) must be
-// rejected gracefully, not overflow the stack in lower_expr. The analyzer bounds
-// its own recursion (kMaxExprDepth) and flags the expression; bind() must stay
-// defensive regardless, exactly like the recursive-CTE guard above. lower_expr
-// now carries a matching depth bound and fails with an error past it. This runs
-// under the ASan/UBSan CI job, which is what catches the old stack overflow.
+// rejected gracefully, never overflow a recursive walk in analyze / lower_expr.
+// The parser now caps a flat operator chain at its max_depth (the producer-owned
+// AST-depth contract, matching the set-op cap), so such a chain is rejected AT
+// PARSE - the primary, reachable defense, which keeps the deep tree from ever
+// reaching a downstream walker. The binder additionally retains its own
+// lower_expr depth guard (kMaxLowerDepth) as defense-in-depth. This runs under
+// the ASan/UBSan CI job, which is what caught the old stack overflow.
 void test_deep_expression_no_overflow(const InMemoryCatalog& cat) {
     std::printf("[test] deeply-nested expression rejected without stack overflow\n");
-    // ~4000 additive levels: comfortably past the 1000 bound, and past the depth
-    // that overflowed the stack before the guard (~2500).
+    // ~4000 additive levels: comfortably past the parser's depth bound and past
+    // the depth that overflowed the stack before the guards (~2500).
     std::string sql = "SELECT 1";
     for (int i = 0; i < 4000; ++i) {
         sql += " + 1";
@@ -2272,13 +2274,9 @@ void test_deep_expression_no_overflow(const InMemoryCatalog& cat) {
 
     db25::parser::Parser parser;
     auto parsed = parser.parse(sql);
-    check(parsed.has_value(), "parse: deep additive chain");
-    if (!parsed) return;
-    Analyzer analyzer(cat);
-    analyzer.analyze(parsed.value());
-    Binder binder(analyzer, cat);
-    BindResult res = binder.bind(parsed.value());
-    check(!res.ok, "deep expression rejected by the binder, no stack overflow");
+    // Rejected up front by the parser's chain cap, so no downstream walker
+    // (analyze / lower_expr) ever recurses into an unbounded tree.
+    check(!parsed.has_value(), "deep additive chain rejected at parse, no overflow");
 
     // Control: a normal-depth expression of the same shape still binds.
     with_plan(cat, "SELECT 1 + 1 + 1 + 1 + 1 FROM users",
