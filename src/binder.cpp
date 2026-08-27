@@ -76,7 +76,16 @@ DataType reconcile_value_type(DataType a, DataType b) {
 
 // Convert an analyzer ResolvedColumn to an IR ColumnSchema (field-for-field).
 ColumnSchema to_schema(const ResolvedColumn& c) {
-    return ColumnSchema{c.name, c.type, c.nullable, c.table_id, c.column_id};
+    // Carry the analyzer's relation-instance qualifier into ColumnSchema.alias.
+    // A `*`-expanded projection column records the relation instance it came
+    // from (empty for a computed column); it is what disambiguates a self-join's
+    // two copies of a base column, which share (table_id, column_id) AND name, so
+    // the bare-`*` reorder can map each output column to the right instance's
+    // child slot. Harmless elsewhere: a derived table / CTE / set-op reference
+    // overwrites its columns' alias with the reference name when it is used.
+    ColumnSchema cs{c.name, c.type, c.nullable, c.table_id, c.column_id};
+    cs.alias = c.qualifier;
+    return cs;
 }
 
 bool is_join_node(NodeType t) {
@@ -2446,14 +2455,20 @@ bool Binder::lower_projection(const ASTNode* select_list, const LogicalNode* chi
                 std::vector<bool> used(visible.size(), false);
                 for (std::size_t k = 0; reordered && k < visible.size(); ++k) {
                     const ColumnSchema& want = out_schema[slice_start + k];
-                    // Match by (table_id, column_id) identity. The child column
-                    // may carry an output ALIAS as its name (an aggregate group
-                    // key from `id AS foo` is named "foo" but has id's identity),
-                    // so the name only breaks ties between same-identity slots (a
-                    // self-join's two copies of a base column); prefer a name
-                    // match, else take the first unused identity match.
+                    // Match by (table_id, column_id) identity, then break ties
+                    // among same-identity child slots. Two spellings can share
+                    // (table_id, column_id): a self-join's two copies of a base
+                    // column (`e1.dept`, `e2.dept`) share the NAME but differ by
+                    // relation instance (alias), while two same-base derived
+                    // columns (`SELECT id AS a, id AS b`) share the ALIAS but
+                    // differ by name. Neither is required to exist - a child group
+                    // key may be named for an output alias (`id AS foo`), and
+                    // identity alone already maps a unique column - so score each
+                    // candidate: +2 for a matching relation instance (the primary
+                    // discriminator for a self-join), +1 for a matching name, and
+                    // take the highest-scoring unused identity match.
                     std::size_t pick = visible.size();
-                    std::size_t id_only = visible.size();
+                    int best = -1;
                     for (std::size_t j = 0; j < visible.size(); ++j) {
                         if (used[j] || want.column_id == 0) {
                             continue;
@@ -2463,16 +2478,13 @@ bool Binder::lower_projection(const ASTNode* select_list, const LogicalNode* chi
                             cand.column_id != want.column_id) {
                             continue;
                         }
-                        if (iequals(cand.name, want.name)) {
+                        const int score =
+                            (!want.alias.empty() && iequals(cand.alias, want.alias) ? 2 : 0) +
+                            (iequals(cand.name, want.name) ? 1 : 0);
+                        if (score > best) {
+                            best = score;
                             pick = j;
-                            break;
                         }
-                        if (id_only == visible.size()) {
-                            id_only = j;
-                        }
-                    }
-                    if (pick == visible.size()) {
-                        pick = id_only;
                     }
                     if (pick == visible.size()) {
                         reordered = false;  // unmatchable -> abandon the reorder
