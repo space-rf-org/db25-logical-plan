@@ -1644,9 +1644,19 @@ void decorrelate_exists(LogicalNodePtr& node) {
 
 LogicalNodePtr optimize(LogicalNodePtr plan) {
     if (plan) {
-        // Decorrelate first, so the later passes optimize the resulting joins;
-        // fold so a folded `1 = 1` -> `true` feeds the boolean identities;
-        // simplify next so a reduced predicate feeds pushdown; push filters so
+        // Fold + simplify BEFORE decorrelation so a subquery that only becomes a
+        // top-level conjunct after boolean reduction is decorrelated in the SAME
+        // pass. decorrelate_node splits only AND conjuncts, so a predicate like
+        // `IN (subquery) OR 3 = 5` hides the subquery until fold (`3=5` -> false)
+        // and simplify (`IN OR false` -> `IN`) reduce it. Running those first
+        // means optimize() reaches its decorrelation fixpoint in one call, so
+        // optimize(optimize(p)) == optimize(p) (was: the subquery decorrelated
+        // only on the SECOND pass).
+        fold_constants(plan.get());
+        simplify_booleans(plan.get());
+        // Decorrelate, so the later passes optimize the resulting joins; fold
+        // again so a folded `1 = 1` -> `true` feeds the boolean identities;
+        // simplify again so a reduced predicate feeds pushdown; push filters so
         // they narrow inputs before pruning; then drop unreferenced columns.
         decorrelate_exists(plan);
         fold_constants(plan.get());
