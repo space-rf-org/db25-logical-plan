@@ -1144,6 +1144,57 @@ void test_star_over_selfjoin_aggregate(const InMemoryCatalog& cat) {
     });
 }
 
+// `SELECT *` over a reordered-GROUP BY Aggregate whose star covers an ID-LESS
+// column (a VALUES-derived or computed/CTE column, column_id == 0). Such a
+// column cannot be matched by (table_id, column_id); the reorder must key it by
+// NAME. Before, an id-less output column was unmatchable, so the whole reorder
+// abandoned to child (group-key) order while the output schema stayed in
+// relation order - transposing every column's value against its label (a
+// VarChar output fed a Double slot, etc.).
+void test_star_over_aggregate_idless_column(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT * over a reordered GROUP BY with an id-less column\n");
+    // v.x is a VALUES column (Text, column_id 0); GROUP BY lists emp's columns
+    // first, so the Aggregate output is [emp.id, emp.dept, emp.sal, v.x] (slots
+    // 0..3) while `*` must be relation order [v.x, emp.id, emp.dept, emp.sal].
+    with_plan(cat,
+              "SELECT * FROM (VALUES ('z')) v(x) JOIN emp ON emp.id > 0 "
+              "GROUP BY emp.id, emp.dept, emp.sal, v.x",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "idless: root is Project");
+        check(root->output.size() == 4 && root->exprs.size() == 4,
+              "idless: 4 output columns / exprs");
+        if (root->output.size() == 4) {
+            check(root->output[0].name == "x", "idless: out[0] is v.x");
+            check(root->output[1].name == "id", "idless: out[1] is emp.id");
+        }
+        if (root->exprs.size() == 4) {
+            // v.x -> slot 3 (its group-key slot); emp.id/dept/sal -> 0/1/2.
+            const std::uint32_t want[] = {3, 0, 1, 2};
+            for (std::size_t i = 0; i < 4; ++i) {
+                expect_col_ref(root->exprs[i], want[i],
+                               "idless: out[" + std::to_string(i) + "] -> its slot");
+            }
+        }
+        // The decisive check: no value/type transposition - each output column's
+        // declared type equals the type of the slot feeding it.
+        for (std::size_t i = 0; i < root->output.size() && i < root->exprs.size(); ++i) {
+            check(root->output[i].type == root->exprs[i]->type,
+                  "idless: output[" + std::to_string(i) + "].type == expr type");
+        }
+    });
+
+    // A COMPUTED derived column (sal+1 AS w, column_id 0) behaves the same.
+    with_plan(cat,
+              "SELECT * FROM (SELECT sal + 1 AS w, id FROM emp) d JOIN emp e ON e.id = d.id "
+              "GROUP BY e.id, e.dept, e.sal, d.id, d.w",
+              [](const LogicalNode* root) {
+        for (std::size_t i = 0; i < root->output.size() && i < root->exprs.size(); ++i) {
+            check(root->output[i].type == root->exprs[i]->type,
+                  "idless-computed: output/expr type agree at " + std::to_string(i));
+        }
+    });
+}
+
 // The Aggregate output is group_keys ++ aggregates, independent of SELECT order.
 // `SELECT COUNT(*), dept` puts the aggregate first in the select list but the
 // Aggregate output is still [dept (key), COUNT (agg)]; the Project reorders it
@@ -4003,6 +4054,7 @@ int main() {
     test_group_by_positional_over_star(cat);
     test_star_over_aggregate_order(cat);
     test_star_over_selfjoin_aggregate(cat);
+    test_star_over_aggregate_idless_column(cat);
     test_group_by_select_reordered(cat);
     test_group_by_same_name_aggregates(cat);
     test_self_join_group_key_distinct_slots(cat);

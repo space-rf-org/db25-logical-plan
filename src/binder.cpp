@@ -2455,27 +2455,33 @@ bool Binder::lower_projection(const ASTNode* select_list, const LogicalNode* chi
                 std::vector<bool> used(visible.size(), false);
                 for (std::size_t k = 0; reordered && k < visible.size(); ++k) {
                     const ColumnSchema& want = out_schema[slice_start + k];
-                    // Match by (table_id, column_id) identity, then break ties
-                    // among same-identity child slots. Two spellings can share
-                    // (table_id, column_id): a self-join's two copies of a base
-                    // column (`e1.dept`, `e2.dept`) share the NAME but differ by
-                    // relation instance (alias), while two same-base derived
-                    // columns (`SELECT id AS a, id AS b`) share the ALIAS but
-                    // differ by name. Neither is required to exist - a child group
-                    // key may be named for an output alias (`id AS foo`), and
-                    // identity alone already maps a unique column - so score each
-                    // candidate: +2 for a matching relation instance (the primary
-                    // discriminator for a self-join), +1 for a matching name, and
-                    // take the highest-scoring unused identity match.
+                    // Map each relation-order output column to its child slot. A
+                    // base column has a (table_id, column_id) identity; two
+                    // spellings can share it: a self-join's two copies (`e1.dept`,
+                    // `e2.dept`) share the NAME but differ by relation instance
+                    // (alias), while two same-base derived columns (`id AS a`,
+                    // `id AS b`) share the ALIAS but differ by name. A COMPUTED or
+                    // VALUES column has NO id (column_id == 0) on both sides, so it
+                    // is keyed by name instead - without this it was unmatchable
+                    // and abandoned the whole reorder to child (group-key) order,
+                    // transposing every column against the relation-order output
+                    // schema. Score each viable candidate: +2 for a matching
+                    // relation instance (the discriminator for a self-join), +1
+                    // for a matching name, and take the highest-scoring unused one.
                     std::size_t pick = visible.size();
                     int best = -1;
                     for (std::size_t j = 0; j < visible.size(); ++j) {
-                        if (used[j] || want.column_id == 0) {
+                        if (used[j]) {
                             continue;
                         }
                         const ColumnSchema& cand = input[visible[j]];
-                        if (cand.table_id != want.table_id ||
-                            cand.column_id != want.column_id) {
+                        const bool identity_match =
+                            want.column_id != 0
+                                ? (cand.table_id == want.table_id &&
+                                   cand.column_id == want.column_id)
+                                // Id-less (computed / VALUES) column: keyed by name.
+                                : (cand.column_id == 0 && iequals(cand.name, want.name));
+                        if (!identity_match) {
                             continue;
                         }
                         const int score =
