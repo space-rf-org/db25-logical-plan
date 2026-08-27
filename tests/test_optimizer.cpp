@@ -1080,10 +1080,44 @@ void test_prune_reaches_filter_subquery(const InMemoryCatalog& cat) {
     });
 }
 
+// A quantified comparison lowers to shapes the optimizer must leave stable: the
+// subquery form is a Quantified subquery expr (NOT decorrelated - only EXISTS/IN
+// are), and the array form is an OR/AND fold of comparisons. optimize() must be
+// idempotent over both, and folding must not collapse the array expansion (its
+// operands reference a column, so no constant fold applies).
+void test_quantified_comparison_optimizes_idempotently(const InMemoryCatalog& cat) {
+    std::printf("[test] quantified comparison optimize idempotence\n");
+    for (const char* sql : {
+             "SELECT id FROM emp WHERE sal > ALL (SELECT sal FROM emp)",
+             "SELECT id FROM emp WHERE sal = ANY (SELECT sal FROM emp)",
+             "SELECT id FROM emp WHERE sal < ANY (ARRAY[1, 2, 3])",
+             "SELECT id FROM emp WHERE sal > ALL (ARRAY[1, 2, 3])",
+         }) {
+        db25::parser::Parser parser;
+        auto parsed = parser.parse(sql);
+        check(parsed.has_value(), std::string{"parse: "} + sql);
+        if (!parsed) continue;
+        Analyzer analyzer(cat);
+        analyzer.analyze(parsed.value());
+        check(!analyzer.has_errors(), std::string{"analyze clean: "} + sql);
+        Binder binder(analyzer, cat);
+        BindResult res = binder.bind(parsed.value());
+        check(res.ok, std::string{"binds: "} + sql + (res.ok ? "" : " -> " + res.error));
+        if (!res.ok) continue;
+        db25::plan::LogicalNodePtr once = db25::plan::optimize(std::move(res.root));
+        const std::string d1 = db25::plan::dump_plan(once.get());
+        db25::plan::LogicalNodePtr twice = db25::plan::optimize(std::move(once));
+        const std::string d2 = db25::plan::dump_plan(twice.get());
+        check(d1 == d2, std::string{"optimize is idempotent: "} + sql + "\n--1--\n" + d1 +
+                            "\n--2--\n" + d2);
+    }
+}
+
 }  // namespace
 
 int main() {
     const InMemoryCatalog cat = make_catalog();
+    test_quantified_comparison_optimizes_idempotently(cat);
 
     test_fold_integer_arithmetic(cat);
     test_fold_nested(cat);

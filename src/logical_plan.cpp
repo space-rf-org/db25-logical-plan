@@ -300,9 +300,10 @@ void dump_rec(const LogicalNode* n, int depth, std::string& out) {
         }
         out.append("SubPlan (");
         switch (sq->subquery_kind) {
-            case SubqueryKind::Scalar: out.append("scalar"); break;
-            case SubqueryKind::In:     out.append("IN"); break;
-            case SubqueryKind::Exists: out.append("EXISTS"); break;
+            case SubqueryKind::Scalar:     out.append("scalar"); break;
+            case SubqueryKind::In:         out.append("IN"); break;
+            case SubqueryKind::Exists:     out.append("EXISTS"); break;
+            case SubqueryKind::Quantified: out.append("quantified"); break;
         }
         out.append(sq->correlated ? ", correlated" : ", uncorrelated");
         out.append(")\n");

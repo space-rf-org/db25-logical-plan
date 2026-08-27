@@ -671,12 +671,13 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
             BinaryOp op{};
             if (!map_binary_op(n->primary_text, op)) {
                 if (is_quantified_comparison_text(n->primary_text)) {
-                    error = "quantified comparison (ALL / ANY / SOME) is not yet "
-                            "supported: '" + std::string{n->primary_text} + "'";
-                } else {
-                    error = "unrecognized binary operator '" +
-                            std::string{n->primary_text} + "'";
+                    // `x <cmp> ANY|ALL|SOME (rhs)`: the analyzer types this
+                    // Boolean and accepts it, so it MUST bind (analyzer-clean =>
+                    // bind-ok). Lower it rather than rejecting it here.
+                    return lower_quantified_comparison(n, input, error);
                 }
+                error = "unrecognized binary operator '" +
+                        std::string{n->primary_text} + "'";
                 return nullptr;
             }
             auto e = make_expr(ExprKind::BinaryOp, n);
@@ -1107,6 +1108,113 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
 // bind_query with `input` pushed as an enclosing schema so any correlated
 // reference the inner lowering encounters can resolve outward to an OuterRef.
 // ---------------------------------------------------------------------------
+ExprPtr Binder::lower_quantified_comparison(const ASTNode* n, const Schema& input,
+                                            std::string& error) {
+    const ASTNode* lhs = first_child(n);
+    const ASTNode* rhs = lhs != nullptr ? lhs->next_sibling : nullptr;
+    if (lhs == nullptr || rhs == nullptr) {
+        error = "quantified comparison is missing an operand";
+        return nullptr;
+    }
+
+    // Split "<cmp> ANY|ALL|SOME" into the comparison op and the quantifier. The
+    // parser packs them as one operator text; is_quantified_comparison_text has
+    // already confirmed the shape, so a trailing space is present.
+    const std::string_view text = n->primary_text;
+    const std::size_t sp = text.rfind(' ');
+    const std::string_view cmp_text = text.substr(0, sp);
+    const std::string quant = to_upper(text.substr(sp + 1));
+    const bool is_all = (quant == "ALL");  // ANY / SOME are the OR sense
+
+    BinaryOp cmp{};
+    if (!map_binary_op(cmp_text, cmp)) {
+        error = "unrecognized comparison operator in quantified comparison '" +
+                std::string{text} + "'";
+        return nullptr;
+    }
+
+    // The whole quantified comparison is Boolean; carry the analyzer's verdict.
+    const DataType type = analyzer_.type_of(n);
+    const auto nullability = static_cast<std::uint8_t>(analyzer_.nullability_of(n));
+
+    // ---- Subquery RHS: expr <cmp> ANY|ALL (SELECT ...) ------------------------
+    // Kept as a faithful Subquery Expr of kind Quantified (the optimizer's
+    // EXISTS/IN decorrelation deliberately does not touch it); the comparison op
+    // rides in bin_op and the ALL sense in ExprFlagQuantAll.
+    if (rhs->node_type == NodeType::Subquery || rhs->node_type == NodeType::SubqueryExpr) {
+        auto left = lower_expr(lhs, input, error);
+        if (!left) return nullptr;
+        auto e = lower_subquery(rhs, SubqueryKind::Quantified, /*negated=*/false,
+                                std::move(left), type, nullability, input, error);
+        if (!e) return nullptr;
+        e->bin_op = cmp;
+        if (is_all) {
+            e->expr_flags |= ExprFlagQuantAll;
+        }
+        return e;
+    }
+
+    // ---- Array / row RHS: expr <cmp> ANY|ALL (ARRAY[..] | (a, b, ..)) ---------
+    // Expand to an OR (ANY/SOME) or AND (ALL) fold of per-element comparisons.
+    // The left operand is re-lowered from its AST node per element, so no deep
+    // clone of the bound expression is needed.
+    if (rhs->node_type == NodeType::ArrayConstructor || rhs->node_type == NodeType::RowExpr) {
+        std::vector<const ASTNode*> elems;
+        for (const ASTNode* c = first_child(rhs); c != nullptr; c = c->next_sibling) {
+            elems.push_back(c);
+        }
+        if (elems.empty()) {
+            // Vacuous: `x <cmp> ANY (empty)` is FALSE; `x <cmp> ALL (empty)` is
+            // TRUE. A definite, never-NULL boolean.
+            auto lit = make_expr(ExprKind::Literal, n);
+            lit->type = DataType::Boolean;
+            lit->nullability = 1;  // not-null
+            lit->value.value = is_all;
+            return lit;
+        }
+        ExprPtr acc;
+        for (const ASTNode* elem : elems) {
+            auto l = lower_expr(lhs, input, error);
+            if (!l) return nullptr;
+            auto r = lower_expr(elem, input, error);
+            if (!r) return nullptr;
+            auto cmp_node = make_expr(ExprKind::BinaryOp, n);
+            cmp_node->type = DataType::Boolean;
+            cmp_node->nullability = nullability;
+            cmp_node->bin_op = cmp;
+            cmp_node->children.push_back(std::move(l));
+            cmp_node->children.push_back(std::move(r));
+            if (!acc) {
+                acc = std::move(cmp_node);
+                continue;
+            }
+            auto fold = make_expr(ExprKind::BinaryOp, n);
+            fold->type = DataType::Boolean;
+            fold->nullability = nullability;
+            fold->bin_op = is_all ? BinaryOp::And : BinaryOp::Or;
+            fold->children.push_back(std::move(acc));
+            fold->children.push_back(std::move(cmp_node));
+            acc = std::move(fold);
+        }
+        return acc;
+    }
+
+    // ---- Any other single-expression RHS -------------------------------------
+    // A non-subquery, non-array scalar operand (e.g. a parenthesized value the
+    // analyzer accepted). `x <cmp> ANY|ALL (scalar)` is just `x <cmp> scalar`.
+    auto l = lower_expr(lhs, input, error);
+    if (!l) return nullptr;
+    auto r = lower_expr(rhs, input, error);
+    if (!r) return nullptr;
+    auto e = make_expr(ExprKind::BinaryOp, n);
+    e->type = DataType::Boolean;
+    e->nullability = nullability;
+    e->bin_op = cmp;
+    e->children.push_back(std::move(l));
+    e->children.push_back(std::move(r));
+    return e;
+}
+
 ExprPtr Binder::lower_subquery(const ASTNode* subquery, SubqueryKind kind, bool negated,
                                ExprPtr left, DataType type, std::uint8_t nullability,
                                const Schema& input, std::string& error) {
