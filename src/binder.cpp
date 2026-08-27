@@ -9,11 +9,14 @@
 #include "db25/plan/identifier.hpp"       // iequals: case-insensitive name matching
 #include "db25/semantic/ast_helpers.hpp"  // first_child / find_child / alias_of / split_column_ref
 
+#include <algorithm>
 #include <charconv>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace db25::plan {
 
@@ -2330,21 +2333,36 @@ bool Binder::lower_projection(const ASTNode* select_list, const LogicalNode* chi
             // hidden bit only excludes the redundant merged-side copy from an
             // unqualified `*`, but `q.*` names the relation explicitly, so
             // Postgres expands it to ALL of q's columns (the join column
-            // included). The hidden copy sits in q's natural column position in
-            // the frame, so order still aligns with the analyzer's `q.*`.
+            // included).
+            //
+            // Emit q's columns in q's NATURAL (catalog) order - by column_id -
+            // NOT in frame order. Frame order is unreliable: a RIGHT/FULL
+            // USING/NATURAL merge HOISTS q's copy of the merged column up to the
+            // left merge position, so a non-merged column of q can precede it in
+            // the frame even though it FOLLOWS in q's catalog order (e.g. for
+            // s3(c, jid, d) USING (jid), s3.jid lands before s3.c/s3.d in the
+            // frame). The analyzer expands `q.*` in catalog order, so ordering
+            // the matched slots by column_id keeps the projection expressions
+            // aligned 1:1 with the analyzer's output columns; a stable sort keeps
+            // frame order for any ties (e.g. computed columns with column_id 0).
             const std::string_view tbl = split_column_ref(star_qual).column;
-            std::size_t matched = 0;
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> hits;  // (column_id, slot)
             for (std::size_t s = 0; s < input.size(); ++s) {
                 if (!iequals(input[s].alias, tbl)) {
                     continue;
                 }
-                out.push_back(make_column_ref(static_cast<std::uint32_t>(s), input[s]));
-                ++matched;
+                hits.emplace_back(input[s].column_id, static_cast<std::uint32_t>(s));
             }
-            if (matched == 0) {
+            if (hits.empty()) {
                 error = "qualified '" + std::string{star_qual} +
                         ".*' matches no relation in the FROM clause";
                 return false;
+            }
+            std::stable_sort(hits.begin(), hits.end(),
+                             [](const auto& a, const auto& b) { return a.first < b.first; });
+            for (const auto& [cid, slot] : hits) {
+                (void)cid;
+                out.push_back(make_column_ref(slot, input[slot]));
             }
             continue;
         }

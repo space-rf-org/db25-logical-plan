@@ -65,6 +65,21 @@ InMemoryCatalog make_catalog() {
         {"a", DataType::Integer, true},
         {"b", DataType::VarChar, true},
     });
+    // Two tables whose shared USING column (jid) is NOT the first column, so a
+    // RIGHT/FULL merge that hoists the right side's jid copy to the left merge
+    // position breaks the right relation's natural column contiguity in the
+    // frame. Distinct per-column types make an expr<->slot transposition
+    // observable (a mis-slotted `c` would carry Integer instead of Double).
+    cat.add_table("t3", {
+        {"a", DataType::Integer, true},
+        {"jid", DataType::Integer, false},
+        {"b", DataType::VarChar, true},
+    });
+    cat.add_table("s3", {
+        {"c", DataType::Double, true},
+        {"jid", DataType::Integer, false},
+        {"d", DataType::VarChar, true},
+    });
     return cat;
 }
 
@@ -2074,6 +2089,52 @@ void test_qualified_star_right_side_over_using(const InMemoryCatalog& cat) {
     });
 }
 
+// A qualified `q.*` over a RIGHT/FULL USING/NATURAL join must expand q's
+// columns in q's NATURAL (catalog) order, each projection expr reading its own
+// slot - even when a RIGHT/FULL merge hoists q's copy of the merged column out
+// of its natural frame position. s3(c, jid, d) USING (jid): s3.jid is hoisted
+// to the left merge slot, so a frame-order expansion would emit [jid, c, d]
+// while the analyzer's output is [c, jid, d] - transposing every column's
+// value/type. The expression types must line up with the output types.
+void test_qualified_star_right_full_merge_order(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT s3.* FROM t3 RIGHT/FULL JOIN s3 USING (jid) -> natural order\n");
+    auto check_s3_star = [](const LogicalNode* root, const char* what) {
+        check(root->output.size() == 3, std::string{what} + ": s3.* -> 3 cols");
+        if (root->output.size() != 3 || root->exprs.size() != 3) {
+            check(false, std::string{what} + ": expected 3 output cols and 3 exprs");
+            return;
+        }
+        // Output columns in s3's catalog order: c (Double), jid (Integer), d (VarChar).
+        check(root->output[0].name == "c" && root->output[1].name == "jid" &&
+                  root->output[2].name == "d",
+              std::string{what} + ": names in natural order c, jid, d");
+        // Each projection expr must carry ITS OWN column's type - proof the expr
+        // reads the correct slot rather than a transposed one.
+        check(root->exprs[0] && root->exprs[0]->type == DataType::Double,
+              std::string{what} + ": expr[0] (c) reads a Double slot");
+        check(root->exprs[1] && root->exprs[1]->type == DataType::Integer,
+              std::string{what} + ": expr[1] (jid) reads an Integer slot");
+        check(root->exprs[2] && root->exprs[2]->type == DataType::VarChar,
+              std::string{what} + ": expr[2] (d) reads a VarChar slot");
+        // c is DOUBLE NULL; a transposition would copy jid's NOT-NULL flag onto it.
+        check(root->output[0].nullable, std::string{what} + ": c stays nullable");
+    };
+    with_plan(cat, "SELECT s3.* FROM t3 RIGHT JOIN s3 USING (jid)",
+              [&](const LogicalNode* root) { check_s3_star(root, "RIGHT"); });
+    with_plan(cat, "SELECT s3.* FROM t3 FULL JOIN s3 USING (jid)",
+              [&](const LogicalNode* root) { check_s3_star(root, "FULL"); });
+    // The left relation's star stays correct over RIGHT/FULL as well.
+    with_plan(cat, "SELECT t3.* FROM t3 RIGHT JOIN s3 USING (jid)",
+              [](const LogicalNode* root) {
+        check(root->output.size() == 3, "t3.* over RIGHT -> 3 cols");
+        if (root->output.size() == 3) {
+            check(root->output[0].name == "a" && root->output[1].name == "jid" &&
+                      root->output[2].name == "b",
+                  "t3.* natural order a, jid, b");
+        }
+    });
+}
+
 // -------------------------------------------------------------------------
 // Derived tables / subqueries in FROM.
 
@@ -3701,6 +3762,7 @@ int main() {
     test_select_star_over_using(cat);
     test_qualified_star_over_join_expands(cat);
     test_qualified_star_right_side_over_using(cat);
+    test_qualified_star_right_full_merge_order(cat);
     test_derived_table(cat);
     test_derived_self_join(cat);
     test_cte(cat);
