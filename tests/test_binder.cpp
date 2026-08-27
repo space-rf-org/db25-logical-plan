@@ -3996,38 +3996,74 @@ void test_aggregate_alias_collides_with_base_column(const InMemoryCatalog& cat) 
     }
 }
 
-// A quantified comparison `x <cmp> ALL|ANY|SOME (subquery)` is typed Boolean by
-// the analyzer, but the binder does not yet lower it. It must be rejected with a
-// SPECIFIC "not yet supported" message, not the generic "unrecognized binary
-// operator" (which wrongly implies a malformed / typo'd operator).
-void test_quantified_comparison_rejected_clearly(const InMemoryCatalog& cat) {
-    std::printf("[test] quantified comparison rejected with a specific message\n");
-    const char* forms[] = {
+// A quantified comparison `x <cmp> ALL|ANY|SOME (rhs)` is typed Boolean by the
+// analyzer and accepted clean, so it MUST bind (analyzer-clean => bind-ok). The
+// subquery RHS lowers to a faithful Quantified subquery expr (the comparison op
+// in bin_op, the ALL/ANY sense in ExprFlagQuantAll; not decorrelated); the
+// array RHS expands to an OR (ANY/SOME) or AND (ALL) fold of per-element
+// comparisons.
+void test_quantified_comparison_lowers(const InMemoryCatalog& cat) {
+    std::printf("[test] quantified comparison lowers (analyzer-clean => bind-ok)\n");
+
+    // Subquery RHS: ANY / ALL / SOME all bind and carry a Quantified subquery.
+    const char* subq[] = {
         "SELECT id FROM emp WHERE sal > ALL (SELECT sal FROM emp)",
         "SELECT id FROM emp WHERE sal > ANY (SELECT sal FROM emp)",
         "SELECT id FROM emp WHERE sal = SOME (SELECT sal FROM emp)",
     };
-    for (const char* sql : forms) {
+    for (const char* sql : subq) {
+        with_plan(cat, sql, [&](const LogicalNode* root) {
+            const std::string d = dump_plan(root);
+            check(d.find("uantified") != std::string::npos,
+                  std::string{"subquery quantified comparison lowered: "} + sql + "\n" + d);
+        });
+    }
+
+    // Array RHS: ANY folds to OR, ALL folds to AND, over per-element comparisons.
+    with_plan(cat, "SELECT id FROM emp WHERE sal < ANY (ARRAY[1, 2, 3])",
+              [&](const LogicalNode* root) {
+                  const std::string d = dump_plan(root);
+                  check(d.find(" OR ") != std::string::npos,
+                        std::string{"ANY over an array folds to OR:\n"} + d);
+              });
+    with_plan(cat, "SELECT id FROM emp WHERE sal > ALL (ARRAY[1, 2, 3])",
+              [&](const LogicalNode* root) {
+                  const std::string d = dump_plan(root);
+                  check(d.find(" AND ") != std::string::npos,
+                        std::string{"ALL over an array folds to AND:\n"} + d);
+              });
+
+    // Every position the analyzer accepts a quantified comparison must bind:
+    // WHERE, HAVING, the SELECT list, and inside a CASE WHEN, over both a
+    // subquery and an array RHS.
+    for (const char* sql : {
+             "SELECT id FROM emp WHERE sal > ALL (SELECT sal FROM emp)",
+             "SELECT id FROM emp WHERE sal < ANY (ARRAY[1, 2, 3])",
+             "SELECT dept FROM emp GROUP BY dept HAVING MAX(sal) > ANY (SELECT sal FROM emp)",
+             "SELECT sal > ALL (ARRAY[1, 2]) FROM emp",
+             "SELECT CASE WHEN sal = ANY (ARRAY[1, 2]) THEN 1 ELSE 0 END FROM emp",
+             "SELECT id FROM emp WHERE sal <> ALL (SELECT sal FROM emp)",
+         }) {
         db25::parser::Parser parser;
         auto parsed = parser.parse(sql);
         check(parsed.has_value(), std::string{"parse: "} + sql);
         if (!parsed) continue;
         Analyzer analyzer(cat);
         analyzer.analyze(parsed.value());
+        check(!analyzer.has_errors(), std::string{"analyze clean: "} + sql);
         Binder binder(analyzer, cat);
         BindResult res = binder.bind(parsed.value());
-        check(!res.ok, std::string{"quantified comparison must not bind: "} + sql);
-        check(res.error.find("quantified comparison") != std::string::npos,
-              std::string{"error names the unsupported feature, not a generic "
-                          "'unrecognized binary operator': "} + res.error);
+        check(res.ok, std::string{"quantified comparison binds: "} + sql +
+                          (res.ok ? "" : " -> " + res.error));
     }
+
 }
 
 int main() {
     const InMemoryCatalog cat = make_catalog();
     test_chained_using_natural_single_merged_column(cat);
     test_aggregate_alias_collides_with_base_column(cat);
-    test_quantified_comparison_rejected_clearly(cat);
+    test_quantified_comparison_lowers(cat);
 
     test_scan_filter_project_limit(cat);
     test_derived_table_column_alias(cat);

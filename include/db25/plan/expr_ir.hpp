@@ -76,6 +76,9 @@ enum class ExprKind : std::uint8_t {
 enum ExprFlags : std::uint16_t {
     ExprFlagNegated = 0x0001,  // NOT LIKE / IS NOT NULL / NOT IN / NOT EXISTS
     ExprFlagCaseInsensitive = 0x0002,  // ILIKE (case-insensitive Like)
+    // On a Subquery of kind Quantified: set = ALL, clear = ANY/SOME. The
+    // comparison operator itself is carried in Expr::bin_op.
+    ExprFlagQuantAll = 0x0004,
 };
 
 // The target of a BooleanTest (IS [NOT] TRUE / FALSE / UNKNOWN). The IS NOT
@@ -193,6 +196,12 @@ struct Expr {
     // Case-insensitive Like (ILIKE). Only meaningful on ExprKind::Like.
     [[nodiscard]] bool case_insensitive() const noexcept {
         return (expr_flags & ExprFlagCaseInsensitive) != 0;
+    }
+
+    // ALL (vs ANY/SOME) sense of a quantified comparison. Only meaningful on a
+    // Subquery of kind Quantified.
+    [[nodiscard]] bool quant_all() const noexcept {
+        return (expr_flags & ExprFlagQuantAll) != 0;
     }
 
     // ----- Checked accessors -----

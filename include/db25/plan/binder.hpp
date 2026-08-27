@@ -221,6 +221,16 @@ private:
                                          db25::ast::DataType type, std::uint8_t nullability,
                                          const Schema& input, std::string& error);
 
+    // Lower a quantified comparison `x <cmp> ANY|ALL|SOME (rhs)` (which the parser
+    // packs into one BinaryExpr whose op text is e.g. "= ANY" / "< ALL"). The
+    // array / row RHS form folds to an OR (ANY/SOME) or AND (ALL) of per-element
+    // comparisons; the subquery RHS form becomes a Subquery Expr of kind
+    // Quantified carrying the comparison op in bin_op and the ALL sense in the
+    // ExprFlagQuantAll flag. Returns null on failure.
+    [[nodiscard]] ExprPtr lower_quantified_comparison(const db25::ast::ASTNode* n,
+                                                      const Schema& input,
+                                                      std::string& error);
+
     // Lower an AST WindowSpec (the OVER (...) clause) into an owned WindowSpecIR.
     [[nodiscard]] bool lower_window_spec(const db25::ast::ASTNode* window_spec,
                                          const Schema& input, WindowSpecIR& out,

@@ -234,10 +234,18 @@ void render(const Expr& e, std::string& out) {
             return;
         }
         case ExprKind::Subquery: {
-            const char* k = e.subquery_kind == SubqueryKind::Scalar  ? "SCALAR"
-                            : e.subquery_kind == SubqueryKind::In     ? "IN"
-                                                                      : "EXISTS";
-            out += std::string{"Subquery["} + k;
+            out += "Subquery[";
+            switch (e.subquery_kind) {
+                case SubqueryKind::Scalar: out += "SCALAR"; break;
+                case SubqueryKind::In:     out += "IN"; break;
+                case SubqueryKind::Exists: out += "EXISTS"; break;
+                case SubqueryKind::Quantified:
+                    // QUANTIFIED:<cmp>:<ANY|ALL> so the op and sense are visible.
+                    out += "QUANTIFIED:";
+                    out += binop_text(e.bin_op);
+                    out += e.quant_all() ? ":ALL" : ":ANY";
+                    break;
+            }
             if (e.correlated) {
                 out += ",correlated";
             }

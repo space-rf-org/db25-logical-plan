@@ -130,9 +130,12 @@ struct Assignment {
 // ExprKind::Subquery node (see expr_ir.hpp), which owns its bound inner plan
 // inline; there is no separate borrowed subquery payload on a LogicalNode.
 enum class SubqueryKind : std::uint8_t {
-    Scalar,  // a scalar subquery: (SELECT ...) yielding a single value
-    In,      // expr IN (SELECT ...)
-    Exists,  // [NOT] EXISTS (SELECT ...)
+    Scalar,     // a scalar subquery: (SELECT ...) yielding a single value
+    In,         // expr IN (SELECT ...)
+    Exists,     // [NOT] EXISTS (SELECT ...)
+    Quantified, // expr <cmp> ANY|ALL|SOME (SELECT ...): the comparison op is
+                // carried in Expr::bin_op and the ANY/ALL sense in the
+                // ExprFlagQuantAll flag (set = ALL; clear = ANY/SOME).
 };
 
 // INSERT ... ON CONFLICT action carried on an Insert node.
