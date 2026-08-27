@@ -2324,10 +2324,18 @@ bool Binder::lower_projection(const ASTNode* select_list, const LogicalNode* chi
             // preserving child order so the expansion aligns with the analyzer's
             // projection for that star. This binds `SELECT u.* FROM a JOIN b`
             // to exactly u's columns instead of the whole join frame.
+            //
+            // Unlike a bare `*`, a qualified `q.*` DOES include q's copy of a
+            // USING/NATURAL merged column even though that copy is HIDDEN: the
+            // hidden bit only excludes the redundant merged-side copy from an
+            // unqualified `*`, but `q.*` names the relation explicitly, so
+            // Postgres expands it to ALL of q's columns (the join column
+            // included). The hidden copy sits in q's natural column position in
+            // the frame, so order still aligns with the analyzer's `q.*`.
             const std::string_view tbl = split_column_ref(star_qual).column;
             std::size_t matched = 0;
             for (std::size_t s = 0; s < input.size(); ++s) {
-                if (input[s].hidden || !iequals(input[s].alias, tbl)) {
+                if (!iequals(input[s].alias, tbl)) {
                     continue;
                 }
                 out.push_back(make_column_ref(static_cast<std::uint32_t>(s), input[s]));

@@ -2040,6 +2040,40 @@ void test_qualified_star_over_join_expands(const InMemoryCatalog& cat) {
     }
 }
 
+// A qualified `q.*` over a USING / NATURAL join must include q's copy of the
+// merged join column, even though that copy is HIDDEN (the hidden bit only
+// removes the redundant merged-side copy from an UNqualified `*`). Postgres
+// expands `o.*` to ALL of o's columns, join column included. Previously the
+// qualified-star branch skipped hidden columns, so `o.*` dropped o.id and the
+// projection-arity guard aborted the bind of this legal query.
+void test_qualified_star_right_side_over_using(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT o.* FROM users u JOIN orders o USING (id) -> o's 3 cols\n");
+    // orders(id, user_id, total): o.id is the HIDDEN merged-right copy; o.* must
+    // still project all three of o's columns, in o's natural order.
+    with_plan(cat, "SELECT o.* FROM users u JOIN orders o USING (id)",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "right-side star: root is Project");
+        check(root->output.size() == 3, "o.* over USING expands to o's 3 cols");
+        if (root->output.size() == 3) {
+            check(root->output[0].name == "id", "o.* col[0] is o.id (merged copy)");
+            check(root->output[1].name == "user_id", "o.* col[1] is o.user_id");
+            check(root->output[2].name == "total", "o.* col[2] is o.total");
+        }
+        check(root->exprs.size() == 3, "o.* lowers to 3 column-ref exprs");
+    });
+
+    // The left-side star still yields exactly u's two columns (u owns the
+    // VISIBLE merged id), and a NATURAL join behaves the same as USING (id).
+    with_plan(cat, "SELECT u.* FROM users u JOIN orders o USING (id)",
+              [](const LogicalNode* root) {
+        check(root->output.size() == 2, "u.* over USING expands to u's 2 cols");
+    });
+    with_plan(cat, "SELECT o.* FROM users u NATURAL JOIN orders o",
+              [](const LogicalNode* root) {
+        check(root->output.size() == 3, "o.* over NATURAL JOIN expands to o's 3 cols");
+    });
+}
+
 // -------------------------------------------------------------------------
 // Derived tables / subqueries in FROM.
 
@@ -3666,6 +3700,7 @@ int main() {
     test_join_using_multi(cat);
     test_select_star_over_using(cat);
     test_qualified_star_over_join_expands(cat);
+    test_qualified_star_right_side_over_using(cat);
     test_derived_table(cat);
     test_derived_self_join(cat);
     test_cte(cat);
