@@ -2004,23 +2004,40 @@ void test_select_star_over_using(const InMemoryCatalog& cat) {
 }
 
 // A QUALIFIED `t.*` over a join is NOT a whole-child star: it must resolve to
-// only t's columns. That table-scoped expansion is not yet lowered, so the bind
-// must fail CLEANLY rather than silently project the whole join frame. Guards
-// the bare-star fast path against swallowing a qualified star (whose qualifier
-// lives in the Star node's schema_name, not its primary_text "*").
-void test_qualified_star_over_join_rejected(const InMemoryCatalog& cat) {
-    std::printf("[test] SELECT u.* FROM users u JOIN orders o USING (id) (rejected)\n");
+// ONLY t's columns, not the whole join frame. The qualifier lives in the Star
+// node's schema_name (its primary_text is always "*"), so table-scoped
+// expansion matches each child column's relation alias against the qualifier.
+void test_qualified_star_over_join_expands(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT u.* FROM users u JOIN orders o -> only u's cols\n");
+    // Plain ON join: the child frame is [u.id, u.name, o.id, o.user_id,
+    // o.total]; `u.*` must project exactly u's two columns (slots 0, 1).
+    with_plan(cat, "SELECT u.* FROM users u INNER JOIN orders o ON u.id = o.user_id",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "qualified star: root is Project");
+        check(root->output.size() == 2, "qualified star expands to u's 2 cols");
+        check(root->exprs.size() == 2, "qualified star lowers to 2 column-ref exprs");
+        if (root->output.size() == 2) {
+            check(root->output[0].name == "id", "qualified star col[0] is u.id");
+            check(root->output[1].name == "name", "qualified star col[1] is u.name");
+        }
+        if (root->exprs.size() == 2) {
+            expect_col_ref(root->exprs[0], 0, "qualified star expr[0] -> slot 0");
+            expect_col_ref(root->exprs[1], 1, "qualified star expr[1] -> slot 1");
+        }
+    });
+
+    // A qualifier that names no relation in the FROM clause fails cleanly
+    // rather than silently projecting nothing or the whole frame.
     db25::parser::Parser parser;
-    auto parsed = parser.parse("SELECT u.* FROM users u JOIN orders o USING (id)");
-    check(parsed.has_value(), "parse qualified star over join");
-    if (!parsed) {
-        return;
+    auto parsed = parser.parse("SELECT bogus.* FROM users u INNER JOIN orders o ON u.id = o.user_id");
+    check(parsed.has_value(), "parse qualified star with unknown qualifier");
+    if (parsed) {
+        Analyzer analyzer(cat);
+        analyzer.analyze(parsed.value());
+        Binder binder(analyzer, cat);
+        BindResult res = binder.bind(parsed.value());
+        check(!res.ok, "bind rejects q.* whose q matches no relation");
     }
-    Analyzer analyzer(cat);
-    analyzer.analyze(parsed.value());
-    Binder binder(analyzer, cat);
-    BindResult res = binder.bind(parsed.value());
-    check(!res.ok, "bind rejects qualified t.* over a join (not silently full frame)");
 }
 
 // -------------------------------------------------------------------------
@@ -3648,7 +3665,7 @@ int main() {
     test_order_by_qualified_null_side_right_join(cat);
     test_join_using_multi(cat);
     test_select_star_over_using(cat);
-    test_qualified_star_over_join_rejected(cat);
+    test_qualified_star_over_join_expands(cat);
     test_derived_table(cat);
     test_derived_self_join(cat);
     test_cte(cat);

@@ -2303,20 +2303,40 @@ bool Binder::lower_projection(const ASTNode* select_list, const LogicalNode* chi
     for (const ASTNode* item = first_child(select_list); item != nullptr;
          item = item->next_sibling) {
         if (item->node_type == NodeType::Star) {
-            // Only an unqualified whole-child `*` is supported: expand to one
-            // positional ColumnRef per child output column. A qualified `t.*`
-            // covers a subset and needs table-scoped expansion (TODO); fail
-            // loudly rather than emit a wrong-arity projection.
-            const std::string_view qual = split_column_ref(item->primary_text).qualifier;
-            if (!qual.empty()) {
-                error = "qualified '" + std::string{qual} + ".*' projection not yet lowered";
-                return false;
+            // A Star stores its qualifier in schema_name as the dotted prefix
+            // ("t" or "schema.table"); its primary_text is always "*", so the
+            // qualifier must be read from schema_name - NOT from primary_text,
+            // whose split is always unqualified.
+            const std::string_view star_qual = item->schema_name;
+            if (star_qual.empty()) {
+                // Bare `*`: expand to one positional ColumnRef per visible child
+                // output column (a hidden merged-right copy is not part of `*`).
+                for (std::size_t s = 0; s < input.size(); ++s) {
+                    if (input[s].hidden) {
+                        continue;
+                    }
+                    out.push_back(make_column_ref(static_cast<std::uint32_t>(s), input[s]));
+                }
+                continue;
             }
+            // Qualified `q.*`: expand only the child columns whose relation alias
+            // matches the qualifier's table component (the last dotted part),
+            // preserving child order so the expansion aligns with the analyzer's
+            // projection for that star. This binds `SELECT u.* FROM a JOIN b`
+            // to exactly u's columns instead of the whole join frame.
+            const std::string_view tbl = split_column_ref(star_qual).column;
+            std::size_t matched = 0;
             for (std::size_t s = 0; s < input.size(); ++s) {
-                if (input[s].hidden) {
-                    continue;  // a hidden merged-right copy is not part of `*`
+                if (input[s].hidden || !iequals(input[s].alias, tbl)) {
+                    continue;
                 }
                 out.push_back(make_column_ref(static_cast<std::uint32_t>(s), input[s]));
+                ++matched;
+            }
+            if (matched == 0) {
+                error = "qualified '" + std::string{star_qual} +
+                        ".*' matches no relation in the FROM clause";
+                return false;
             }
             continue;
         }
