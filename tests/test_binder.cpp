@@ -1241,6 +1241,30 @@ void test_order_by_aggregate_not_selected(const InMemoryCatalog& cat) {
     });
 }
 
+// A statement-level ORDER BY whose key is an aggregate ALSO selected must dedup
+// to the ONE aggregate producer even when the ORDER BY carries a direction (DESC)
+// or NULLS ordering. Those bits belong to the Sort node, not the aggregate's
+// identity - the ordered-aggregate ordering guard (scoped to an aggregate's OWN
+// argument-list ORDER BY) must not split a statement ORDER BY aggregate from its
+// SELECT twin, or a redundant second aggregate column is emitted.
+void test_order_by_selected_aggregate_direction_dedups(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT dept, sum(sal) ... ORDER BY sum(sal) DESC (dedups)\n");
+    for (const char* sql : {
+            "SELECT dept, sum(sal) FROM emp GROUP BY dept ORDER BY sum(sal) DESC",
+            "SELECT dept, sum(sal) FROM emp GROUP BY dept ORDER BY sum(sal) ASC NULLS FIRST",
+            "SELECT dept, count(*) FROM emp GROUP BY dept ORDER BY count(*) DESC"}) {
+        with_plan(cat, sql, [](const LogicalNode* root) {
+            // Sort -> Project -> Aggregate -> Scan.
+            check(root->op == LogicalOp::Sort, "root is Sort");
+            const LogicalNode* project = only_child(root);
+            const LogicalNode* agg = project ? only_child(project) : nullptr;
+            check(agg && agg->op == LogicalOp::Aggregate, "has an Aggregate");
+            check(agg && agg->aggregates.size() == 1,
+                  "ORDER BY <agg> DESC dedups to the SELECT aggregate (one producer)");
+        });
+    }
+}
+
 // -------------------------------------------------------------------------
 // SELECT DISTINCT: a Distinct node directly above the Project.
 
@@ -3595,6 +3619,7 @@ int main() {
     test_having_aggregate_not_selected(cat);
     test_having_aggregate_aliased(cat);
     test_order_by_aggregate_not_selected(cat);
+    test_order_by_selected_aggregate_direction_dedups(cat);
     test_distinct(cat);
     test_select_star(cat);
     test_order_by(cat);
