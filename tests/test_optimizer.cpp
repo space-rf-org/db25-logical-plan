@@ -427,6 +427,36 @@ void test_decorrelate_exists_in_conjunction(const InMemoryCatalog& cat) {
     });
 }
 
+// A subquery that becomes a top-level conjunct only AFTER boolean simplification
+// (a dead `OR 3 = 5`, or a double negation) must still be decorrelated in a
+// SINGLE optimize() pass. decorrelate_node splits only AND, so the subquery is
+// hidden until fold (`3=5` -> false) and simplify (`IN OR false` -> `IN`) reduce
+// the predicate; running fold/simplify before decorrelation exposes it in the
+// same pass, so optimize(optimize(p)) == optimize(p) (previously it decorrelated
+// only on the SECOND pass - a non-idempotence).
+void test_decorrelate_subquery_exposed_by_simplify(const InMemoryCatalog& cat) {
+    std::printf("[test] WHERE IN (subquery) OR 3=5 -> SemiJoin in ONE pass (idempotent)\n");
+    with_optimized_plan(
+        cat,
+        "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders) OR 3 = 5",
+        [](const LogicalNode* root) {
+        check(find_op(root, LogicalOp::SemiJoin) != nullptr,
+              "IN subquery behind `OR 3=5` decorrelates to a SemiJoin in one pass");
+        check(!any_represented_subquery(root),
+              "no represented subquery remains after a single optimize()");
+    });
+    // Double-negation hiding the subquery reduces the same way.
+    with_optimized_plan(
+        cat,
+        "SELECT id FROM users WHERE NOT (NOT (id IN (SELECT user_id FROM orders)))",
+        [](const LogicalNode* root) {
+        check(find_op(root, LogicalOp::SemiJoin) != nullptr,
+              "IN subquery behind double negation decorrelates in one pass");
+        check(!any_represented_subquery(root),
+              "no represented subquery remains (double-negation case)");
+    });
+}
+
 // A column read by nobody is dropped from the Scan.
 void test_prune_single_table(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT id FROM users  (name pruned from scan)\n");
@@ -1082,6 +1112,7 @@ int main() {
     test_distinct_keeps_all_columns(cat);
     test_decorrelate_exists(cat);
     test_decorrelate_exists_in_conjunction(cat);
+    test_decorrelate_subquery_exposed_by_simplify(cat);
     test_decorrelate_not_exists(cat);
     test_decorrelate_exists_uncorrelated(cat);
     test_no_decorrelate_skip_level_correlation(cat);
