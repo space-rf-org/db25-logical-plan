@@ -1099,6 +1099,51 @@ void test_star_over_aggregate_order(const InMemoryCatalog& cat) {
     });
 }
 
+// `SELECT *` over a SELF-JOIN Aggregate with a reordered GROUP BY. The two
+// instances' copies of a base column (e1.dept, e2.dept) share (table_id,
+// column_id) AND name, so a name-only reorder tie-break cannot tell them apart
+// and maps every `*` column to the first same-identity child slot (group-key
+// order) while the output labels are in relation order - silently transposing
+// the two relation blocks (an e1-labeled output column fed e2's value). The
+// tie-break must disambiguate by relation INSTANCE (alias), which the child
+// slots and the analyzer projection both carry.
+void test_star_over_selfjoin_aggregate(const InMemoryCatalog& cat) {
+    std::printf("[test] SELECT * over a self-join Aggregate keeps each instance's slot\n");
+    // GROUP BY lists e2's columns first, so the Aggregate output is group-key
+    // order [e2.id, e2.dept, e2.sal, e1.id, e1.dept, e1.sal] (slots 0..5), while
+    // `*` must be relation order [e1.id, e1.dept, e1.sal, e2.id, e2.dept, e2.sal].
+    with_plan(cat,
+              "SELECT * FROM emp e1 JOIN emp e2 ON e1.id = e2.id "
+              "GROUP BY e2.id, e2.dept, e2.sal, e1.id, e1.dept, e1.sal",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Project, "sj-star: root is Project");
+        check(root->output.size() == 6 && root->exprs.size() == 6,
+              "sj-star: 6 output columns / exprs");
+        if (root->output.size() == 6) {
+            // Output is in relation order and each column is labeled with its own
+            // instance alias.
+            const char* names[] = {"id", "dept", "sal", "id", "dept", "sal"};
+            const char* inst[]  = {"e1", "e1", "e1", "e2", "e2", "e2"};
+            for (std::size_t i = 0; i < 6; ++i) {
+                check(root->output[i].name == names[i],
+                      "sj-star: out[" + std::to_string(i) + "] name");
+                check(root->output[i].alias == inst[i],
+                      "sj-star: out[" + std::to_string(i) + "] instance " + inst[i]);
+            }
+        }
+        if (root->exprs.size() == 6) {
+            // e1 block -> the e1 group-key slots (3,4,5); e2 block -> (0,1,2).
+            // Before the fix the name-only tie-break produced the identity map
+            // 0..5, feeding e1-labeled outputs from e2's slots (transposition).
+            const std::uint32_t want[] = {3, 4, 5, 0, 1, 2};
+            for (std::size_t i = 0; i < 6; ++i) {
+                expect_col_ref(root->exprs[i], want[i],
+                               "sj-star: out[" + std::to_string(i) + "] -> its instance slot");
+            }
+        }
+    });
+}
+
 // The Aggregate output is group_keys ++ aggregates, independent of SELECT order.
 // `SELECT COUNT(*), dept` puts the aggregate first in the select list but the
 // Aggregate output is still [dept (key), COUNT (agg)]; the Project reorders it
@@ -3957,6 +4002,7 @@ int main() {
     test_group_by_positional(cat);
     test_group_by_positional_over_star(cat);
     test_star_over_aggregate_order(cat);
+    test_star_over_selfjoin_aggregate(cat);
     test_group_by_select_reordered(cat);
     test_group_by_same_name_aggregates(cat);
     test_self_join_group_key_distinct_slots(cat);
