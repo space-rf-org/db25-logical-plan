@@ -385,6 +385,41 @@ void test_string_keyword_functions(const InMemoryCatalog& cat) {
             expect_col(root->output[1], "s", DataType::Text, false, "SUBSTRING literal");
             expect_col(root->output[2], "t", DataType::Text, false, "TRIM literal");
         });
+
+    // TRIM's LEADING / TRAILING / BOTH direction must survive lowering: the three
+    // forms are semantically distinct (ltrim / rtrim / btrim), so their plans must
+    // differ. The direction is preserved as a synthetic leading string-literal
+    // argument (the parser records it in FunctionCall.semantic_flags bits 12-13,
+    // not as a child). Without this the three collapsed to one identical plan.
+    auto trim_spec = [&](std::string_view sql) -> std::string {
+        std::string found = "<none>";
+        with_plan(cat, sql, [&](const LogicalNode* root) {
+            const LogicalNode* proj =
+                (root->op == LogicalOp::Project) ? root : only_child(root);
+            if (!proj || proj->exprs.empty()) return;
+            const auto& e = proj->exprs[0];
+            if (!e || e->kind != ExprKind::ScalarFunction || e->func_name != "TRIM" ||
+                e->children.empty())
+                return;
+            const auto* s = std::get_if<std::string>(&e->children[0]->value.value);
+            if (e->children[0]->kind == ExprKind::Literal && s != nullptr &&
+                (*s == "LEADING" || *s == "TRAILING" || *s == "BOTH"))
+                found = *s;  // an explicit spec literal
+        });
+        return found;
+    };
+    check(trim_spec("SELECT TRIM(LEADING 'x' FROM name) FROM users") == "LEADING",
+          "TRIM LEADING spec preserved in plan");
+    check(trim_spec("SELECT TRIM(TRAILING 'x' FROM name) FROM users") == "TRAILING",
+          "TRIM TRAILING spec preserved in plan");
+    check(trim_spec("SELECT TRIM(BOTH 'x' FROM name) FROM users") == "BOTH",
+          "TRIM BOTH spec preserved in plan");
+    // Comma / single form carries no specifier (defaults to BOTH): no spec literal
+    // is prepended, so the first child is the value argument, not a direction.
+    check(trim_spec("SELECT TRIM(name) FROM users") == "<none>",
+          "TRIM(name) has no synthetic spec literal");
+    check(trim_spec("SELECT TRIM('x' FROM name) FROM users") == "<none>",
+          "TRIM(chars FROM str) without a keyword has no spec literal");
 }
 
 void test_scan_filter_project_limit(const InMemoryCatalog& cat) {
