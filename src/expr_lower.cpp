@@ -774,6 +774,29 @@ ExprPtr Binder::lower_expr(const ASTNode* n, const Schema& input, std::string& e
             e->nullability = nullability;
             e->func_name = uname;
             e->distinct = n->has_flag(ast::NodeFlags::Distinct);
+            // TRIM([LEADING|TRAILING|BOTH] [chars] FROM str): the direction
+            // specifier is recorded by the parser in FunctionCall.semantic_flags
+            // bits 12-13 (1=LEADING, 2=TRAILING, 3=BOTH), NOT as a child. Preserve
+            // it in the plan as a synthetic LEADING string-literal argument
+            // (mirroring EXTRACT's field keyword just below), so the three forms
+            // lower to DISTINCT plans that an executor can tell apart - without it
+            // LEADING / TRAILING / BOTH collapse to one identical plan and an
+            // executor computes BOTH for all three. The comma form / no specifier
+            // carries no bits and defaults to BOTH (no literal emitted).
+            if (uname == "TRIM") {
+                const unsigned spec = (n->semantic_flags >> 12) & 0x3u;
+                const char* kw = spec == 1 ? "LEADING"
+                               : spec == 2 ? "TRAILING"
+                               : spec == 3 ? "BOTH"
+                                           : nullptr;
+                if (kw != nullptr) {
+                    auto s = make_expr(ExprKind::Literal, n);
+                    s->type = ast::DataType::Text;
+                    s->nullability = 1;
+                    s->value.value = std::string(kw);
+                    e->children.push_back(std::move(s));
+                }
+            }
             // EXTRACT(field FROM ts) / DATE_PART(field, ts): the leading field is
             // a date-part keyword (YEAR, MONTH, ...) the parser emits as an
             // Identifier. Lower it as a string literal, not a column reference -
