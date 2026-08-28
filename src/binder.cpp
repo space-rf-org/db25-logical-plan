@@ -2304,9 +2304,10 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
 
 // ---------------------------------------------------------------------------
 // DML lowering. Each produces a dedicated logical node carrying the target
-// table plus the relevant child plan. Deeper semantics (RETURNING projections,
-// ON CONFLICT, multi-table UPDATE/DELETE, constraint checking) are left as
-// clearly-marked TODOs; the analyzer already validates the surface shapes.
+// table plus the relevant child plan. RETURNING projections and INSERT
+// ON CONFLICT are lowered here; multi-table UPDATE/DELETE and constraint
+// checking are left as clearly-marked TODOs; the analyzer already validates the
+// surface shapes.
 // ---------------------------------------------------------------------------
 
 LogicalNodePtr Binder::bind_insert(const ASTNode* insert_stmt, std::string& error) {
@@ -2544,10 +2545,8 @@ LogicalNodePtr Binder::bind_delete(const ASTNode* delete_stmt, std::string& erro
 // (a Star expands to every column; a bare column reference picks up that
 // column's type / nullability / ids; anything else is left Unknown-typed).
 //
-// NOTE: the build of the parser we consume drops the RETURNING clause for
-// INSERT (it emits no ReturningClause node), so only UPDATE / DELETE RETURNING
-// are represented end-to-end today. INSERT RETURNING is handled here too and
-// will light up automatically once the parser preserves it. TODO(parser).
+// Wired end-to-end for INSERT / UPDATE / DELETE alike: the parser preserves the
+// ReturningClause for all three, so each lowers to a Returning node here.
 // ---------------------------------------------------------------------------
 LogicalNodePtr Binder::wrap_returning(LogicalNodePtr dml, const ASTNode* stmt,
                                       std::string& error) {
