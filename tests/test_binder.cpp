@@ -338,6 +338,55 @@ void test_collate(const InMemoryCatalog& cat) {
     });
 }
 
+// SQL-standard keyword-argument string functions bind and type end to end:
+// POSITION(x IN y) -> Integer, SUBSTRING(s FROM a FOR b) / TRIM(... FROM s) ->
+// Text, with nullability following the string argument. They lower to ordinary
+// ScalarFunction expressions (the parser routes the keyword spelling to the same
+// FunctionCall node the analyzer already types by name), so no binder change was
+// needed - this pins that they flow through correctly.
+void test_string_keyword_functions(const InMemoryCatalog& cat) {
+    std::printf("[test] POSITION(x IN y) / SUBSTRING(s FROM a FOR b) / TRIM(spec FROM s)\n");
+
+    // Over the nullable `name` column: every result is nullable.
+    with_plan(cat,
+        "SELECT POSITION('@' IN name) AS p, "
+        "SUBSTRING(name FROM 1 FOR 3) AS s, "
+        "TRIM(BOTH ' ' FROM name) AS t FROM users",
+        [](const LogicalNode* root) {
+            check(root->output.size() == 3, "keyword-fn: three projected columns");
+            if (root->output.size() != 3) return;
+            expect_col(root->output[0], "p", DataType::Integer, true, "POSITION");
+            expect_col(root->output[1], "s", DataType::Text, true, "SUBSTRING");
+            expect_col(root->output[2], "t", DataType::Text, true, "TRIM");
+            const LogicalNode* proj =
+                (root->op == LogicalOp::Project) ? root : only_child(root);
+            if (proj && proj->exprs.size() == 3) {
+                check(proj->exprs[0]->kind == ExprKind::ScalarFunction &&
+                          proj->exprs[0]->func_name == "POSITION",
+                      "POSITION lowers to a ScalarFunction");
+                check(proj->exprs[1]->kind == ExprKind::ScalarFunction &&
+                          proj->exprs[1]->func_name == "SUBSTRING",
+                      "SUBSTRING lowers to a ScalarFunction");
+                check(proj->exprs[2]->kind == ExprKind::ScalarFunction &&
+                          proj->exprs[2]->func_name == "TRIM",
+                      "TRIM lowers to a ScalarFunction");
+            }
+        });
+
+    // All-literal arguments: results are NOT NULL. Confirms the TRIM spec and
+    // the FROM/FOR/IN operands do not spuriously introduce nullability.
+    with_plan(cat,
+        "SELECT POSITION('@' IN 'a@b') AS p, "
+        "SUBSTRING('hello' FROM 1 FOR 3) AS s, "
+        "TRIM(LEADING 'x' FROM 'xxhi') AS t FROM users",
+        [](const LogicalNode* root) {
+            if (root->output.size() != 3) { check(false, "literal keyword-fn: 3 cols"); return; }
+            expect_col(root->output[0], "p", DataType::Integer, false, "POSITION literal");
+            expect_col(root->output[1], "s", DataType::Text, false, "SUBSTRING literal");
+            expect_col(root->output[2], "t", DataType::Text, false, "TRIM literal");
+        });
+}
+
 void test_scan_filter_project_limit(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT id, name FROM users WHERE id = 1 LIMIT 10\n");
     with_plan(cat, "SELECT id, name FROM users WHERE id = 1 LIMIT 10",
@@ -4349,6 +4398,7 @@ int main() {
     test_cast_modifiers(cat);
     test_array_constructor(cat);
     test_collate(cat);
+    test_string_keyword_functions(cat);
     test_limit_offset(cat);
     test_values_query_primary(cat);
     test_inner_join(cat);
