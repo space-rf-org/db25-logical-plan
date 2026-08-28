@@ -147,6 +147,12 @@ const ASTNode* subquery_body(const ASTNode* node) {
             return c;
         }
     }
+    // A VALUES table-value-constructor is also a query body (a CTE body, a
+    // derived table, or a set-op branch). bind_query lowers it, so surfacing it
+    // here lets `WITH x AS (VALUES ...)` register and resolve like a SELECT CTE.
+    if (ASTNode* vals = find_child(node, NodeType::ValuesStmt)) {
+        return vals;
+    }
     return nullptr;
 }
 
@@ -1189,6 +1195,7 @@ BindResult Binder::bind(const ASTNode* stmt) {
         case NodeType::UnionStmt:
         case NodeType::IntersectStmt:
         case NodeType::ExceptStmt:
+        case NodeType::ValuesStmt:
             result.root = bind_query(stmt, result.error);
             break;
         case NodeType::InsertStmt:
@@ -1219,6 +1226,71 @@ LogicalNodePtr Binder::bind_query(const ASTNode* query, std::string& error) {
     if (is_setop_node(query->node_type)) {
         return bind_setop(query, error);
     }
+    // A VALUES table-value-constructor is a query primary in its own right - a
+    // top-level statement, a set-operation branch, or a CTE body - not only a
+    // FROM-derived table. Lower it to the same Values node bind_values_relation
+    // builds, then apply any trailing ORDER BY / LIMIT. Without this a top-level
+    // `VALUES (1,2),(3,4)` (analyzer-clean) failed to bind (invariant #1).
+    if (query->node_type == NodeType::ValuesStmt) {
+        auto current = bind_values_relation(query, error);
+        if (!current) {
+            return nullptr;
+        }
+        // Trailing ORDER BY over the (anonymous) value columns: positional
+        // `ORDER BY n` or an expression over them.
+        if (const ASTNode* order_by = find_child(query, NodeType::OrderByClause)) {
+            auto sort = make_node(LogicalOp::Sort);
+            // Each ORDER BY child IS the key expression; the parser records
+            // ASC/DESC in its semantic_flags (bit 7 = DESC).
+            for (const ASTNode* key = first_child(order_by); key != nullptr;
+                 key = key->next_sibling) {
+                SortKeyIR sk;
+                sk.descending = (key->semantic_flags & (1u << 7)) != 0;
+                std::int64_t ordinal = 0;
+                if (key->node_type == NodeType::IntegerLiteral &&
+                    parse_int_literal(key, ordinal)) {
+                    if (ordinal < 1 ||
+                        static_cast<std::size_t>(ordinal) > current->output.size()) {
+                        error = "ORDER BY ordinal " + std::to_string(ordinal) +
+                                " out of range";
+                        return nullptr;
+                    }
+                    sk.expr = make_column_ref(
+                        static_cast<std::uint32_t>(ordinal - 1),
+                        current->output[static_cast<std::size_t>(ordinal - 1)]);
+                } else {
+                    sk.expr = lower_expr(key, current->output, error);
+                    if (!sk.expr) {
+                        return nullptr;
+                    }
+                }
+                sort->sort_keys.push_back(std::move(sk));
+            }
+            sort->output = current->output;  // sort is schema-preserving
+            sort->add_child(std::move(current));
+            current = std::move(sort);
+        }
+        // Trailing LIMIT / OFFSET.
+        if (const ASTNode* limit = find_child(query, NodeType::LimitClause)) {
+            auto lim = make_node(LogicalOp::Limit);
+            const ASTNode* limit_op = first_child(limit);
+            const ASTNode* offset_op =
+                limit_op != nullptr ? limit_op->next_sibling : nullptr;
+            std::int64_t v = 0;
+            if (parse_int_literal(limit_op, v)) {
+                lim->has_limit = true;
+                lim->limit = v;
+            }
+            if (parse_int_literal(offset_op, v)) {
+                lim->has_offset = true;
+                lim->offset = v;
+            }
+            lim->output = current->output;  // limit is schema-preserving
+            lim->add_child(std::move(current));
+            current = std::move(lim);
+        }
+        return current;
+    }
     error = "unsupported query block kind (TODO)";
     return nullptr;
 }
@@ -1246,7 +1318,12 @@ LogicalNodePtr Binder::bind_setop(const ASTNode* setop, std::string& error) {
     const ASTNode* left_q = nullptr;
     const ASTNode* right_q = nullptr;
     for (const ASTNode* c = first_child(setop); c != nullptr; c = c->next_sibling) {
-        if (c->node_type != NodeType::SelectStmt && !is_setop_node(c->node_type)) {
+        // A VALUES table-value-constructor is a valid set-operation branch
+        // (`SELECT 1 UNION VALUES (2)`); count it alongside SELECT / nested set-op
+        // branches so bind_query lowers it. Without this the ValuesStmt operand
+        // was skipped and the set-op looked like it had only one branch.
+        if (c->node_type != NodeType::SelectStmt && !is_setop_node(c->node_type) &&
+            c->node_type != NodeType::ValuesStmt) {
             continue;
         }
         if (left_q == nullptr) {

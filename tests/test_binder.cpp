@@ -507,6 +507,41 @@ void test_limit_offset(const InMemoryCatalog& cat) {
     });
 }
 
+// A VALUES table-value-constructor is a query primary: it must bind as a
+// top-level statement, a set-operation branch, and a CTE body - not only a
+// FROM-derived table. Previously bind()/bind_query/bind_setop had no ValuesStmt
+// case, so an analyzer-clean `VALUES (1,2),(3,4)` failed to bind (invariant #1).
+void test_values_query_primary(const InMemoryCatalog& cat) {
+    std::printf("[test] top-level VALUES / VALUES set-op branch / VALUES CTE body\n");
+    // Top-level VALUES -> a Values node with one column per value position.
+    with_plan(cat, "VALUES (1, 2), (3, 4)", [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Values, "top-level VALUES -> Values node");
+        check(root->output.size() == 2, "two value columns");
+        check(root->value_rows.size() == 2, "two rows");
+    });
+    // Trailing ORDER BY / LIMIT over the value columns.
+    with_plan(cat, "VALUES (3), (1), (2) ORDER BY 1 DESC LIMIT 2",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Limit, "VALUES ... LIMIT -> Limit root");
+        check(root->has_limit && root->limit == 2, "limit == 2");
+        const LogicalNode* sort = only_child(root);
+        check(sort && sort->op == LogicalOp::Sort, "VALUES ... ORDER BY -> Sort");
+        check(sort && sort->sort_keys.size() == 1 && sort->sort_keys[0].descending,
+              "one DESC sort key");
+    });
+    // VALUES as a set-operation branch.
+    with_plan(cat, "SELECT id FROM users UNION VALUES (2)",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::SetOp, "UNION with a VALUES branch binds");
+    });
+    // VALUES as a CTE body.
+    with_plan(cat, "WITH x AS (VALUES (1, 2)) SELECT * FROM x",
+              [](const LogicalNode* root) {
+        check(root != nullptr, "WITH x AS (VALUES ...) SELECT * FROM x binds");
+        check(root->output.size() == 2, "CTE-over-VALUES projects two columns");
+    });
+}
+
 void test_inner_join(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT u.id, o.total FROM users u INNER JOIN orders o ON ...\n");
     with_plan(cat,
@@ -4248,6 +4283,7 @@ int main() {
     test_array_constructor(cat);
     test_collate(cat);
     test_limit_offset(cat);
+    test_values_query_primary(cat);
     test_inner_join(cat);
     test_self_join_alias_resolution(cat);
     test_derived_table_join_qualifier_resolution(cat);
