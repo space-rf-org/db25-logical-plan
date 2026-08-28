@@ -27,8 +27,12 @@ which are vendored read-only.
 
 ### Logical IR — `include/db25/plan/logical_plan.hpp`
 
-* `LogicalOp` — `{ Scan, Filter, Project, Join, Aggregate, Window, Distinct,
-  Sort, Limit, SetOp, Values, Insert, Update, Delete, Returning }`.
+* `LogicalOp` — `{ Scan, Filter, Project, Join, SemiJoin, AntiJoin, Aggregate,
+  Window, Distinct, Sort, Limit, SetOp, Values, Insert, Update, Delete,
+  Returning, RecursiveCTE, WorkingTableScan }`. `SemiJoin` / `AntiJoin` carry the
+  left schema only (lowered from `EXISTS` / `IN` / `NOT EXISTS`); `RecursiveCTE`
+  and `WorkingTableScan` represent a `WITH RECURSIVE` fixpoint and its
+  self-reference.
 * `LogicalNode` — an owning tree (`std::unique_ptr` children) where every node
   carries an **output schema**: a `std::vector<ColumnSchema>` and each
   `ColumnSchema` is `{ std::string name, db25::ast::DataType type, bool nullable,
@@ -73,6 +77,13 @@ Scan(s) -> [Join] -> [Filter (WHERE)] -> [Aggregate (GROUP BY / implicit)]
   projection, labeled with the correlation alias.
 * **`GROUP BY` -> Aggregate** carrying group keys + detected aggregate calls, with
   a per-item output schema read back from the analyzer.
+* **`GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` -> Aggregate** with a first-class
+  `grouping_sets` field: the group-key list is the union of every leaf key, and
+  `grouping_sets` holds one index-set per emitted grouping (ROLLUP(a,b) ->
+  `{{0,1},{0},{}}`, CUBE the full power set, and an explicit list for
+  `GROUPING SETS`). Keys absent from a set are NULL-extended, so a grouping-set
+  key is marked nullable in the output schema and `GROUPING(col)` is typed as a
+  NOT-NULL indicator.
 * **Implicit aggregation -> Aggregate** (empty group keys): a query that uses an
   aggregate function without a `GROUP BY` (`SELECT COUNT(*) FROM users`) collapses
   the input to a single group. Aggregate detection walks the whole expression
@@ -99,13 +110,15 @@ Scan(s) -> [Join] -> [Filter (WHERE)] -> [Aggregate (GROUP BY / implicit)]
   or bound query source for `INSERT`, and a `Scan` (wrapped in a `Filter` when a
   `WHERE` clause is present) for `UPDATE` / `DELETE`. `UPDATE` also carries owned
   `SET` assignments (a target column id plus a lowered value expression); the
-  `VALUES` rows of an `INSERT` are owned constant expressions.
+  `VALUES` rows of an `INSERT` are owned constant expressions. An `INSERT`'s
+  `ON CONFLICT` is lowered onto the **Insert** node: its conflict target columns
+  and a `ConflictAction` (`DoNothing` / `DoUpdate`, the latter carrying the
+  owned `SET` assignments of the upsert).
 * **`RETURNING` -> Returning** on top of the DML node, with an output schema
   resolved against the target table's catalog columns (`RETURNING *` expands to
   every column; a bare column reference carries its type / nullability / ids).
-  Represented for `UPDATE` / `DELETE`; **`INSERT ... RETURNING`** is wired the
-  same way but the vendored parser currently drops the clause for `INSERT` (no
-  `ReturningClause` node), so it does not yet appear — a parser-side `TODO`.
+  Wired end-to-end for `INSERT`, `UPDATE`, and `DELETE` alike (the vendored
+  parser now preserves the `ReturningClause` for all three).
 * **Window functions -> Window** (below the `Project`): a `Window` node carries
   owned `WindowFunction` expressions (each with its lowered arguments and an owned
   `WindowSpecIR` for the `PARTITION BY` / `ORDER BY` / frame) and appends one
@@ -123,24 +136,28 @@ Scan(s) -> [Join] -> [Filter (WHERE)] -> [Aggregate (GROUP BY / implicit)]
 
 **Not yet lowered (clearly-marked `TODO`s in the source)**
 
-* `INSERT ... RETURNING` (parser drops the clause), `ON CONFLICT`, and
-  multi-table `UPDATE` / `DELETE`.
-* `LATERAL` joins (the vendored parser/analyzer do not support them end-to-end:
-  the analyzer reports the correlated relation alias as unresolved and
-  `CROSS JOIN LATERAL` fails to parse), `GROUPING SETS` / `CUBE` / `ROLLUP`, and
-  correlated-subquery **decorrelation**.
+* Multi-table `UPDATE` / `DELETE` (a `FROM` / `USING` extra relation) and DML
+  constraint checking.
+* `LATERAL` joins (the vendored parser does not support them end-to-end: both the
+  comma form `t1, LATERAL (...)` and `CROSS JOIN LATERAL` fail to parse, and a
+  non-`LATERAL` correlated derived table is correctly rejected by the analyzer as
+  an unresolved reference). The binder already has a `LateralJoin` case ready for
+  when the parser preserves the node.
+* Correlated-subquery **decorrelation** (correlated subqueries are faithfully
+  represented via `OuterRef`, but left un-decorrelated for a later optimizer pass).
 
 ### Tests — `tests/test_binder.cpp`
 
 A self-contained harness (no gtest, so no network fetch and a clean
 `-fno-exceptions` build). It parses + analyzes + binds a spread of queries —
 scan/filter/project/limit, joins (inner, comma/cross, `USING`), `GROUP BY`,
-implicit aggregation, `HAVING`, `SELECT DISTINCT`,
-`ORDER BY`, `SELECT` without `FROM`, derived tables, set operations,
-`INSERT` / `UPDATE` / `DELETE`, `UPDATE` / `DELETE ... RETURNING`, window
-functions, and scalar / `IN` / `EXISTS` subqueries — and asserts both the
-logical tree shape and the output schema (names + types + nullability), plus
-subquery kind and correlation. Run via `ctest` or the `test_binder` binary.
+`ROLLUP` / `CUBE` / `GROUPING SETS`, implicit aggregation, `HAVING`,
+`SELECT DISTINCT`, `ORDER BY`, `SELECT` without `FROM`, derived tables, set
+operations, `INSERT` / `UPDATE` / `DELETE` (including `ON CONFLICT` and
+`RETURNING`), window functions, and scalar / `IN` / `EXISTS` subqueries — and
+asserts both the logical tree shape and the output schema (names + types +
+nullability), plus subquery kind and correlation. Run via `ctest` or the
+`test_binder` binary.
 
 ## Submodule pattern
 
