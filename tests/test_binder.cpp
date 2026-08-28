@@ -4108,11 +4108,58 @@ void test_quantified_comparison_lowers(const InMemoryCatalog& cat) {
 
 }
 
+// SELECT DISTINCT with an ORDER BY key that is a compound expression appearing
+// verbatim in the SELECT list must bind (analyzer-clean => bind-ok): the ORDER
+// BY expression is structurally matched to the projected select-list expression
+// and ordered by that output column, like an alias or ordinal. Previously only
+// name/alias/ordinal keys resolved under DISTINCT, so a bare `sal + 9` was
+// rejected.
+void test_distinct_order_by_expression(const InMemoryCatalog& cat) {
+    std::printf("[test] DISTINCT ORDER BY expression matches a SELECT-list item\n");
+    for (const char* sql : {
+             "SELECT DISTINCT sal + 9 FROM emp ORDER BY sal + 9",
+             "SELECT DISTINCT sal + 9 FROM emp ORDER BY sal + 9 DESC",
+             "SELECT DISTINCT ABS(sal) FROM emp ORDER BY ABS(sal)",
+             "SELECT DISTINCT dept, sal + 1 FROM emp ORDER BY sal + 1, dept",
+             "SELECT DISTINCT -sal FROM emp ORDER BY -sal",
+         }) {
+        db25::parser::Parser parser;
+        auto parsed = parser.parse(sql);
+        check(parsed.has_value(), std::string{"parse: "} + sql);
+        if (!parsed) continue;
+        Analyzer analyzer(cat);
+        analyzer.analyze(parsed.value());
+        check(!analyzer.has_errors(), std::string{"analyze clean: "} + sql);
+        Binder binder(analyzer, cat);
+        BindResult res = binder.bind(parsed.value());
+        check(res.ok, std::string{"DISTINCT ORDER BY expr binds: "} + sql +
+                          (res.ok ? "" : " -> " + res.error));
+    }
+    // Guard: an ORDER BY expression NOT in the SELECT list is still rejected
+    // under DISTINCT (a hidden sort column would change the distinct key).
+    {
+        db25::parser::Parser parser;
+        auto parsed = parser.parse("SELECT DISTINCT sal + 9 FROM emp ORDER BY sal + 7");
+        check(parsed.has_value(), "parse: DISTINCT ORDER BY non-member");
+        if (parsed) {
+            Analyzer analyzer(cat);
+            analyzer.analyze(parsed.value());
+            if (!analyzer.has_errors()) {
+                Binder binder(analyzer, cat);
+                BindResult res = binder.bind(parsed.value());
+                check(!res.ok,
+                      "DISTINCT ORDER BY expr not in SELECT list is rejected");
+            }
+        }
+    }
+}
+
 int main() {
     const InMemoryCatalog cat = make_catalog();
     test_chained_using_natural_single_merged_column(cat);
     test_aggregate_alias_collides_with_base_column(cat);
     test_quantified_comparison_lowers(cat);
+    test_distinct_order_by_expression(cat);
 
     test_scan_filter_project_limit(cat);
     test_derived_table_column_alias(cat);

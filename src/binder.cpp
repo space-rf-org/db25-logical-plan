@@ -2013,6 +2013,50 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
                     continue;
                 }
             }
+            // Under DISTINCT, an ORDER BY key that is a compound EXPRESSION
+            // appearing verbatim in the SELECT list must resolve to that output
+            // column (just as an output alias or an ordinal does). The
+            // visible-output attempt above only matches by output NAME/alias, so
+            // a bare `age + 9` -- whose leaf `age` is not itself an output column
+            // -- fell through and was wrongly rejected. Lower the key against the
+            // Project's input and match it STRUCTURALLY against a projected
+            // select-list expression via its canonical dump; on a hit, order by
+            // that output slot. A hidden sort column is forbidden under DISTINCT
+            // (it would change the distinct key), so this is the only way an
+            // expression key binds.
+            // The Distinct sits directly above the Project (see above), so reach
+            // through it to the Project's select-list exprs and its input frame.
+            LogicalNode* dproj =
+                (over_distinct && input_node->child_count() > 0) ? input_node->child(0)
+                                                                 : nullptr;
+            const Schema* dproj_input =
+                (dproj != nullptr && dproj->child_count() > 0) ? &dproj->child(0)->output
+                                                               : nullptr;
+            if (over_distinct && dproj != nullptr && dproj_input != nullptr) {
+                std::string merr;
+                agg_frame_ = &agg_frame;
+                auto lk = lower_expr(key, *dproj_input, merr);
+                agg_frame_ = nullptr;
+                if (lk) {
+                    const std::string want = dump_expr(*lk);
+                    int hit = -1;
+                    for (std::size_t k = 0; k < dproj->exprs.size() &&
+                                            k < input_node->output.size(); ++k) {
+                        if (dproj->exprs[k] && dump_expr(*dproj->exprs[k]) == want) {
+                            hit = static_cast<int>(k);
+                            break;
+                        }
+                    }
+                    if (hit >= 0) {
+                        sk.expr = make_column_ref(
+                            static_cast<std::uint32_t>(hit),
+                            input_node->output[static_cast<std::size_t>(hit)]);
+                        sort->sort_keys.push_back(std::move(sk));
+                        continue;
+                    }
+                }
+            }
+
             // Not a visible output column: append a hidden sort column (or reject
             // under DISTINCT).
             if (over_distinct || proj_input == nullptr) {
