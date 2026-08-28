@@ -501,6 +501,91 @@ ExprPtr make_column_ref(std::uint32_t slot, const ColumnSchema& c) {
     return e;
 }
 
+// Collect the leaf grouping-column nodes of one grouping "unit": a bare column
+// is one leaf; a parenthesized ColumnList / RowConstructor groups several
+// columns as a single unit (e.g. `ROLLUP((a, b), c)`).
+void collect_grouping_leaves(const ASTNode* n, std::vector<const ASTNode*>& out) {
+    if (n == nullptr) return;
+    if (n->node_type == NodeType::ColumnList ||
+        n->node_type == NodeType::RowConstructor) {
+        for (const ASTNode* c = first_child(n); c != nullptr; c = c->next_sibling) {
+            collect_grouping_leaves(c, out);
+        }
+        return;
+    }
+    out.push_back(n);  // a single grouping expression (usually a ColumnRef)
+}
+
+// Identity of two grouping leaf columns: the resolved (table_id, column_id) when
+// both carry one, else the case-insensitive text. Used to de-duplicate columns
+// shared across grouping sets into one group_keys slot.
+bool same_grouping_leaf(const ASTNode* a, const ASTNode* b) {
+    const auto at = a->context.analysis.table_id, ac = a->context.analysis.column_id;
+    const auto bt = b->context.analysis.table_id, bc = b->context.analysis.column_id;
+    if (at != 0 && ac != 0 && bt != 0 && bc != 0) return at == bt && ac == bc;
+    return iequals(a->primary_text, b->primary_text);
+}
+
+// Flatten a GROUP BY GroupingElement (ROLLUP / CUBE / GROUPING SETS) into the
+// flat, de-duplicated list of leaf grouping-column AST nodes (`keys`, first-seen
+// order) plus the grouping SETS - each a set of indices into `keys` (see
+// LogicalNode::grouping_sets). The parser emits primary_text uppercase.
+void flatten_grouping_element(const ASTNode* ge, std::vector<const ASTNode*>& keys,
+                              std::vector<std::vector<std::uint32_t>>& sets) {
+    const std::string_view kind = ge->primary_text;
+
+    auto index_of = [&](const ASTNode* c) -> std::uint32_t {
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            if (same_grouping_leaf(keys[i], c)) return static_cast<std::uint32_t>(i);
+        }
+        keys.push_back(c);
+        return static_cast<std::uint32_t>(keys.size() - 1);
+    };
+
+    if (kind == "GROUPING_SETS") {
+        // Each child is one grouping set: a ColumnList of its members (an empty
+        // ColumnList is the empty set), or a bare column (a singleton set).
+        for (const ASTNode* set_node = first_child(ge); set_node != nullptr;
+             set_node = set_node->next_sibling) {
+            std::vector<const ASTNode*> leaves;
+            collect_grouping_leaves(set_node, leaves);
+            std::vector<std::uint32_t> idx;
+            for (const ASTNode* leaf : leaves) idx.push_back(index_of(leaf));
+            sets.push_back(std::move(idx));
+        }
+        return;
+    }
+
+    // ROLLUP / CUBE: each child is a grouping UNIT (one or more columns grouped
+    // together). Enumerate the units, then the sets they generate.
+    std::vector<std::vector<std::uint32_t>> units;
+    for (const ASTNode* unit = first_child(ge); unit != nullptr; unit = unit->next_sibling) {
+        std::vector<const ASTNode*> leaves;
+        collect_grouping_leaves(unit, leaves);
+        std::vector<std::uint32_t> idx;
+        for (const ASTNode* leaf : leaves) idx.push_back(index_of(leaf));
+        units.push_back(std::move(idx));
+    }
+    const std::size_t m = units.size();
+    const auto union_of = [&](auto&& active) {
+        std::vector<std::uint32_t> s;
+        for (std::size_t u = 0; u < m; ++u) {
+            if (active(u)) for (std::uint32_t k : units[u]) s.push_back(k);
+        }
+        return s;
+    };
+    if (kind == "ROLLUP") {
+        // Prefixes: all units, then drop the last, ... down to none.
+        for (std::size_t take = m + 1; take-- > 0;) {
+            sets.push_back(union_of([&](std::size_t u) { return u < take; }));
+        }
+    } else {  // CUBE: every subset of the units (2^m sets).
+        for (std::size_t mask = (std::size_t{1} << m); mask-- > 0;) {
+            sets.push_back(union_of([&](std::size_t u) { return ((mask >> u) & 1u) != 0; }));
+        }
+    }
+}
+
 // Find a schema slot by output column name (the producer-map fallback for a
 // precomputed aggregate / window output). Returns -1 when absent.
 int slot_by_name(const Schema& s, std::string_view name) {
@@ -1620,9 +1705,26 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
         // SELECT item's expression instead (see group_key_alias_target). A
         // bare-column key additionally carries its source (table_id, column_id)
         // so an operator above resolves it by id rather than only structurally.
+        // GROUP BY ROLLUP / CUBE / GROUPING SETS: a single GroupingElement child.
+        // Flatten it into the flat group-key columns + the grouping-set index
+        // lists (agg->grouping_sets); a plain GROUP BY uses the clause's direct
+        // children. Under a grouping set every key is nullable - a key is NULL in
+        // the super-aggregate rows of the sets that omit it - matching the
+        // analyzer's projection_of (the parser guarantees a single grouping
+        // construct, never mixed with plain keys).
+        std::vector<const ASTNode*> group_key_nodes;
+        const ASTNode* gb_first = (group_by != nullptr) ? first_child(group_by) : nullptr;
+        if (gb_first != nullptr && gb_first->node_type == NodeType::GroupingElement) {
+            flatten_grouping_element(gb_first, group_key_nodes, agg->grouping_sets);
+        } else {
+            for (const ASTNode* k = gb_first; k != nullptr; k = k->next_sibling) {
+                group_key_nodes.push_back(k);
+            }
+        }
+        const bool is_grouping_sets = !agg->grouping_sets.empty();
+
         std::uint32_t slot = 0;
-        for (const ASTNode* key = group_by != nullptr ? first_child(group_by) : nullptr;
-             key != nullptr; key = key->next_sibling) {
+        for (const ASTNode* key : group_key_nodes) {
             const ASTNode* lowered_from = key;
             ExprPtr e;
             // Positional GROUP BY: `GROUP BY <n>` groups by the n-th SELECT item's
@@ -1698,6 +1800,11 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
             if (e && e->kind == ExprKind::ColumnRef &&
                 e->input_index < agg_input.size()) {
                 col.alias = agg_input[e->input_index].alias;
+            }
+            // A grouping-set key is nullable regardless of its base constraint.
+            if (is_grouping_sets) {
+                col.nullable = true;
+                if (e) e->nullability = std::uint8_t{2};
             }
             agg->output.push_back(std::move(col));
             agg->group_keys.push_back(std::move(e));

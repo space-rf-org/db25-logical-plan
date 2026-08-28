@@ -183,6 +183,17 @@ struct LogicalNode {
     // argument expressions.
     std::vector<ExprPtr> group_keys;   // GROUP BY expressions
     std::vector<ExprPtr> aggregates;   // aggregate call expressions
+    // GROUPING SETS / ROLLUP / CUBE: the set of grouping-key combinations to
+    // aggregate over. Each inner vector lists the indices (into group_keys) that
+    // are ACTIVE for that grouping set; a key absent from a set is NULL in that
+    // set's output rows. EMPTY (the common case) means a plain GROUP BY - a
+    // single implicit set containing every group key. So `GROUP BY ROLLUP(a, b)`
+    // lowers to group_keys [a, b] with grouping_sets {{0,1},{0},{}}; the empty
+    // grouping set `GROUP BY ()` is grouping_sets {{}} with no group keys. Kept
+    // as first-class Aggregate payload (DuckDB / Calcite style) rather than
+    // expanded to a UNION, so the plan stays compact and the output shape is the
+    // ordinary [keys..., aggregates...].
+    std::vector<std::vector<std::uint32_t>> grouping_sets;
 
     // --- Window payload ---
     // Owned, typed window-function expressions (each an ExprKind::WindowFunction
