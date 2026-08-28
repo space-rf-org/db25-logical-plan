@@ -3804,6 +3804,73 @@ void test_correlated_outer_computed_column(const InMemoryCatalog& cat) {
     });
 }
 
+// Find the first Aggregate node in a plan (depth-first).
+const LogicalNode* find_aggregate(const LogicalNode* n) {
+    if (n == nullptr) return nullptr;
+    if (n->op == LogicalOp::Aggregate) return n;
+    for (std::size_t i = 0; i < n->child_count(); ++i) {
+        if (const LogicalNode* a = find_aggregate(n->child(i))) return a;
+    }
+    return nullptr;
+}
+
+// GROUP BY ROLLUP / CUBE / GROUPING SETS lowers to an Aggregate carrying a
+// first-class `grouping_sets` payload (index-sets into group_keys). The output
+// shape is the ordinary [keys..., aggregates...], every grouping key is nullable
+// (a key is NULL in the super-aggregate rows), and a plain GROUP BY leaves
+// grouping_sets empty. See LogicalNode::grouping_sets.
+void test_grouping_sets_lowering(const InMemoryCatalog& cat) {
+    std::printf("[test] GROUP BY ROLLUP / CUBE / GROUPING SETS lowering\n");
+
+    // ROLLUP(dept): sets {dept} and {} (the grand total).
+    with_plan(cat, "SELECT dept, SUM(sal) FROM emp GROUP BY ROLLUP(dept)",
+              [](const LogicalNode* root) {
+        const LogicalNode* agg = find_aggregate(root);
+        check(agg != nullptr, "ROLLUP: has an Aggregate");
+        if (!agg) return;
+        check(agg->group_keys.size() == 1, "ROLLUP: one group key (dept)");
+        check(agg->grouping_sets.size() == 2, "ROLLUP(dept): two grouping sets");
+        if (agg->grouping_sets.size() == 2) {
+            check(agg->grouping_sets[0] == std::vector<std::uint32_t>{0}, "ROLLUP set0 = {dept}");
+            check(agg->grouping_sets[1].empty(), "ROLLUP set1 = {} (grand total)");
+        }
+        check(!agg->output.empty() && agg->output[0].nullable,
+              "ROLLUP: the grouping key is nullable");
+    });
+
+    // CUBE(dept): 2^1 = 2 sets.
+    with_plan(cat, "SELECT dept, SUM(sal) FROM emp GROUP BY CUBE(dept)",
+              [](const LogicalNode* root) {
+        const LogicalNode* agg = find_aggregate(root);
+        check(agg && agg->grouping_sets.size() == 2, "CUBE(dept): two grouping sets");
+    });
+
+    // GROUPING SETS ((dept), ()): the listed sets, in order.
+    with_plan(cat, "SELECT dept, SUM(sal) FROM emp GROUP BY GROUPING SETS ((dept), ())",
+              [](const LogicalNode* root) {
+        const LogicalNode* agg = find_aggregate(root);
+        check(agg != nullptr, "GROUPING SETS: has an Aggregate");
+        if (!agg) return;
+        check(agg->grouping_sets.size() == 2, "GROUPING SETS: two sets");
+        if (agg->grouping_sets.size() == 2) {
+            check(agg->grouping_sets[0] == std::vector<std::uint32_t>{0}, "GS set0 = {dept}");
+            check(agg->grouping_sets[1].empty(), "GS set1 = {}");
+        }
+    });
+
+    // Guard: a plain GROUP BY carries NO grouping sets and does not force the key
+    // nullable beyond its catalog constraint (`id` is NOT NULL).
+    with_plan(cat, "SELECT id, SUM(sal) FROM emp GROUP BY id",
+              [](const LogicalNode* root) {
+        const LogicalNode* agg = find_aggregate(root);
+        check(agg != nullptr, "plain GROUP BY: has an Aggregate");
+        if (!agg) return;
+        check(agg->grouping_sets.empty(), "plain GROUP BY: no grouping sets");
+        check(!agg->output.empty() && !agg->output[0].nullable,
+              "plain GROUP BY: NOT NULL key `id` stays NOT NULL");
+    });
+}
+
 }  // namespace
 
 void test_derived_table_column_alias(const InMemoryCatalog& cat) {
@@ -4388,6 +4455,7 @@ int main() {
     test_exists_subquery(cat);
     test_self_correlated_subquery(cat);
     test_correlated_outer_computed_column(cat);
+    test_grouping_sets_lowering(cat);
     test_not_exists_negated(cat);
     test_scalar_subquery_over_aggregate(cat);
 
