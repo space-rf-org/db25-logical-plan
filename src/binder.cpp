@@ -2212,6 +2212,21 @@ LogicalNodePtr Binder::bind_insert(const ASTNode* insert_stmt, std::string& erro
             if (target != nullptr) {
                 tschema = scan_schema(*target, target->table_id, node->table_name);
             }
+            // DO UPDATE SET values may reference the proposed-insert row through
+            // the `excluded` pseudo-relation (the canonical upsert
+            // `SET col = excluded.col`). Lower the values against a frame that
+            // exposes the target columns TWICE: once under the target's own
+            // name (for a bare `col` / `target.col`, the existing/stored row)
+            // and once aliased `excluded` (for `excluded.col`, the proposed
+            // row). Without the excluded copy a qualified `excluded.col`
+            // resolved to no slot and the whole - analyzer-clean - upsert failed
+            // to bind, so DO UPDATE could never form its excluded assignments.
+            Schema upsert_schema = tschema;
+            for (const auto& c : tschema) {
+                ColumnSchema ex = c;
+                ex.alias = "excluded";
+                upsert_schema.push_back(std::move(ex));
+            }
             if (const ASTNode* set_clause = find_child(oc, NodeType::SetClause)) {
                 for (const ASTNode* asgn = first_child(set_clause); asgn != nullptr;
                      asgn = asgn->next_sibling) {
@@ -2222,7 +2237,7 @@ LogicalNodePtr Binder::bind_insert(const ASTNode* insert_stmt, std::string& erro
                             assignment.target_column_id = ci->column_id;
                         }
                     }
-                    assignment.value = lower_expr(first_child(asgn), tschema, error);
+                    assignment.value = lower_expr(first_child(asgn), upsert_schema, error);
                     if (!assignment.value) {
                         return nullptr;
                     }
@@ -2368,6 +2383,19 @@ LogicalNodePtr Binder::wrap_returning(LogicalNodePtr dml, const ASTNode* stmt,
     // them (and expand `*`) positionally against that table's schema so the
     // owned exprs stay 1:1 with `output`.
     const Schema target = scan_schema(*table, table->table_id, dml->table_name);
+    // For UPDATE ... FROM / DELETE ... USING a RETURNING item may reference the
+    // auxiliary (FROM/USING) relations' columns (Postgres semantics, and what
+    // the analyzer accepts by resolving RETURNING against the DML's full
+    // combined scope). Those columns live in the DML child's output (the target
+    // scan cross-joined with the auxiliary relations) - whose first
+    // target.size() slots are exactly the target scan - not in the target
+    // schema alone. Lower non-target-column items against that full input scope.
+    // INSERT's child is the VALUES/query SOURCE, not a target scan, so INSERT
+    // RETURNING resolves against the target schema only.
+    const Schema& resolve_scope =
+        (dml->op != LogicalOp::Insert && dml->child_count() > 0)
+            ? dml->child(0)->output
+            : target;
     for (const ASTNode* item = first_child(returning); item != nullptr;
          item = item->next_sibling) {
         if (item->node_type == NodeType::Star) {
@@ -2394,12 +2422,24 @@ LogicalNodePtr Binder::wrap_returning(LogicalNodePtr dml, const ASTNode* stmt,
             }
         }
         if (!expr) {
-            // A non-column RETURNING item (an expression over the target row):
-            // lower it as a fresh expression against the target schema.
-            expr = lower_expr(item, target, error);
+            // A non-target-column RETURNING item: either an expression over the
+            // affected row (`k + 1`), or a reference to an auxiliary FROM/USING
+            // relation's column (`dept.loc`). Lower it against the full input
+            // scope so auxiliary columns resolve.
+            expr = lower_expr(item, resolve_scope, error);
             if (!expr) {
                 return nullptr;
             }
+            // The output column carries the lowered expression's own type and
+            // nullability (and provenance ids). Previously only col.name was set
+            // and col.type/nullable were left at their defaults (Unknown /
+            // nullable), so the plan-root result schema disagreed with the very
+            // expression it owned (`RETURNING k + 1` produced `+:Unknown?`
+            // despite the expr being baked Integer).
+            col.type = expr->type;
+            col.nullable = expr->nullability != 1;  // 1 == not-null
+            col.table_id = expr->ref_table_id;
+            col.column_id = expr->ref_column_id;
         }
         node->exprs.push_back(std::move(expr));
         node->output.push_back(std::move(col));

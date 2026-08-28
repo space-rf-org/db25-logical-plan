@@ -3194,6 +3194,82 @@ void test_delete_returning_star(const InMemoryCatalog& cat) {
     });
 }
 
+// A non-column RETURNING item (an expression) must carry its lowered
+// expression's own type/nullability in the output schema. Previously only the
+// name was set and the type stayed Unknown, so the plan-root schema disagreed
+// with the expr it owned (`RETURNING k + 1` -> `+:Unknown?` despite Integer).
+void test_returning_expression_type(const InMemoryCatalog& cat) {
+    std::printf("[test] INSERT ... RETURNING id, id + 1 (expr output type)\n");
+    with_plan(cat,
+              "INSERT INTO users (id, name) VALUES (1, 'a') RETURNING id, id + 1",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Returning, "root is Returning");
+        check(root->output.size() == 2, "returning 2 cols");
+        if (root->output.size() == 2) {
+            expect_col(root->output[0], "id", DataType::Integer, false, "ret[0]");
+            // The expression column is typed from the lowered expr, not Unknown.
+            check(root->output[1].type == DataType::Integer,
+                  "ret[1] expr column typed Integer, not Unknown");
+        }
+    });
+}
+
+// ON CONFLICT DO UPDATE SET col = excluded.col: the value references the
+// proposed-insert row via the `excluded` pseudo-relation. It must bind (it
+// resolved to no slot before, failing the whole analyzer-clean upsert).
+void test_on_conflict_excluded_assignment(const InMemoryCatalog& cat) {
+    std::printf("[test] INSERT ... ON CONFLICT (id) DO UPDATE SET name = excluded.name\n");
+    with_plan(cat,
+              "INSERT INTO users (id, name) VALUES (1, 'a') "
+              "ON CONFLICT (id) DO UPDATE SET name = excluded.name",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Insert, "root is Insert");
+        check(root->conflict_action == db25::plan::ConflictAction::DoUpdate,
+              "action is DoUpdate");
+        check(root->assignments.size() == 1, "one excluded assignment lowered");
+        check(!root->assignments.empty() && root->assignments[0].value != nullptr,
+              "excluded assignment value is bound");
+    });
+}
+
+// DELETE ... USING / UPDATE ... FROM with a RETURNING item that references an
+// auxiliary (USING/FROM) relation's column must bind: the item is lowered
+// against the DML's full input scope (target scan cross-joined with the
+// auxiliary relations), not the target scan schema alone.
+void test_returning_auxiliary_relation_column(const InMemoryCatalog& cat) {
+    std::printf("[test] DELETE ... USING / UPDATE ... FROM RETURNING aux column\n");
+    with_plan(cat,
+              "DELETE FROM emp USING orders WHERE emp.id = orders.user_id "
+              "RETURNING orders.total",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Returning, "delete-using: root is Returning");
+        check(root->output.size() == 1, "one returning column");
+        if (root->output.size() == 1) {
+            expect_col(root->output[0], "total", DataType::Double, true, "aux ret[0]");
+        }
+    });
+    with_plan(cat,
+              "UPDATE emp SET sal = 1 FROM orders WHERE emp.id = orders.user_id "
+              "RETURNING orders.total",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Returning, "update-from: root is Returning");
+        check(root->output.size() == 1, "one returning column");
+        if (root->output.size() == 1) {
+            expect_col(root->output[0], "total", DataType::Double, true, "aux ret[0]");
+        }
+    });
+    // Guard: RETURNING a plain target column is unchanged.
+    with_plan(cat,
+              "DELETE FROM emp USING orders WHERE emp.id = orders.user_id "
+              "RETURNING emp.sal",
+              [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Returning, "target-col: root is Returning");
+        if (root->output.size() == 1) {
+            expect_col(root->output[0], "sal", DataType::Double, true, "target ret[0]");
+        }
+    });
+}
+
 // -------------------------------------------------------------------------
 // Window functions: a Window node below the Project, carrying the window-call
 // specs and appending one output column per function.
@@ -4258,6 +4334,9 @@ int main() {
     test_update_returning(cat);
     test_delete_returning(cat);
     test_delete_returning_star(cat);
+    test_returning_expression_type(cat);
+    test_on_conflict_excluded_assignment(cat);
+    test_returning_auxiliary_relation_column(cat);
 
     test_window_rank(cat);
     test_window_row_number(cat);
