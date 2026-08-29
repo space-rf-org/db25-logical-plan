@@ -178,7 +178,10 @@ LogicalNodePtr make_join_node(LogicalNodePtr left, LogicalNodePtr right,
     auto join = std::make_unique<LogicalNode>(LogicalOp::Join);
     join->join_type = jt;
     const bool null_left = jt == ast::JoinType::Right || jt == ast::JoinType::Full;
-    const bool null_right = jt == ast::JoinType::Left || jt == ast::JoinType::Full;
+    // LeftLateral is LEFT JOIN LATERAL: like a LEFT join, its right (lateral)
+    // side is null-supplied for a left row that produces no lateral rows.
+    const bool null_right = jt == ast::JoinType::Left || jt == ast::JoinType::Full ||
+                            jt == ast::JoinType::LeftLateral;
     Schema out;
     out.reserve(left->output.size() + right->output.size());
     for (const auto& col : left->output) {
@@ -215,7 +218,15 @@ ast::JoinType join_type_of(const ASTNode* join) {
         case NodeType::RightJoin: return ast::JoinType::Right;
         case NodeType::FullJoin:  return ast::JoinType::Full;
         case NodeType::CrossJoin: return ast::JoinType::Cross;
-        case NodeType::LateralJoin: return ast::JoinType::Lateral;
+        case NodeType::LateralJoin:
+            // Laterality is the join type; the outer-join qualifier rides in
+            // primary_text (only LEFT is legal with LATERAL - RIGHT/FULL are
+            // rejected at the parser). LEFT JOIN LATERAL null-extends its RHS,
+            // so it maps to LeftLateral; everything else (comma / CROSS /
+            // [INNER] JOIN LATERAL) is plain Lateral.
+            return upper(join->primary_text).find("LEFT") != std::string::npos
+                       ? ast::JoinType::LeftLateral
+                       : ast::JoinType::Lateral;
         default: break;
     }
     const std::string kind = upper(join->primary_text);

@@ -149,6 +149,7 @@ void dump_rec(const LogicalNode* n, int depth, std::string& out) {
                 case ast::JoinType::Full:    out.append("FULL"); break;
                 case ast::JoinType::Cross:   out.append("CROSS"); break;
                 case ast::JoinType::Lateral: out.append("LATERAL"); break;
+                case ast::JoinType::LeftLateral: out.append("LEFT LATERAL"); break;
             }
             out.push_back(')');
             if (n->predicate) {
