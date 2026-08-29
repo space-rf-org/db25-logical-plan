@@ -756,6 +756,77 @@ void test_derived_expr_alias_join_qualifier_resolution(const InMemoryCatalog& ca
     });
 }
 
+// Recursively find the first OuterRef in an expression tree.
+const db25::plan::Expr* find_outer_ref(const db25::plan::Expr* e) {
+    if (e == nullptr) return nullptr;
+    if (e->kind == ExprKind::OuterRef) return e;
+    for (const auto& c : e->children) {
+        if (const auto* hit = find_outer_ref(c.get())) return hit;
+    }
+    return nullptr;
+}
+
+// LATERAL join binding. A LATERAL derived table is evaluated per left row, so a
+// reference in its body to a preceding FROM item must lower to an OuterRef
+// against the left input, and the join is a Lateral join. Two spellings bind to
+// the same shape: the comma form `a, LATERAL (subq)` and `a CROSS JOIN LATERAL
+// (subq)`. (The parser produces a LateralJoin node for both; the analyzer grants
+// the RHS sibling visibility; the binder here exposes the left schema as an
+// enclosing input so the correlation resolves.)
+void test_lateral_join_correlation(const InMemoryCatalog& cat) {
+    auto check_shape = [&](std::string_view sql) {
+        with_plan(cat, sql, [&](const LogicalNode* root) {
+            const std::string ctx{sql};
+            // Project -> Join(Lateral) -> [Scan emp, Project (lateral body)].
+            check(root->op == LogicalOp::Project, ctx + ": root is Project");
+            const LogicalNode* join = only_child(root);
+            check(join && join->op == LogicalOp::Join, ctx + ": child is Join");
+            check(join && join->join_type == db25::ast::JoinType::Lateral,
+                  ctx + ": join is LATERAL");
+            check(join && join->child_count() == 2, ctx + ": join has 2 inputs");
+            if (join && join->child_count() == 2) {
+                check(join->child(0)->op == LogicalOp::Scan &&
+                          join->child(0)->table_name == "emp",
+                      ctx + ": left input is Scan emp");
+                const LogicalNode* rhs = join->child(1);
+                check(rhs->op == LogicalOp::Project,
+                      ctx + ": right input is the derived-table Project");
+                // The body projects `e.sal + 1`; e.sal is not in the body's own
+                // input, so it must have lowered to an OuterRef at depth 1 (the
+                // immediately-enclosing left input).
+                const db25::plan::Expr* oref = nullptr;
+                if (rhs->op == LogicalOp::Project && !rhs->exprs.empty()) {
+                    oref = find_outer_ref(rhs->exprs[0].get());
+                }
+                check(oref != nullptr, ctx + ": body references an OuterRef");
+                check(oref == nullptr || oref->outer_depth == 1,
+                      ctx + ": OuterRef is at depth 1 (the left input)");
+            }
+        });
+    };
+    std::printf("[test] LATERAL correlation: comma form and CROSS JOIN LATERAL\n");
+    check_shape("SELECT e.id, s.z FROM emp e, LATERAL (SELECT e.sal + 1 AS z) s");
+    check_shape(
+        "SELECT e.id, s.z FROM emp e CROSS JOIN LATERAL (SELECT e.sal + 1 AS z) s");
+}
+
+// The mirror image: a NON-LATERAL derived table must NOT see its FROM-list
+// siblings. `FROM emp e, (SELECT e.sal) s` is rejected by the analyzer (the
+// correlation needs LATERAL), so it never reaches the binder. This pins that the
+// laterality gate is real and not accidentally always-on.
+void test_non_lateral_sibling_reference_rejected(const InMemoryCatalog& cat) {
+    std::printf("[test] non-LATERAL sibling reference is rejected by the analyzer\n");
+    const char* sql = "SELECT e.id FROM emp e, (SELECT e.sal AS z) s";
+    db25::parser::Parser parser;
+    auto parsed = parser.parse(sql);
+    check(parsed.has_value(), std::string{"parse: "} + sql);
+    if (!parsed) return;
+    Analyzer analyzer(cat);
+    analyzer.analyze(parsed.value());
+    check(analyzer.has_errors(),
+          "non-LATERAL derived table referencing a sibling must be an analyzer error");
+}
+
 // A table-name qualifier (no explicit alias) still resolves against the single
 // occurrence - the fix must not regress the common unaliased case.
 void test_table_name_qualifier(const InMemoryCatalog& cat) {
@@ -4440,6 +4511,8 @@ int main() {
     test_self_join_alias_resolution(cat);
     test_derived_table_join_qualifier_resolution(cat);
     test_derived_expr_alias_join_qualifier_resolution(cat);
+    test_lateral_join_correlation(cat);
+    test_non_lateral_sibling_reference_rejected(cat);
     test_table_name_qualifier(cat);
     test_group_by(cat);
     test_ordered_aggregate(cat);

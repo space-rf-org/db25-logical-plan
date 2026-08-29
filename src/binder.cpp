@@ -943,7 +943,20 @@ LogicalNodePtr Binder::bind_join(LogicalNodePtr left, const ASTNode* join_node,
         return nullptr;
     }
 
+    // A LATERAL join evaluates its right derived table once per left row, so the
+    // RHS may reference the left input's columns. Expose the left schema as an
+    // enclosing input while binding the RHS so those references lower to OuterRefs
+    // (Calcite-style correlation). A plain join's RHS is independent and gets no
+    // such exposure - a sibling reference there is an error, as SQL requires (that
+    // is exactly what LATERAL is for).
+    const bool lateral = join_node->node_type == NodeType::LateralJoin;
+    if (lateral) {
+        outer_inputs_.push_back(&left->output);
+    }
     auto right = bind_relation(right_ref, error);
+    if (lateral) {
+        outer_inputs_.pop_back();
+    }
     if (!right) {
         return nullptr;
     }
@@ -1244,7 +1257,21 @@ LogicalNodePtr Binder::bind_from(const ASTNode* from_clause, std::string& error)
         if (is_join_node(item->node_type)) {
             // A JOIN extends the current table_reference (left-associative within
             // the group) - its left operand is `group`, not the whole FROM so far.
+            // A comma-form LATERAL (`a, b, LATERAL (subq)`) may reference EARLIER
+            // comma-separated table_references too, already cross-joined into
+            // `current`, not only its immediate left operand `group`. Expose
+            // `current` as an enclosing input across the bind so those
+            // correlations resolve; bind_join exposes `group` (the immediate
+            // left). A non-lateral join gets neither, as SQL requires.
+            const bool lateral_group =
+                item->node_type == NodeType::LateralJoin && current != nullptr;
+            if (lateral_group) {
+                outer_inputs_.push_back(&current->output);
+            }
             group = bind_join(std::move(group), item, error);
+            if (lateral_group) {
+                outer_inputs_.pop_back();
+            }
             if (!group) {
                 return nullptr;
             }
