@@ -35,6 +35,7 @@ const char* logical_op_to_string(LogicalOp op) noexcept {
         case LogicalOp::Returning: return "Returning";
         case LogicalOp::RecursiveCTE:     return "RecursiveCTE";
         case LogicalOp::WorkingTableScan: return "WorkingTableScan";
+        case LogicalOp::CreateTableAs:    return "CreateTableAs";
     }
     return "?";
 }
@@ -259,6 +260,7 @@ void dump_rec(const LogicalNode* n, int depth, std::string& out) {
             break;
         case LogicalOp::Delete:
         case LogicalOp::Returning:
+        case LogicalOp::CreateTableAs:
             out.push_back(' ');
             out.append(n->table_name);
             break;

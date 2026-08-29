@@ -81,6 +81,13 @@ enum class LogicalOp : std::uint8_t {
                       // CTE name, `alias` the reference's correlation name, and
                       // `output` the CTE's columns (so refs in the recursive term
                       // resolve exactly as against any other relation).
+    CreateTableAs,    // CREATE TABLE <name> AS <query> (CTAS): materialize a query
+                      // into a new table. `table_name` is the target, `output` the
+                      // new table's schema (the query's projection, optionally
+                      // renamed by a column-name list), and children[0] is the
+                      // bound defining query. There is no executor: this node
+                      // REPRESENTS the materialization (plain non-AS CREATE TABLE
+                      // is a catalog operation, applied via execute_ddl, not here).
 };
 
 [[nodiscard]] const char* logical_op_to_string(LogicalOp op) noexcept;

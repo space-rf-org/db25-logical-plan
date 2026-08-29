@@ -1330,12 +1330,40 @@ BindResult Binder::bind(const ASTNode* stmt) {
         case NodeType::DeleteStmt:
             result.root = bind_delete(stmt, result.error);
             break;
+        case NodeType::CreateTableStmt:
+            result.root = bind_create_table_as(stmt, result.error);
+            break;
         default:
             result.error = "statement kind not yet lowered (TODO)";
             return result;
     }
     result.ok = (result.root != nullptr);
     return result;
+}
+
+LogicalNodePtr Binder::bind_create_table_as(const ASTNode* stmt, std::string& error) {
+    // Only CTAS - CREATE TABLE <name> AS <query> - lowers to a plan. A plain
+    // CREATE TABLE (a column/constraint list, no query body) is a catalog
+    // operation applied via execute_ddl; it carries no query to plan, so it
+    // stays an honest error here rather than a fabricated inert node.
+    const ASTNode* body = subquery_body(stmt);  // SelectStmt / set-op / VALUES
+    if (body == nullptr) {
+        error = "plain CREATE TABLE is a catalog operation, not a query plan "
+                "(only CREATE TABLE ... AS <query> is lowered)";
+        return nullptr;
+    }
+    auto query = bind_query(body, error);
+    if (!query) {
+        return nullptr;
+    }
+    auto node = make_node(LogicalOp::CreateTableAs);
+    node->table_name = std::string{stmt->primary_text};
+    node->output = query->output;  // the new table's schema = the query's output
+    // (A bare column-name list `CREATE TABLE t (a, b) AS ...` would rename these
+    // columns positionally, but the parser does not yet parse that form - it
+    // expects column DEFINITIONS before AS - so there is nothing to apply here.)
+    node->add_child(std::move(query));
+    return node;
 }
 
 LogicalNodePtr Binder::bind_query(const ASTNode* query, std::string& error) {
@@ -2003,9 +2031,9 @@ LogicalNodePtr Binder::bind_select(const ASTNode* select_stmt, std::string& erro
     // A Star node stores its qualifier in schema_name / catalog_name (its
     // primary_text is just "*"), so a qualified `t.*` must be excluded by those
     // fields - it is NOT a whole-child star and keeps using the analyzer's
-    // projection (which correctly covers only t's columns; a qualified star over
-    // a join still hits the not-yet-lowered arity guard rather than binding to
-    // the full frame).
+    // projection (which correctly covers only t's columns). A qualified star over
+    // a join binds to exactly that relation's columns via the qualified-`q.*`
+    // expansion in lower_projection below.
     const ASTNode* only_item =
         select_list != nullptr ? first_child(select_list) : nullptr;
     const bool bare_star =
