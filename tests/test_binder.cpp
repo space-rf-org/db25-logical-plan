@@ -774,15 +774,19 @@ const db25::plan::Expr* find_outer_ref(const db25::plan::Expr* e) {
 // the RHS sibling visibility; the binder here exposes the left schema as an
 // enclosing input so the correlation resolves.)
 void test_lateral_join_correlation(const InMemoryCatalog& cat) {
-    auto check_shape = [&](std::string_view sql) {
+    // The lateral body projects `e.id` (a NON-nullable base column) as `z`, so
+    // the RHS output column is non-nullable on its own - which makes the LEFT
+    // JOIN LATERAL null-extension observable: only that spelling turns `z`
+    // nullable.
+    auto check_shape = [&](std::string_view sql, db25::ast::JoinType want_jt,
+                           bool want_rhs_nullable) {
         with_plan(cat, sql, [&](const LogicalNode* root) {
             const std::string ctx{sql};
             // Project -> Join(Lateral) -> [Scan emp, Project (lateral body)].
             check(root->op == LogicalOp::Project, ctx + ": root is Project");
             const LogicalNode* join = only_child(root);
             check(join && join->op == LogicalOp::Join, ctx + ": child is Join");
-            check(join && join->join_type == db25::ast::JoinType::Lateral,
-                  ctx + ": join is LATERAL");
+            check(join && join->join_type == want_jt, ctx + ": join type");
             check(join && join->child_count() == 2, ctx + ": join has 2 inputs");
             if (join && join->child_count() == 2) {
                 check(join->child(0)->op == LogicalOp::Scan &&
@@ -791,9 +795,8 @@ void test_lateral_join_correlation(const InMemoryCatalog& cat) {
                 const LogicalNode* rhs = join->child(1);
                 check(rhs->op == LogicalOp::Project,
                       ctx + ": right input is the derived-table Project");
-                // The body projects `e.sal + 1`; e.sal is not in the body's own
-                // input, so it must have lowered to an OuterRef at depth 1 (the
-                // immediately-enclosing left input).
+                // `e.id` is not in the body's own input, so it must have lowered
+                // to an OuterRef at depth 1 (the immediately-enclosing left).
                 const db25::plan::Expr* oref = nullptr;
                 if (rhs->op == LogicalOp::Project && !rhs->exprs.empty()) {
                     oref = find_outer_ref(rhs->exprs[0].get());
@@ -801,13 +804,28 @@ void test_lateral_join_correlation(const InMemoryCatalog& cat) {
                 check(oref != nullptr, ctx + ": body references an OuterRef");
                 check(oref == nullptr || oref->outer_depth == 1,
                       ctx + ": OuterRef is at depth 1 (the left input)");
+                // RHS null-extension: `z` is the last output column (after emp's
+                // id, dept, sal). LEFT JOIN LATERAL makes it nullable; the
+                // uncorrelated-side spellings leave it as produced.
+                check(!join->output.empty() &&
+                          join->output.back().nullable == want_rhs_nullable,
+                      ctx + ": RHS column nullability");
             }
         });
     };
-    std::printf("[test] LATERAL correlation: comma form and CROSS JOIN LATERAL\n");
-    check_shape("SELECT e.id, s.z FROM emp e, LATERAL (SELECT e.sal + 1 AS z) s");
+    std::printf("[test] LATERAL correlation: comma / CROSS / LEFT JOIN LATERAL\n");
+    using JT = db25::ast::JoinType;
+    check_shape("SELECT e.id, s.z FROM emp e, LATERAL (SELECT e.id AS z) s",
+                JT::Lateral, /*want_rhs_nullable=*/false);
     check_shape(
-        "SELECT e.id, s.z FROM emp e CROSS JOIN LATERAL (SELECT e.sal + 1 AS z) s");
+        "SELECT e.id, s.z FROM emp e CROSS JOIN LATERAL (SELECT e.id AS z) s",
+        JT::Lateral, /*want_rhs_nullable=*/false);
+    // LEFT JOIN LATERAL: still correlated (OuterRef), but now the RHS is
+    // null-extended (a left row with no lateral rows keeps NULLs), so `z` is
+    // nullable and the join type is LeftLateral.
+    check_shape(
+        "SELECT e.id, s.z FROM emp e LEFT JOIN LATERAL (SELECT e.id AS z) s ON true",
+        JT::LeftLateral, /*want_rhs_nullable=*/true);
 }
 
 // The mirror image: a NON-LATERAL derived table must NOT see its FROM-list
