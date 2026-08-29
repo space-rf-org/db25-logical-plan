@@ -99,6 +99,10 @@ private:
     LogicalNodePtr bind_insert(const db25::ast::ASTNode* insert_stmt, std::string& error);
     LogicalNodePtr bind_update(const db25::ast::ASTNode* update_stmt, std::string& error);
     LogicalNodePtr bind_delete(const db25::ast::ASTNode* delete_stmt, std::string& error);
+    // CREATE TABLE ... AS <query> (CTAS) -> a CreateTableAs over the bound query.
+    // A plain CREATE TABLE (no query body) has no plan and returns an error.
+    LogicalNodePtr bind_create_table_as(const db25::ast::ASTNode* stmt,
+                                        std::string& error);
 
     // FROM clause -> Scan / Join subtree. Returns null on unsupported shapes.
     LogicalNodePtr bind_from(const db25::ast::ASTNode* from_clause,

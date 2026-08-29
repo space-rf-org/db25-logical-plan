@@ -845,6 +845,52 @@ void test_non_lateral_sibling_reference_rejected(const InMemoryCatalog& cat) {
           "non-LATERAL derived table referencing a sibling must be an analyzer error");
 }
 
+// CREATE TABLE ... AS <query> (CTAS) lowers to a CreateTableAs node over the
+// bound defining query: `table_name` the target, `output` the query's schema
+// (optionally renamed by a column-name list), children[0] the bound query. A
+// plain CREATE TABLE (no query body) has no plan and is an honest bind error.
+void test_create_table_as(const InMemoryCatalog& cat) {
+    std::printf("[test] CREATE TABLE AS (CTAS) lowers to CreateTableAs\n");
+    with_plan(cat, "CREATE TABLE t AS SELECT id, name FROM users",
+              [&](const LogicalNode* root) {
+        check(root->op == LogicalOp::CreateTableAs, "root is CreateTableAs");
+        check(root->table_name == "t", "target table name");
+        check(root->child_count() == 1, "one child (the defining query)");
+        check(root->child_count() == 1 && root->child(0)->op == LogicalOp::Project,
+              "child is the bound query (Project)");
+        // The new table's schema is the query's projection.
+        check(root->output.size() == 2, "two output columns");
+        if (root->output.size() == 2) {
+            expect_col(root->output[0], "id", DataType::Integer, false, "ctas[0]");
+            expect_col(root->output[1], "name", DataType::VarChar, true, "ctas[1]");
+        }
+    });
+    // (A bare column-name list `CREATE TABLE t (x, y) AS ...` is not parsed yet -
+    // the parser expects column DEFINITIONS there - so the binder's positional
+    // rename is guarded but unexercised until the parser supports it.)
+    // A CTAS over a join / with a WHERE still lowers (the query is bound normally).
+    with_plan(cat,
+              "CREATE TABLE t AS SELECT u.id, o.total FROM users u "
+              "JOIN orders o ON u.id = o.user_id WHERE u.id > 0",
+              [&](const LogicalNode* root) {
+        check(root->op == LogicalOp::CreateTableAs, "join CTAS: root is CreateTableAs");
+        check(root->output.size() == 2, "join CTAS: two columns");
+    });
+    // Plain CREATE TABLE (no query body) has no plan: honest bind error.
+    {
+        db25::parser::Parser parser;
+        auto parsed = parser.parse("CREATE TABLE t (a INTEGER, b TEXT)");
+        check(parsed.has_value(), "parse plain CREATE TABLE");
+        if (parsed) {
+            Analyzer analyzer(cat);
+            analyzer.analyze(parsed.value());
+            Binder binder(analyzer, cat);
+            BindResult res = binder.bind(parsed.value());
+            check(!res.ok, "plain CREATE TABLE does not lower to a plan");
+        }
+    }
+}
+
 // A table-name qualifier (no explicit alias) still resolves against the single
 // occurrence - the fix must not regress the common unaliased case.
 void test_table_name_qualifier(const InMemoryCatalog& cat) {
@@ -4531,6 +4577,7 @@ int main() {
     test_derived_expr_alias_join_qualifier_resolution(cat);
     test_lateral_join_correlation(cat);
     test_non_lateral_sibling_reference_rejected(cat);
+    test_create_table_as(cat);
     test_table_name_qualifier(cat);
     test_group_by(cat);
     test_ordered_aggregate(cat);
