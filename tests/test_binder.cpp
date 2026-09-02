@@ -3407,6 +3407,56 @@ void test_update_returning(const InMemoryCatalog& cat) {
     });
 }
 
+// The DML node a Returning sits on must DECLARE the columns that Returning
+// projects. Its expressions are POSITIONAL - `col #0` and `col #1` here - and
+// they index into the DML node's output, so a DML node with an empty output is a
+// projection over nothing. It read as correct for as long as nothing looked at
+// the schema between the two nodes; the physical planner renders both, and the
+// plan came out as `(Project exprs=[(col #0)] (Insert out=[] ...))`.
+//
+// A DML statement with NO returning keeps an empty output, which is honest: it
+// returns no rows, so there is nothing to declare.
+void test_a_dml_node_declares_the_rows_returning_projects(const InMemoryCatalog& cat) {
+    std::printf("[test] a DML node declares the rows RETURNING projects\n");
+    const auto widest = [](const LogicalNode* ret, std::size_t want, const char* what) {
+        const LogicalNode* dml = only_child(ret);
+        check(dml != nullptr, "returning has a child");
+        if (dml == nullptr) return;
+        check(dml->output.size() == want, what);
+        // Every projected index must be IN that schema. This is the assertion
+        // that fails on an empty output, and it is stated as a bound rather than
+        // as a count so it stays true for any RETURNING list.
+        for (const auto& e : ret->exprs) {
+            if (e && e->kind == db25::plan::ExprKind::ColumnRef) {
+                check(e->input_index < dml->output.size(),
+                      "returning index within the DML node's schema");
+            }
+        }
+    };
+    with_plan(cat, "INSERT INTO users (id, name) VALUES (1, 'a') RETURNING id",
+              [&](const LogicalNode* root) {
+        check(root->op == LogicalOp::Returning, "insert returning root");
+        widest(root, 2, "insert declares the target's 2 columns");
+    });
+    with_plan(cat, "UPDATE users SET name = 'x' WHERE id = 1 RETURNING id, name",
+              [&](const LogicalNode* root) {
+        check(root->op == LogicalOp::Returning, "update returning root");
+        widest(root, 2, "update declares the scanned row's 2 columns");
+    });
+    with_plan(cat, "DELETE FROM users WHERE id = 1 RETURNING *",
+              [&](const LogicalNode* root) {
+        check(root->op == LogicalOp::Returning, "delete returning root");
+        widest(root, 2, "delete declares the scanned row's 2 columns");
+    });
+    // The control: without RETURNING the DML node stays empty, so the assertion
+    // above is about the projection and not about DML nodes always carrying a
+    // schema.
+    with_plan(cat, "DELETE FROM users WHERE id = 1", [](const LogicalNode* root) {
+        check(root->op == LogicalOp::Delete, "delete root");
+        check(root->output.empty(), "a DML with no RETURNING returns no rows");
+    });
+}
+
 void test_delete_returning(const InMemoryCatalog& cat) {
     std::printf("[test] DELETE FROM orders WHERE id=1 RETURNING id, total\n");
     with_plan(cat, "DELETE FROM orders WHERE id = 1 RETURNING id, total",
@@ -4658,6 +4708,7 @@ int main() {
     test_delete(cat);
 
     test_update_returning(cat);
+    test_a_dml_node_declares_the_rows_returning_projects(cat);
     test_delete_returning(cat);
     test_delete_returning_star(cat);
     test_returning_expression_type(cat);

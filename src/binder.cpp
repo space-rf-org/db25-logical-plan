@@ -2645,6 +2645,17 @@ LogicalNodePtr Binder::wrap_returning(LogicalNodePtr dml, const ASTNode* stmt,
         (dml->op != LogicalOp::Insert && dml->child_count() > 0)
             ? dml->child(0)->output
             : target;
+    // And that scope is the DML node's OWN output - the affected rows it hands
+    // upward. Without this the node declared NO columns while the Returning above
+    // it projected `col #0` of them: a projection over a zero-column input, which
+    // is not a plan any executor could run. It was invisible for as long as
+    // nothing rendered the schemas between the two nodes.
+    //
+    // A DML statement with no RETURNING keeps an empty output, and that is
+    // honest rather than an omission: it returns no rows, exactly as Postgres
+    // does, and the affected rows are not materialized for a reader that does
+    // not exist.
+    dml->output = resolve_scope;
     for (const ASTNode* item = first_child(returning); item != nullptr;
          item = item->next_sibling) {
         if (item->node_type == NodeType::Star) {
