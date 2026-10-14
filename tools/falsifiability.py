@@ -34,7 +34,7 @@ aimed at the optimizer's passes cannot kill the expression-lowering tests, and
 pretending otherwise would mean
 either an allowlist nobody maintains or a gate somebody disables.
 """
-import argparse, pathlib, shutil, subprocess, sys
+import argparse, pathlib, re, shutil, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -235,7 +235,18 @@ def main():
     # but printed so the hole is visible and shrinking it is a visible improvement
     # rather than an invisible one.
     all_tests = sh(f"ctest --test-dir {bd} -N").stdout
-    known = {l.split(":", 1)[1].strip() for l in all_tests.splitlines() if "Test #" in l and ":" in l}
+    # ctest RIGHT-ALIGNS the number ("Test  #1:", two spaces, but "Test #10:"),
+    # so a literal "Test #" match silently drops tests 1-9. It did, in the sibling
+    # parser gate this code was shared with: that report claimed 30 of a 39-binary
+    # suite. Hence the cross-check below - a parsed count that does not agree with
+    # ctest's own total is a hard error, not a quietly shorter list.
+    known = {m.group(1).strip() for m in
+             (re.match(r"\s*Test\s+#\d+:\s*(.+)$", l) for l in all_tests.splitlines()) if m}
+    declared = re.search(r"Total Tests:\s*(\d+)", all_tests)
+    if declared and int(declared.group(1)) != len(known):
+        print(f"GATE FAIL: parsed {len(known)} test names but ctest declares "
+              f"{declared.group(1)} - the coverage report would understate its own scope.")
+        return 1
     never = sorted(known - set(killers))
     if never:
         print(f"\n[uncovered] {len(never)} binary/binaries this catalog cannot kill:")
