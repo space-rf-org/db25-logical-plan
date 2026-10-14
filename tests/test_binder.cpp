@@ -2009,6 +2009,60 @@ void test_comma_join(const InMemoryCatalog& cat) {
 // FROM list was folded left-associatively into `(emp CROSS users) RIGHT JOIN
 // orders`, whose whole left input (including emp) was null-extended, so a NOT
 // NULL column of the comma table came out nullable.
+// A RIGHT / FULL join must make the LEFT side's columns nullable, checked on a
+// column that is NOT NULL at base.
+//
+// This exists because the suite already appeared to cover it and did not. The
+// test above asserts that `u.name` is nullable on the left of a RIGHT join - but
+// `users.name` is nullable in the fixture catalog, so `base || null_left` is
+// `true || anything` and the assertion holds whether null_left works or not. A
+// mutation setting `null_left = false` passed the entire suite.
+//
+// `users.id` is NOT NULL, so it can only become nullable by the join making it
+// so. That is the difference between an assertion that describes the behaviour
+// and one that exercises it.
+void test_outer_join_nullability_on_a_notnull_column(const InMemoryCatalog& cat) {
+    std::printf("[test] RIGHT/FULL join nullability on a NOT NULL column\n");
+
+    // RIGHT: the LEFT side is null-supplied.
+    with_plan(cat, "SELECT u.id, o.id FROM users u RIGHT JOIN orders o ON u.id = o.user_id",
+              [](const LogicalNode* root) {
+        check(root->output.size() == 2, "project has 2 cols");
+        if (root->output.size() == 2) {
+            expect_col(root->output[0], "id", DataType::Integer, true,
+                       "RIGHT join: left users.id is NOT NULL at base and becomes nullable");
+            expect_col(root->output[1], "id", DataType::Integer, false,
+                       "RIGHT join: right orders.id keeps NOT NULL");
+        }
+    });
+
+    // FULL: BOTH sides are null-supplied.
+    with_plan(cat, "SELECT u.id, o.id FROM users u FULL JOIN orders o ON u.id = o.user_id",
+              [](const LogicalNode* root) {
+        check(root->output.size() == 2, "project has 2 cols");
+        if (root->output.size() == 2) {
+            expect_col(root->output[0], "id", DataType::Integer, true,
+                       "FULL join: left users.id becomes nullable");
+            expect_col(root->output[1], "id", DataType::Integer, true,
+                       "FULL join: right orders.id becomes nullable");
+        }
+    });
+
+    // LEFT: the RIGHT side is null-supplied, and the left keeps NOT NULL. The
+    // mirror case, so that a mutation flipping either flag is caught by one of
+    // the two rather than by neither.
+    with_plan(cat, "SELECT u.id, o.id FROM users u LEFT JOIN orders o ON u.id = o.user_id",
+              [](const LogicalNode* root) {
+        check(root->output.size() == 2, "project has 2 cols");
+        if (root->output.size() == 2) {
+            expect_col(root->output[0], "id", DataType::Integer, false,
+                       "LEFT join: left users.id keeps NOT NULL");
+            expect_col(root->output[1], "id", DataType::Integer, true,
+                       "LEFT join: right orders.id becomes nullable");
+        }
+    });
+}
+
 void test_comma_then_outer_join_nullability(const InMemoryCatalog& cat) {
     std::printf("[test] SELECT emp.id FROM emp, users u RIGHT JOIN orders o ON ...\n");
     with_plan(cat,
@@ -4661,6 +4715,7 @@ int main() {
     test_select_no_from_const(cat);
     test_select_no_from_func(cat);
     test_comma_join(cat);
+    test_outer_join_nullability_on_a_notnull_column(cat);
     test_comma_then_outer_join_nullability(cat);
     test_cross_join(cat);
     test_join_using(cat);
