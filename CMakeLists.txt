@@ -42,8 +42,11 @@ if(NOT EXISTS ${ANALYZER_DIR}/src/analyzer.cpp)
         "external/analyzer is empty. Run: git submodule update --init --recursive")
 endif()
 
-# Turn off the parser's own tests/tools/benchmarks BEFORE add_subdirectory so it
-# does not FetchContent googletest (no network) or build extra artifacts.
+# Turn off the dependencies' own tests/tools/benchmarks BEFORE add_subdirectory
+# so the parser does not FetchContent googletest (no network) or build extra
+# artifacts. BUILD_TESTS is the option name in BOTH the parser and the analyzer,
+# so this one line covers both add_subdirectory calls below; each repo's suite
+# runs in its own CI.
 set(BUILD_TESTS      OFF CACHE BOOL "" FORCE)
 set(BUILD_TOOLS      OFF CACHE BOOL "" FORCE)
 set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
@@ -51,7 +54,23 @@ set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
 add_subdirectory(${PARSER_DIR} ${CMAKE_CURRENT_BINARY_DIR}/parser)
 
 # ---------------------------------------------------------------------------
-# db25logicalplan: the IR + binder, plus the analyzer compiled in-tree.
+# The semantic analyzer, as a subdirectory like every other dependency.
+#
+# This used to name the analyzer's .cpp files in our own add_library, because
+# the analyzer's CMake called find_package(DB25Parser) unconditionally and
+# add_subdirectory would therefore have demanded an install of the parser. Both
+# halves of that are fixed upstream now: the parser aliases its in-tree target
+# to DB25::db25parser (the name its export publishes), and the analyzer reuses
+# an existing target instead of insisting on find_package.
+#
+# The hand-written list was a liability, not a style choice. It named two of the
+# analyzer's five translation units, nothing checked it against that repo, and a
+# new TU there was invisible here until a link failed - which is what the
+# evaluate_check() comment it used to carry was a record of.
+add_subdirectory(${ANALYZER_DIR} ${CMAKE_CURRENT_BINARY_DIR}/analyzer)
+
+# ---------------------------------------------------------------------------
+# db25logicalplan: the IR + binder.
 # ---------------------------------------------------------------------------
 add_library(db25logicalplan STATIC
     src/logical_plan.cpp
@@ -59,21 +78,18 @@ add_library(db25logicalplan STATIC
     src/expr_ir.cpp
     src/expr_lower.cpp
     src/optimizer.cpp
-    ${ANALYZER_DIR}/src/analyzer.cpp
-    # analyzer.cpp calls evaluate_check() (constant CHECK folding for INSERT
-    # rows), which lives in this second TU - compile it in too.
-    ${ANALYZER_DIR}/src/check_eval.cpp
 )
 
 target_include_directories(db25logicalplan PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include   # our db25/plan/*
-    ${ANALYZER_DIR}/include               # db25/semantic/*
-    ${PARSER_DIR}/include                 # db25/ast/*, db25/parser/*, db25/memory/*
-    ${TOKENIZER_DIR}/include              # simd_tokenizer.hpp et al.
 )
 
-# The parser library brings in the AST/arena/tokenizer object code.
-target_link_libraries(db25logicalplan PUBLIC db25parser)
+# db25semantic carries db25/semantic/* and links DB25::db25parser PUBLIC, which
+# in turn carries db25/ast/*, db25/parser/*, db25/memory/* and the tokenizer
+# headers. So one link edge replaces the three include paths this used to spell
+# out by hand, and they cannot now disagree with what those targets actually
+# export.
+target_link_libraries(db25logicalplan PUBLIC db25semantic)
 
 target_compile_options(db25logicalplan PRIVATE -fno-exceptions -Wall -Wextra)
 
